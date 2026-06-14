@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from concurrent import futures
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 from bioimage_cpp.utils import Blocking
 from threadpoolctl import threadpool_limits
@@ -77,6 +77,7 @@ class Runner(ABC):
         has_return_val: bool = False,
         name: str = "",
         roi: Optional[Tuple[slice, ...]] = None,
+        pre_cleanup: Optional[Callable[[str], None]] = None,
     ) -> Optional[list]:
         """Run ``function`` block-wise over the inputs/outputs.
 
@@ -92,6 +93,12 @@ class Runner(ABC):
             has_return_val: Whether ``function`` returns a value to collect.
             name: A short name for progress display.
             roi: Region of interest to restrict the blocking to.
+            pre_cleanup: Optional callback ``pre_cleanup(tmp_folder)`` invoked on the
+                orchestrating process with the job temp folder right before it is deleted
+                (distributed backends only, success path only). Use it to read out anything
+                worth keeping from the temp folder (e.g. the per-task timing files under
+                ``tmp_folder/timings/``) before cleanup. Ignored by the local runner, which
+                has no temp folder.
 
         Returns:
             The list of per-block return values (in ``block_ids`` order) if
@@ -128,6 +135,7 @@ class Runner(ABC):
             blocking=blocking, block_ids=block_ids, halo=halo_n,
             has_return_val=has_return_val, num_workers=num_workers, name=name,
             shape=tuple(domain.shape), block_shape=block_shape, roi=roi,
+            pre_cleanup=pre_cleanup,
         )
         return results if has_return_val else None
 
@@ -167,6 +175,7 @@ class Runner(ABC):
         shape: Tuple[int, ...],
         block_shape: Tuple[int, ...],
         roi: Optional[Tuple[slice, ...]],
+        pre_cleanup: Optional[Callable[[str], None]] = None,
     ) -> List[Any]:
         """Execute the per-block function over ``block_ids`` and return ordered results."""
         ...
@@ -191,8 +200,13 @@ class LocalRunner(Runner):
         shape: Tuple[int, ...],
         block_shape: Tuple[int, ...],
         roi: Optional[Tuple[slice, ...]],
+        pre_cleanup: Optional[Callable[[str], None]] = None,
     ) -> List[Any]:
-        """Run the blocks in a thread pool, collecting results and re-raising failures."""
+        """Run the blocks in a thread pool, collecting results and re-raising failures.
+
+        ``pre_cleanup`` is accepted for interface parity but ignored: the local runner has
+        no temp folder (and no per-worker concept) to read out before returning.
+        """
         results: list = [None] * len(block_ids)
         failed: List[int] = []
         first_error: Optional[BaseException] = None

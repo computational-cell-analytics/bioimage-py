@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 from concurrent import futures
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import cloudpickle
 from bioimage_cpp.utils import Blocking
@@ -86,11 +86,12 @@ class _DistributedRunner(Runner):
         shape: Tuple[int, ...],
         block_shape: Tuple[int, ...],
         roi: Optional[Tuple[slice, ...]],
+        pre_cleanup: Optional[Callable[[str], None]] = None,
     ) -> List[Any]:
         # Validate up front that every source can be reopened on a worker (file-backed).
         self._require_reopenable(inputs, outputs, mask)
         tmp = tempfile.mkdtemp(prefix="bioimage_py_", dir=self.config.tmp_root)
-        for sub in ("blocks", "results", "success", "error"):
+        for sub in ("blocks", "results", "success", "error", "timings"):
             os.makedirs(os.path.join(tmp, sub), exist_ok=True)
 
         # Build and write the cloudpickle payload. to_spec() raises here for numpy inputs,
@@ -125,7 +126,8 @@ class _DistributedRunner(Runner):
                 json.dump([int(b) for b in ids], f)
 
         self._launch_and_wait(tmp, n_tasks, num_workers, name)
-        return self._finalize(tmp, n_tasks, tasks, block_ids, has_return_val, name)
+        return self._finalize(tmp, n_tasks, tasks, block_ids, has_return_val, name,
+                              pre_cleanup=pre_cleanup)
 
     def _finalize(
         self,
@@ -135,6 +137,7 @@ class _DistributedRunner(Runner):
         block_ids: Sequence[int],
         has_return_val: bool,
         name: str,
+        pre_cleanup: Optional[Callable[[str], None]] = None,
     ) -> List[Any]:
         """Check the per-task sentinels, then collect results or raise on failure.
 
@@ -149,6 +152,9 @@ class _DistributedRunner(Runner):
             block_ids: The full ordered block-id list (used to order collected results).
             has_return_val: Whether per-block return values were collected.
             name: A short name for the failure message.
+            pre_cleanup: Optional ``pre_cleanup(tmp)`` callback invoked right before the temp
+                folder is removed on the success path (best-effort; its failure is reported
+                but does not abort cleanup or the run).
 
         Returns:
             The per-block return values in ``block_ids`` order if ``has_return_val``, else
@@ -167,6 +173,11 @@ class _DistributedRunner(Runner):
                               failed_block_ids=failed_block_ids, tmp_folder=tmp)
 
         results = self._collect(tmp, n_tasks, block_ids) if has_return_val else [None] * len(block_ids)
+        if pre_cleanup is not None:
+            try:
+                pre_cleanup(tmp)
+            except Exception as err:  # noqa: BLE001 - best-effort: never fail the run on this
+                print(f"pre_cleanup callback failed for {tmp}: {err!r}")
         shutil.rmtree(tmp, ignore_errors=True)
         return results
 
@@ -521,7 +532,8 @@ class SlurmRunner(_DistributedRunner):
                           f"running; reattach with SlurmRunner(...).reattach({tmp!r}).")
                     raise
 
-    def reattach(self, tmp_folder: str, name: str = "reattach") -> Optional[list]:
+    def reattach(self, tmp_folder: str, name: str = "reattach",
+                 pre_cleanup: Optional[Callable[[str], None]] = None) -> Optional[list]:
         """Reattach to a previously submitted run and finalize it.
 
         Picks a run back up from its manifest (e.g. after the orchestrating login-node
@@ -531,6 +543,8 @@ class SlurmRunner(_DistributedRunner):
         Args:
             tmp_folder: The job temp folder containing ``manifest.json`` and ``payload.pkl``.
             name: A short name for the progress display.
+            pre_cleanup: Optional ``pre_cleanup(tmp)`` callback invoked right before the temp
+                folder is removed (forwarded to :meth:`_finalize`).
 
         Returns:
             The per-block return values (if the run collected any), else ``None``.
@@ -565,5 +579,6 @@ class SlurmRunner(_DistributedRunner):
                 )
             self._poll(job_id, n_tasks, tmp_folder, name)
 
-        results = self._finalize(tmp_folder, n_tasks, tasks, block_ids, has_return_val, name)
+        results = self._finalize(tmp_folder, n_tasks, tasks, block_ids, has_return_val, name,
+                                 pre_cleanup=pre_cleanup)
         return results if has_return_val else None
