@@ -50,3 +50,20 @@ def test_setitem(zarr_factory):
     src = as_source(z)
     src[(slice(0, 4), slice(0, 4))] = np.ones((4, 4), dtype="float32")
     assert src[(slice(0, 4), slice(0, 4))].sum() == 16
+
+
+def test_z5py_spec_roundtrip(n5_factory, rng):
+    pytest.importorskip("z5py")
+    import z5py
+
+    a = rng.random((12, 10)).astype("float32")
+    path, key = n5_factory(a, chunks=(4, 5))
+
+    # A live z5py dataset dispatches to ArraySource with a kind="z5py" spec.
+    with z5py.File(path, mode="r") as f:
+        src = as_source(f[key])
+        assert isinstance(src, ArraySource)
+        assert src.chunks == (4, 5)
+        spec = src.to_spec()
+        assert spec.kind == "z5py"
+    np.testing.assert_array_equal(from_spec(spec)[(slice(None), slice(None))], a)

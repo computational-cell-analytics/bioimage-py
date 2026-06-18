@@ -61,6 +61,18 @@ def from_spec(spec: SourceSpec) -> Source:
     """Reconstruct a :class:`Source` from its :class:`SourceSpec`."""
     if spec.kind in ("zarr", "z5py"):
         return ArraySource.reopen(spec)
+    if spec.kind == "file":
+        from .file_source import FileSource
+
+        return FileSource.reopen(spec)
+    if spec.kind == "cloudvolume":
+        from .cloudvolume_source import CloudVolumeSource
+
+        return CloudVolumeSource.reopen(spec)
+    if spec.kind == "webknossos":
+        from .webknossos_source import WebKnossosSource
+
+        return WebKnossosSource.reopen(spec)
     if spec.kind == "wrapper":
         from ..wrapper.base import wrapper_from_spec
 
@@ -72,3 +84,42 @@ def from_spec(spec: SourceSpec) -> Source:
 # accepts any duck-typed array (an object exposing ``shape``, ``dtype`` and ``__getitem__``);
 # the listed members are the statically-known supported types.
 SourceLike = Union[Source, np.ndarray, "zarr.Array", "z5py.Dataset"]
+
+
+def _is_module(obj: object, module: str) -> bool:
+    """Return whether ``obj``'s top-level module is ``module`` (without importing it)."""
+    return type(obj).__module__.split(".")[0] == module
+
+
+def _convert_h5py(dataset: object) -> Source:
+    """Wrap a live h5py dataset as a reopenable :class:`FileSource`."""
+    from .file_source import FileSource
+
+    file = dataset.file  # type: ignore[attr-defined]
+    writable = file.mode != "r"
+    return FileSource(
+        dataset,
+        path=file.filename,
+        internal_path=dataset.name.lstrip("/"),  # type: ignore[attr-defined]
+        format="hdf5",
+        mode="r+" if writable else "r",
+        writable=writable,
+    )
+
+
+def _convert_cloudvolume(volume: object) -> Source:
+    """Wrap a live CloudVolume handle as a :class:`CloudVolumeSource`."""
+    from .cloudvolume_source import CloudVolumeSource
+
+    open_params = {
+        "mip": int(volume.mip),  # type: ignore[attr-defined]
+        "fill_missing": bool(volume.fill_missing),  # type: ignore[attr-defined]
+        "bounded": bool(volume.bounded),  # type: ignore[attr-defined]
+    }
+    return CloudVolumeSource(volume, open_params=open_params)
+
+
+# Live-object converters for the optional backends. The predicates only inspect the type's module
+# name, so importing this module never imports h5py / cloudvolume; the converters import lazily.
+register_source(lambda o: _is_module(o, "h5py") and hasattr(o, "file") and hasattr(o, "shape"), _convert_h5py)
+register_source(lambda o: _is_module(o, "cloudvolume") and hasattr(o, "cloudpath"), _convert_cloudvolume)

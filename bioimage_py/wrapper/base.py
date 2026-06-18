@@ -43,6 +43,11 @@ class WrapperSource(Source):
         raise TypeError("Wrapper sources are read-only.")
 
     @property
+    def writable(self) -> bool:
+        """Wrapper sources are read-only."""
+        return False
+
+    @property
     def shape(self) -> Tuple[int, ...]:
         return self._source.shape
 

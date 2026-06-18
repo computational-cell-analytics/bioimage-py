@@ -71,6 +71,14 @@ class Source(ABC):
         """Number of dimensions."""
         return len(self.shape)
 
+    @property
+    def writable(self) -> bool:
+        """Whether this source supports writing via :meth:`__setitem__`.
+
+        Distributed runs reject non-writable sources passed as outputs.
+        """
+        return True
+
     @abstractmethod
     def to_spec(self) -> SourceSpec:
         """Return a serializable spec to reopen this source on another process.
