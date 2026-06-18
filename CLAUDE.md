@@ -18,7 +18,14 @@ The package lives in `bioimage_py/`:
   reattach), `_harness.py` (worker entry point), `config.py` (`RunnerConfig` / `SlurmConfig`),
   `factory.py` (`get_runner`).
 - `sources/` — `Source` ABC + `SourceSpec` (`base.py`), `ArraySource` for numpy/zarr/z5py
-  (`array_source.py`), and the `as_source` / `from_spec` / `SourceLike` dispatch (`dispatch.py`).
+  (`array_source.py`), the `as_source` / `from_spec` / `SourceLike` dispatch (`dispatch.py`),
+  `FileSource` + `open_source` (`file_source.py`, the `kind="file"` spec over the `io/` layer),
+  `CloudVolumeSource` + `open_cloudvolume` (`cloudvolume_source.py`, writable, ZYX-over-XYZ), and
+  `WebKnossosSource` + `open_webknossos` (`webknossos_source.py`, read-only, remote).
+- `io/` — native file-format IO layer (mirrors `elf.io`): `open_file` + a guarded extension→format
+  registry (`files.py`, `registry.py`), array-like wrappers for mrc / nifti / knossos / image-stack
+  (tif) / msr, and the ported indexing helpers (`_util.py`). Each backend's heavy import is guarded
+  (optional dependency). `FileSource` opens these by path and adds the reopenable spec.
 - `wrapper/` — on-the-fly transformation sources (`WrapperSource`, `ThresholdSource`).
 - `stats/`, `filters/`, `segmentation/` — the operations (`stats.max/min/mean/std`,
   `filters.apply_filter` + the gaussian family, `segmentation.label`).
@@ -38,7 +45,11 @@ Conventions (follow these):
 - Array-output ops (`filters.*`, `segmentation.label`) take an optional `output`: for local execution a
   numpy array is allocated and returned when omitted; for distributed execution `output` is required and
   the runner validates it is file-backed (reopenable). These ops return the output array object.
-- numpy arrays are local-only (their `to_spec()` raises); distributed backends need zarr/n5 sources.
+- numpy arrays are local-only (their `to_spec()` raises); distributed backends need a reopenable source.
+- A `Source` exposes a `writable` property (default `True`; `False` for wrappers, read-only `FileSource`s,
+  and `WebKnossosSource`). The distributed runner rejects non-writable outputs, and rejects HDF5 as an
+  output (concurrent multi-process writes corrupt it). Read-only formats (mrc/nifti/knossos/...) and
+  HDF5 are valid distributed *inputs* (concurrent readers are safe); distributed *outputs* stay zarr/n5.
 
 # Installation
 

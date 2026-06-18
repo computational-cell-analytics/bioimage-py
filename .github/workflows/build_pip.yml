@@ -1,0 +1,39 @@
+---
+name: build (pip)
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    name: pip ${{ matrix.os }} ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+        # zarr>=3 does not support py3.10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Pure pip install: every dependency (including bioimage-cpp and z5py) is pulled from PyPI.
+      # The 'io' extra adds zarr>=3 + z5py, so the n5 path is exercised here too.
+      - name: Install package
+        run: pip install -e ".[test,io,hdf5,mrc,nifti,imagestack]"
+
+      # cloud-volume is only reliably installable on Linux; install it there so the CloudVolume
+      # tests run on the Ubuntu job (they skip elsewhere via importorskip).
+      - name: Install cloud-volume (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: pip install cloud-volume
+
+      - name: Run tests
+        run: python -m pytest -q

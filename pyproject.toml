@@ -7,7 +7,7 @@ name = "bioimage_py"
 version = "0.0.1"
 description = "Efficient, parallel, and distributed implementation of image analysis and segmentation functionality."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Constantin Pape", email = "constantin.pape@cs.uni-goettingen.de" }]
 dependencies = [
@@ -22,6 +22,17 @@ dependencies = [
 
 [project.optional-dependencies]
 io = ["zarr>=3", "z5py"]
+hdf5 = ["h5py"]
+mrc = ["mrcfile"]
+nifti = ["nibabel"]
+imagestack = ["imageio", "tifffile"]
+msr = ["msr-reader"]
+cloudvolume = ["cloud-volume"]
+webknossos = ["webknossos"]
+io-all = [
+    "zarr>=3", "z5py", "h5py", "mrcfile", "nibabel", "imageio", "tifffile",
+    "cloud-volume", "webknossos",
+]
 test = ["pytest", "zarr>=3", "scikit-image", "scipy", "openpyxl"]
 dev = ["flake8", "pyflakes"]
 

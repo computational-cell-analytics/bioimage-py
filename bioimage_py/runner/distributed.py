@@ -64,11 +64,22 @@ class _DistributedRunner(Runner):
         for role, sources in roles:
             for source in sources:
                 try:
-                    source.to_spec()
+                    spec = source.to_spec()
                 except ValueError as error:
                     raise ValueError(
                         f"Distributed execution requires file-backed {role} arrays (zarr/n5). {error}"
                     ) from error
+                if role == "output":
+                    if not source.writable:
+                        raise ValueError(
+                            "Distributed outputs must be writable; got a read-only output "
+                            f"({spec.kind!r}). Use a writable, file-backed output (zarr/n5)."
+                        )
+                    if spec.kind == "file" and spec.params.get("format") == "hdf5":
+                        raise ValueError(
+                            "HDF5 is not safe as a distributed output (concurrent multi-process writes "
+                            "to one file corrupt it). Use zarr or n5 for distributed outputs."
+                        )
 
     def _execute(
         self,

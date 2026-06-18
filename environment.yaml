@@ -1,0 +1,29 @@
+channels:
+  - conda-forge
+name:
+  bioimage-py-dev
+dependencies:
+  - python
+  - pip
+  # core
+  - bioimage-cpp
+  - numpy
+  - pandas
+  - scikit-image >=0.20
+  - cloudpickle
+  - tqdm
+  - threadpoolctl
+  # io (available on conda-forge)
+  - zarr >=3
+  - z5py
+  - h5py
+  - mrcfile
+  - imageio
+  - tifffile
+  - nibabel
+  # test
+  - pytest
+  - scipy
+  - openpyxl
+  # The remaining optional backends (cloud-volume, webknossos, msr-reader) are pip-only;
+  # the tests that need them are skipped in the conda environment.
