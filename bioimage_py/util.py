@@ -62,6 +62,37 @@ def sigma_to_halo(sigma: Union[float, Sequence[float]], order: int) -> Union[int
     return [multiplier * int(ceil(3.0 * sig + 0.5 * order + 0.5)) for sig in sigma]
 
 
+def downscale_shape(shape: Sequence[int], scale_factor: Union[int, Sequence[int]],
+                    ceil_mode: bool = True) -> Tuple[int, ...]:
+    """Compute the shape resulting from downscaling by an integer factor.
+
+    Mirrors elf's ``downscale_shape``.
+
+    Args:
+        shape: The input array shape.
+        scale_factor: The downscaling factor: a single int (isotropic) or a per-axis sequence.
+        ceil_mode: Whether to round the downscaled size up (so no input voxel is dropped) or
+            down (strict integer division).
+
+    Returns:
+        The downscaled shape.
+
+    Raises:
+        ValueError: If a per-axis ``scale_factor`` does not match the dimensionality of ``shape``.
+    """
+    if isinstance(scale_factor, numbers.Integral):
+        factors = [int(scale_factor)] * len(shape)
+    else:
+        factors = [int(f) for f in scale_factor]
+        if len(factors) != len(shape):
+            raise ValueError(
+                f"scale_factor {scale_factor} does not match the dimensionality {len(shape)}."
+            )
+    if ceil_mode:
+        return tuple(int(s) // f + int((int(s) % f) != 0) for s, f in zip(shape, factors))
+    return tuple(int(s) // f for s, f in zip(shape, factors))
+
+
 def derive_block_shape(source: Source, block_shape: Optional[Sequence[int]]) -> Tuple[int, ...]:
     """Resolve the block shape, falling back to the source's chunks.
 

@@ -50,6 +50,52 @@ def _make_compute() -> ComputeFn:
     return _compute
 
 
+def _copy_source(
+    input: SourceLike,
+    output: Optional[SourceLike],
+    *,
+    block_shape: Optional[Tuple[int, ...]],
+    job_type: str,
+    job_config: Optional[RunnerConfig],
+    num_workers: int,
+    mask: Optional[SourceLike],
+    name: str,
+) -> SourceLike:
+    """Materialize ``input`` into ``output`` block-wise (shared by :func:`copy` and downsample).
+
+    Handles output allocation (a numpy array for local execution, a required file-backed array for
+    distributed execution), the direct (whole-array) fast path, and the runner dispatch. The output
+    shape and dtype are taken from ``input`` (so a shape-changing wrapper input is handled too).
+    """
+    src = as_source(input)
+    ndim = src.ndim
+    direct = job_type == "local" and num_workers == 1 and block_shape is None and mask is None
+
+    if output is None:
+        if job_type != "local":
+            raise ValueError(
+                f"'output' is required for distributed execution (job_type={job_type!r}); "
+                "pass a file-backed (zarr/n5) output array."
+            )
+        out_array: SourceLike = np.zeros(tuple(src.shape), dtype=src.dtype)
+    else:
+        out_array = output
+
+    out = as_source(out_array)
+    if not direct and _same_array(out, src):
+        raise ValueError(f"Block-wise {name} needs 'output' to differ from 'input'.")
+
+    if direct:
+        out[_full_roi(out.ndim)] = src[_full_roi(ndim)]
+        return out_array
+
+    compute = _make_compute()
+    runner = get_runner(job_type, job_config)
+    runner.run(compute, [src], outputs=[out], block_shape=block_shape,
+               mask=mask, num_workers=num_workers, name=name)
+    return out_array
+
+
 def copy(
     input: SourceLike,
     output: Optional[SourceLike] = None,
@@ -85,30 +131,5 @@ def copy(
     Returns:
         The output array (the provided ``output``, or a newly allocated numpy array).
     """
-    src = as_source(input)
-    ndim = src.ndim
-    direct = job_type == "local" and num_workers == 1 and block_shape is None and mask is None
-
-    if output is None:
-        if job_type != "local":
-            raise ValueError(
-                f"'output' is required for distributed execution (job_type={job_type!r}); "
-                "pass a file-backed (zarr/n5) output array."
-            )
-        out_array: SourceLike = np.zeros(tuple(src.shape), dtype=src.dtype)
-    else:
-        out_array = output
-
-    out = as_source(out_array)
-    if not direct and _same_array(out, src):
-        raise ValueError("Block-wise copy needs 'output' to differ from 'input'.")
-
-    if direct:
-        out[_full_roi(out.ndim)] = src[_full_roi(ndim)]
-        return out_array
-
-    compute = _make_compute()
-    runner = get_runner(job_type, job_config)
-    runner.run(compute, [input], outputs=[out], block_shape=block_shape,
-               mask=mask, num_workers=num_workers, name="copy")
-    return out_array
+    return _copy_source(input, output, block_shape=block_shape, job_type=job_type,
+                        job_config=job_config, num_workers=num_workers, mask=mask, name="copy")
