@@ -1,5 +1,6 @@
 """bioimage_py: efficient, parallel, and distributed image analysis and segmentation."""
 from . import filters, io, morphology, segmentation, stats  # noqa: F401
+from .copy import copy
 from .runner import get_runner
 from .sources import as_source, open_cloudvolume, open_source, open_webknossos
 from .util import to_roi
@@ -11,6 +12,7 @@ __all__ = [
     "segmentation",
     "morphology",
     "io",
+    "copy",
     "get_runner",
     "as_source",
     "open_source",
