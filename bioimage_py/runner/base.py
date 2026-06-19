@@ -113,11 +113,21 @@ class Runner(ABC):
             raise ValueError("run() requires at least one input or output source.")
 
         # Shape consistency: all inputs and the mask must match the domain shape.
+        dom_shape = tuple(domain.shape)
         for src in inputs + ([mask_source] if mask_source is not None else []):
-            if tuple(src.shape) != tuple(domain.shape):
+            if tuple(src.shape) != dom_shape:
                 raise ValueError(
                     f"Shape mismatch: source with shape {src.shape} does not match the "
                     f"domain shape {domain.shape}."
+                )
+        # Outputs may carry a leading channel axis, but their trailing spatial dims must match
+        # the domain so the per-block roi indexes them consistently.
+        for out in outputs:
+            out_shape = tuple(out.shape)
+            if out_shape[-len(dom_shape):] != dom_shape:
+                raise ValueError(
+                    f"Output shape {out_shape} is incompatible with the domain shape "
+                    f"{dom_shape}: its trailing dimensions must match the domain."
                 )
 
         block_shape = derive_block_shape(domain, block_shape)
@@ -196,17 +206,22 @@ class Runner(ABC):
 
         This prevents two blocks from concurrently writing the same chunk (which would
         corrupt it). Auto-derivation of a safe block shape is a flagged TODO.
+
+        ``block_shape`` is spatial-only, but an output may carry a leading channel axis (its
+        ``chunks`` then have one extra leading entry); the block shape is aligned against the
+        trailing (spatial) chunk axes, since the channel axis is fully written by every block.
         """
         for out in outputs:
             chunks = out.chunks
-            if chunks is None or len(chunks) != len(block_shape):
+            if chunks is None or len(chunks) < len(block_shape):
                 continue
-            for bs, ch in zip(block_shape, chunks):
+            spatial_chunks = tuple(chunks[-len(block_shape):])
+            for bs, ch in zip(block_shape, spatial_chunks):
                 if bs % ch != 0:
                     raise ValueError(
                         f"Unsafe block shape for writing: {tuple(block_shape)} is not a multiple "
-                        f"of the output chunk shape {tuple(chunks)}. Concurrent writes could "
-                        "corrupt shared chunks; use a block shape that is a chunk multiple."
+                        f"of the output (spatial) chunk shape {spatial_chunks}. Concurrent writes "
+                        "could corrupt shared chunks; use a block shape that is a chunk multiple."
                     )
 
     @abstractmethod

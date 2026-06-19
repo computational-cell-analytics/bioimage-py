@@ -32,7 +32,9 @@ def slice_to_start_stop(s: slice, size: int) -> slice:
     if stop < 1:
         return slice(None, 0)
 
-    return slice(start, stop)
+    # Clamp so a reversed slice (start > stop) yields an empty region rather than a negative
+    # extent (which crashes the assemble-from-pieces wrappers downstream).
+    return slice(start, max(start, stop))
 
 
 def int_to_start_stop(i: int, size: int) -> slice:

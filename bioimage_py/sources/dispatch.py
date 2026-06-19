@@ -108,13 +108,20 @@ def _convert_h5py(dataset: object) -> Source:
 
 
 def _convert_cloudvolume(volume: object) -> Source:
-    """Wrap a live CloudVolume handle as a :class:`CloudVolumeSource`."""
+    """Wrap a live CloudVolume handle as a :class:`CloudVolumeSource`.
+
+    Captures the write-affecting open params too (``non_aligned_writes``, ``cache``) so the spec
+    round-trips the volume's write semantics, not just its read settings.
+    """
     from .cloudvolume_source import CloudVolumeSource
 
+    cache = getattr(volume, "cache", None)
     open_params = {
         "mip": int(volume.mip),  # type: ignore[attr-defined]
         "fill_missing": bool(volume.fill_missing),  # type: ignore[attr-defined]
         "bounded": bool(volume.bounded),  # type: ignore[attr-defined]
+        "non_aligned_writes": bool(getattr(volume, "non_aligned_writes", False)),
+        "cache": bool(getattr(cache, "enabled", False)),
     }
     return CloudVolumeSource(volume, open_params=open_params)
 

@@ -283,8 +283,20 @@ class SubprocessRunner(_DistributedRunner):
         cmd_base = [python, "-m", "bioimage_py.runner._harness", tmp]
 
         def _run_task(task_id: int):
-            # Output is discarded; failures are reported via the harness's error file.
-            return subprocess.run(cmd_base + [str(task_id)], capture_output=True, text=True)
+            proc = subprocess.run(cmd_base + [str(task_id)], capture_output=True, text=True)
+            # The harness writes its own error/<id>.txt on a caught exception. But a failure
+            # *before* that try (e.g. an import error launching the module) would otherwise be
+            # silent, so capture the subprocess output as a fallback error file.
+            if proc.returncode != 0:
+                err_path = os.path.join(tmp, "error", f"{task_id}.txt")
+                if not os.path.exists(err_path):
+                    with open(err_path, "w") as f:
+                        f.write(f"Worker for task {task_id} exited with code {proc.returncode}.\n")
+                        if proc.stdout:
+                            f.write(f"--- stdout ---\n{proc.stdout}\n")
+                        if proc.stderr:
+                            f.write(f"--- stderr ---\n{proc.stderr}\n")
+            return proc
 
         with futures.ThreadPoolExecutor(max(1, int(num_workers))) as tp:
             list(tqdm(tp.map(_run_task, range(n_tasks)), total=n_tasks,
@@ -363,7 +375,14 @@ class SlurmRunner(_DistributedRunner):
         with open(script_path, "w") as f:
             f.write(self._build_script(tmp, n_tasks, throttle, name))
 
-        job_id = self._submit(script_path)
+        # Unlike the tmp_root / max_array guards above, a submission failure deliberately does NOT
+        # remove the temp folder: the generated submit.sh, payload, and per-task block lists are
+        # exactly what's needed to diagnose why sbatch rejected the job. Re-raise naming the folder
+        # so the user knows where to look.
+        try:
+            job_id = self._submit(script_path)
+        except RuntimeError as err:
+            raise RuntimeError(f"{err} Temp folder preserved for debugging: {tmp}.") from err
         with open(os.path.join(tmp, "manifest.json"), "w") as f:
             json.dump({
                 "job_id": job_id,

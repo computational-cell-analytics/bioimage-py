@@ -48,3 +48,26 @@ def test_direct_rejects_mask(rng):
     a = rng.random((8, 8)).astype("float32")
     with pytest.raises(ValueError, match="Direct computation"):
         bp.stats.max(a, mask=np.ones((8, 8), dtype="uint8"))
+
+
+def test_reductions_subprocess_parity(zarr_factory, rng):
+    # Every reduction must agree across direct/local/subprocess, exercising the return-value
+    # channel (and the parallel-variance merge for mean/std) through cloudpickle + partitioning.
+    a = rng.random((33, 28)).astype("float32")
+    z = zarr_factory(a, chunks=(8, 8))
+    kw = dict(block_shape=(8, 8), num_workers=3, job_type="subprocess")
+    assert np.isclose(bp.stats.max(z, **kw), a.max())
+    assert np.isclose(bp.stats.min(z, **kw), a.min())
+    assert np.isclose(bp.stats.mean(z, **kw), a.mean(), atol=1e-5)
+    assert np.isclose(bp.stats.std(z, **kw), a.std(), atol=1e-5)
+    mn, mx = bp.stats.min_and_max(z, **kw)
+    assert np.isclose(mn, a.min()) and np.isclose(mx, a.max())
+    mean_val, std_val = bp.stats.mean_and_std(z, **kw)
+    assert np.isclose(mean_val, a.mean(), atol=1e-5) and np.isclose(std_val, a.std(), atol=1e-5)
+
+
+def test_mask_shape_mismatch_raises(rng):
+    a = rng.random((16, 16)).astype("float32")
+    bad_mask = np.ones((8, 8), dtype="uint8")  # wrong shape
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        bp.stats.max(a, block_shape=(8, 8), num_workers=2, mask=bad_mask)

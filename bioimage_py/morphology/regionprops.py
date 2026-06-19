@@ -18,20 +18,17 @@ Work is mapped one task per object with the generic
 from __future__ import annotations
 
 import functools
-import importlib.util
 import os
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import bioimage_cpp as bic
 import numpy as np
+import pandas as pd
 
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
 from .morphology import _axis_names
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 __all__ = ["regionprops"]
 
@@ -41,18 +38,8 @@ __all__ = ["regionprops"]
 _SEG_CACHE: Dict[Any, Source] = {}
 
 
-def _check_surface_deps() -> None:
-    """Ensure scikit-image is importable (only needed when ``compute_surface`` is requested)."""
-    if importlib.util.find_spec("skimage") is None:  # pragma: no cover - needs skimage uninstalled.
-        raise ImportError(
-            "regionprops(compute_surface=True) requires scikit-image; install it "
-            "(e.g. pip install scikit-image) or pass compute_surface=False."
-        )
-
-
 def _read_table(path: str) -> "pd.DataFrame":
     """Read a serialized table from a ``.csv`` / ``.xlsx`` path."""
-    import pandas as pd
     lower = str(path).lower()
     if lower.endswith((".xlsx", ".xls")):
         return pd.read_excel(path)
@@ -63,7 +50,6 @@ def _read_table(path: str) -> "pd.DataFrame":
 
 def _load_table(table: Union[str, "pd.DataFrame"]) -> "pd.DataFrame":
     """Return ``table`` as a DataFrame (pass-through, or read from a path)."""
-    import pandas as pd
     if isinstance(table, pd.DataFrame):
         return table
     return _read_table(str(table))
@@ -280,15 +266,11 @@ def regionprops(
         ``bb_min_<axis>``/``bb_max_<axis>`` (global voxels), and ``surface_area`` (only when
         ``compute_surface`` and the input is 3D).
     """
-    import pandas as pd
-
     src = as_source(input)
     if not np.issubdtype(np.dtype(src.dtype), np.integer):
         raise ValueError(f"regionprops expects an integer label image, got dtype {src.dtype}.")
     ndim = src.ndim
     axes = _axis_names(ndim)
-    if compute_surface and ndim == 3:
-        _check_surface_deps()
 
     if resolution is None:
         resolution = tuple(1.0 for _ in range(ndim))

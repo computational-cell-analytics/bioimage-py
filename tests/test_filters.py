@@ -58,6 +58,44 @@ def test_numpy_output_distributed_rejected_by_runner(zarr_factory, rng):
                                       num_workers=2, job_type="subprocess")
 
 
+@pytest.mark.parametrize("filter_name,kwargs", [
+    ("hessian_of_gaussian_eigenvalues", {}),
+    ("structure_tensor_eigenvalues", {"outer_scale": 2.0}),
+])
+def test_multichannel_filter_parity(filter_name, kwargs, zarr_factory, rng):
+    # Multi-channel filters write a leading channel axis (ndim, *spatial). Block-wise must match
+    # the direct path, and the write-safety guard must align the block to the trailing chunks.
+    a = rng.random((48, 50)).astype("float32")
+    z = zarr_factory(a, chunks=(8, 8))
+    ndim = a.ndim
+    direct = bp.filters.apply_filter(a.copy(), filter_name, 2.0, **kwargs)  # (ndim, *spatial)
+    assert direct.shape == (ndim,) + a.shape
+
+    for nw, job in [(1, "local"), (4, "local"), (3, "subprocess")]:
+        out = zarr_factory(shape=(ndim,) + a.shape, chunks=(ndim, 16, 16), dtype="float32", fill=0.0)
+        bp.filters.apply_filter(z, filter_name, 2.0, output=out, block_shape=(16, 16),
+                                num_workers=nw, job_type=job, **kwargs)
+        np.testing.assert_allclose(out[:], direct, atol=1e-3, err_msg=f"nw={nw} job={job}")
+
+
+def test_multichannel_return_channel_scalar(zarr_factory, rng):
+    # return_channel selects a single channel -> a scalar (spatial-only) output.
+    a = rng.random((48, 50)).astype("float32")
+    z = zarr_factory(a, chunks=(8, 8))
+    direct = bp.filters.apply_filter(a.copy(), "hessian_of_gaussian_eigenvalues", 2.0, return_channel=0)
+    assert direct.shape == a.shape
+    out = zarr_factory(shape=a.shape, chunks=(16, 16), dtype="float32", fill=0.0)
+    bp.filters.apply_filter(z, "hessian_of_gaussian_eigenvalues", 2.0, return_channel=0,
+                            output=out, block_shape=(16, 16), num_workers=4)
+    np.testing.assert_allclose(out[:], direct, atol=1e-3)
+
+
+def test_structure_tensor_requires_outer_scale(zarr_factory, rng):
+    z = zarr_factory(rng.random((16, 16)).astype("float32"), chunks=(8, 8))
+    with pytest.raises(ValueError, match="outer_scale"):
+        bp.filters.apply_filter(z, "structure_tensor_eigenvalues", 1.0, block_shape=(8, 8))
+
+
 def test_mask_keeps_out_of_mask_unchanged(zarr_factory, rng):
     a = rng.random((24, 24)).astype("float32")
     z = zarr_factory(a, chunks=(8, 8))

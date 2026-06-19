@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -136,6 +137,11 @@ class MSRDataset:
         self._dtype = sample.dtype
         self._shape = sample.shape if len(self.stack_indices) == 1 else (len(self.stack_indices),) + sample.shape
         self._size = int(np.prod(self._shape))
+        # Decoded stacks are cached so each is read+decoded once per dataset, not per block read.
+        # The same dataset instance is shared across worker threads (local backend), so the
+        # cache is guarded by a lock; decoded stacks are immutable once stored.
+        self._cache: Dict[int, np.ndarray] = {}
+        self._cache_lock = threading.Lock()
 
     @property
     def dtype(self) -> np.dtype:
@@ -167,11 +173,19 @@ class MSRDataset:
         """Dummy attributes for compatibility with the hdf5/zarr API."""
         return {}
 
+    def _stack_data(self, stack_index: int) -> np.ndarray:
+        """Return the decoded stack, reading+caching it on first access."""
+        with self._cache_lock:
+            data = self._cache.get(stack_index)
+            if data is None:
+                with OBFFile(self.path) as msr:
+                    data = msr.read_stack(stack_index)
+                self._cache[stack_index] = data
+        return data
+
     def _read_stack(self, stack_index: int, spatial_index: Any) -> np.ndarray:
-        """Read (and crop) a single stack."""
-        with OBFFile(self.path) as msr:
-            data = msr.read_stack(stack_index)
-        return data[spatial_index]
+        """Read (from cache) and crop a single stack."""
+        return self._stack_data(stack_index)[spatial_index]
 
     def __getitem__(self, key: Any) -> np.ndarray:
         key, to_squeeze = normalize_index(key, self.shape)
@@ -179,10 +193,14 @@ class MSRDataset:
             data = self._read_stack(self.stack_indices[0], key)
             return squeeze_singletons(data, to_squeeze).copy()
 
+        # Multi-stack: key[0] selects channels. normalize_index converts an integer channel to a
+        # unit slice (+ squeeze) and rejects non-trivial steps, so the channel slice has step 1.
         channel_index, spatial_index = key[0], key[1:]
-        channel_step = 1 if channel_index.step is None else channel_index.step
-        data = [
-            self._read_stack(stack_index, spatial_index)
-            for stack_index in self.stack_indices[channel_index.start:channel_index.stop:channel_step]
-        ]
-        return squeeze_singletons(np.stack(data, axis=0), to_squeeze).copy()
+        selected = self.stack_indices[channel_index.start:channel_index.stop]
+        if selected:
+            stacked = np.stack([self._read_stack(idx, spatial_index) for idx in selected], axis=0)
+        else:  # empty channel selection -> empty array with the right spatial shape.
+            spatial_shape = tuple(len(range(*sl.indices(n)))
+                                  for sl, n in zip(spatial_index, self.shape[1:]))
+            stacked = np.empty((0,) + spatial_shape, dtype=self._dtype)
+        return squeeze_singletons(stacked, to_squeeze).copy()

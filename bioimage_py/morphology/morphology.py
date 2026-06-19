@@ -8,17 +8,15 @@ the ``local`` / ``subprocess`` / ``slurm`` backends. No custom C++ (nifty) code 
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
 from ..util import BlockDescriptor, to_roi
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 __all__ = ["morphology"]
 
@@ -135,11 +133,6 @@ def _to_dataframe(labels: np.ndarray, size: np.ndarray, com: np.ndarray,
     ``bb_max`` is converted to an exclusive slice stop (``max_coordinate + 1``) so the bounding box of a
     row is ``tuple(slice(row.bb_min_<ax>, row.bb_max_<ax>) for ax in axes)``.
     """
-    try:
-        import pandas as pd
-    except ImportError as exc:  # pragma: no cover - exercised only without the optional dependency.
-        raise ImportError("morphology() returns a pandas DataFrame; install pandas to use it.") from exc
-
     axes = _axis_names(ndim)
     columns = {"label": labels.astype("uint64"), "size": size.astype("int64")}
     for a, ax in enumerate(axes):

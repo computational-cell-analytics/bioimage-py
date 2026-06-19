@@ -37,7 +37,10 @@ class NiftiFile(Mapping):
         return self
 
     def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
-        pass
+        # Release any cached / memory-mapped array data held by the nibabel image.
+        uncache = getattr(self.nifti, "uncache", None)
+        if uncache is not None:
+            uncache()
 
     @property
     def attrs(self) -> Dict[str, Any]:
@@ -67,7 +70,12 @@ class NiftiDataset:
 
     @property
     def dtype(self) -> np.dtype:
-        """The numpy dtype of the data."""
+        """The on-disk numpy dtype of the data.
+
+        Note: for files with a stored scaling (``scl_slope``/``scl_inter``), reads via
+        :meth:`__getitem__` are upcast by nibabel (typically to float), so the returned array's
+        dtype can differ from this on-disk dtype.
+        """
         return self._data.get_data_dtype()
 
     @property

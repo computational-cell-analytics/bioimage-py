@@ -28,6 +28,11 @@ class CloudVolumeSource(Source):
     numpy-order view (single channel only), transposing on read and write. Indices are local to the
     source origin (``offset``) and translated to absolute CloudVolume coordinates internally.
 
+    Not thread-safe: the CloudVolume handle is not safe to share across threads, so do not run the
+    ``local`` backend with ``num_workers > 1`` over this source. For parallelism use the
+    ``subprocess``/``slurm`` backends, where each worker reopens the source from its spec; concurrent
+    block writes must still be chunk-aligned (the runner's write-safety guard enforces this).
+
     Args:
         volume: An opened CloudVolume (precomputed) handle.
         offset: Absolute XYZ origin of the view; defaults to the volume's ``voxel_offset``.
