@@ -28,6 +28,7 @@ import pandas as pd
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
+from ..util import check_rerun_args
 from .morphology import _axis_names
 
 __all__ = ["regionprops"]
@@ -227,6 +228,8 @@ def regionprops(
     num_workers: int = 1,
     job_type: str = "local",
     job_config: Optional[RunnerConfig] = None,
+    item_ids: Optional[Sequence[int]] = None,
+    resume_from: Optional[str] = None,
     pre_cleanup: Optional[Callable[[str], None]] = None,
 ) -> "pd.DataFrame":
     """Compute per-object morphology features for a labeled volume, one task per object.
@@ -254,6 +257,14 @@ def regionprops(
         num_workers: Number of parallel workers (threads for ``local``, tasks for distributed backends).
         job_type: Execution backend: one of ``"local"``, ``"subprocess"`` or ``"slurm"``.
         job_config: Backend configuration (a `RunnerConfig` / `SlurmConfig`).
+        item_ids: Restrict processing to these item indices (rows of ``table``), e.g. to re-run
+            previously failed objects; the result then covers only those rows. An item id indexes a
+            *row* of ``table``, so the same table (same row order) must be passed as in the original
+            run. Mutually exclusive with ``resume_from``.
+        resume_from: Distributed only; the preserved temp folder of a failed run to resume and merge
+            (see ``runner.run``). The result then covers all objects (the already-completed merged
+            with the re-run ones). The recommended rerun path for regionprops. Mutually exclusive
+            with ``item_ids``.
         pre_cleanup: Optional ``pre_cleanup(tmp_folder)`` callback invoked on the orchestrating
             process with the job temp folder right before it is deleted (distributed backends only).
             Use it to read out the per-task timing files under ``tmp_folder/timings/`` before cleanup.
@@ -266,6 +277,7 @@ def regionprops(
         ``bb_min_<axis>``/``bb_max_<axis>`` (global voxels), and ``surface_area`` (only when
         ``compute_surface`` and the input is 3D).
     """
+    check_rerun_args(job_type, resume_from, item_ids, subset_name="item_ids")
     src = as_source(input)
     if not np.issubdtype(np.dtype(src.dtype), np.integer):
         raise ValueError(f"regionprops expects an integer label image, got dtype {src.dtype}.")
@@ -309,6 +321,7 @@ def regionprops(
     }
     runner = get_runner(job_type, job_config)
     results = runner.map(functools.partial(_object_features, ctx=ctx), n,
+                         item_ids=item_ids, resume_from=resume_from,
                          num_workers=num_workers, has_return_val=True, name="regionprops",
                          pre_cleanup=pre_cleanup)
 

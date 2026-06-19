@@ -142,6 +142,11 @@ def label(
 ) -> SourceLike:
     """Label connected components of (optionally thresholded) data, block-wise.
 
+    Unlike the single-pass operations, ``label`` is multi-stage with a global cross-block merge
+    (per-block labeling, then a union-find over touching components across block faces), so it
+    does **not** accept ``block_ids`` or ``resume_from``: a failed run must be re-run whole (it is
+    idempotent given the same ``output``).
+
     Args:
         input: The input data (a numpy/zarr/n5 array or a `Source`).
         output: The ``uint64`` output array to write the labels into. Optional for local

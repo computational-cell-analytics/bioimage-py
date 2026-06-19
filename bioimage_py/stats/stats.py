@@ -9,7 +9,7 @@ import numpy as np
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
-from ..util import BlockDescriptor, to_roi
+from ..util import BlockDescriptor, check_rerun_args, to_roi
 
 __all__ = ["max", "min", "mean", "std", "mean_and_std", "min_and_max"]
 
@@ -71,6 +71,7 @@ def max(
     job_config: Optional[RunnerConfig] = None,
     mask: Optional[SourceLike] = None,
     block_ids: Optional[Sequence[int]] = None,
+    resume_from: Optional[str] = None,
 ) -> float:
     """Compute the maximum value of the data, optionally restricted to a mask.
 
@@ -84,16 +85,20 @@ def max(
         job_config: Backend configuration (a `RunnerConfig` / `SlurmConfig`).
         mask: Optional binary mask; values outside the mask are excluded from the computation.
         block_ids: Restrict processing to these block ids (e.g. to re-run previously failed blocks).
+        resume_from: Distributed only; the preserved temp folder of a failed run to resume and
+            merge (see ``runner.run``). Mutually exclusive with ``block_ids``.
 
     Returns:
         The maximum value.
     """
+    check_rerun_args(job_type, resume_from, block_ids)
     if _check_direct(job_type, num_workers, block_shape, mask, block_ids):
         src = as_source(input)
         return float(np.max(src[_full_roi(src)]))
     runner = get_runner(job_type, job_config)
     results = runner.run(_max_block, [input], num_workers=num_workers, block_shape=block_shape,
-                         mask=mask, block_ids=block_ids, has_return_val=True, name="max")
+                         mask=mask, block_ids=block_ids, resume_from=resume_from,
+                         has_return_val=True, name="max")
     results = [r for r in results if r is not None]
     if not results:
         raise ValueError("No values within the mask; cannot compute a maximum.")
@@ -119,6 +124,7 @@ def min_and_max(
     job_config: Optional[RunnerConfig] = None,
     mask: Optional[SourceLike] = None,
     block_ids: Optional[Sequence[int]] = None,
+    resume_from: Optional[str] = None,
 ) -> Tuple[float, float]:
     """Compute the (minimum, maximum) of the data, optionally restricted to a mask.
 
@@ -132,17 +138,21 @@ def min_and_max(
         job_config: Backend configuration (a `RunnerConfig` / `SlurmConfig`).
         mask: Optional binary mask; values outside the mask are excluded from the computation.
         block_ids: Restrict processing to these block ids (e.g. to re-run previously failed blocks).
+        resume_from: Distributed only; the preserved temp folder of a failed run to resume and
+            merge (see ``runner.run``). Mutually exclusive with ``block_ids``.
 
     Returns:
         The minimum and maximum values, as a ``(min, max)`` tuple.
     """
+    check_rerun_args(job_type, resume_from, block_ids)
     if _check_direct(job_type, num_workers, block_shape, mask, block_ids):
         src = as_source(input)
         d = src[_full_roi(src)]
         return float(np.min(d)), float(np.max(d))
     runner = get_runner(job_type, job_config)
     results = runner.run(_min_and_max_block, [input], num_workers=num_workers, block_shape=block_shape,
-                         mask=mask, block_ids=block_ids, has_return_val=True, name="min_and_max")
+                         mask=mask, block_ids=block_ids, resume_from=resume_from,
+                         has_return_val=True, name="min_and_max")
     results = [r for r in results if r is not None]
     if not results:
         raise ValueError("No values within the mask; cannot compute min/max.")
@@ -159,6 +169,7 @@ def min(
     job_config: Optional[RunnerConfig] = None,
     mask: Optional[SourceLike] = None,
     block_ids: Optional[Sequence[int]] = None,
+    resume_from: Optional[str] = None,
 ) -> float:
     """Compute the minimum value of the data, optionally restricted to a mask.
 
@@ -172,11 +183,14 @@ def min(
         job_config: Backend configuration (a `RunnerConfig` / `SlurmConfig`).
         mask: Optional binary mask; values outside the mask are excluded from the computation.
         block_ids: Restrict processing to these block ids (e.g. to re-run previously failed blocks).
+        resume_from: Distributed only; the preserved temp folder of a failed run to resume and
+            merge (see ``runner.run``). Mutually exclusive with ``block_ids``.
 
     Returns:
         The minimum value.
     """
-    return min_and_max(input, num_workers, block_shape, job_type, job_config, mask, block_ids)[0]
+    return min_and_max(input, num_workers, block_shape, job_type, job_config, mask, block_ids,
+                       resume_from)[0]
 
 
 # --- mean / std ------------------------------------------------------------------------
@@ -198,6 +212,7 @@ def mean_and_std(
     job_config: Optional[RunnerConfig] = None,
     mask: Optional[SourceLike] = None,
     block_ids: Optional[Sequence[int]] = None,
+    resume_from: Optional[str] = None,
 ) -> Tuple[float, float]:
     """Compute the (mean, standard deviation) of the data, optionally restricted to a mask.
 
@@ -214,17 +229,21 @@ def mean_and_std(
         job_config: Backend configuration (a `RunnerConfig` / `SlurmConfig`).
         mask: Optional binary mask; values outside the mask are excluded from the computation.
         block_ids: Restrict processing to these block ids (e.g. to re-run previously failed blocks).
+        resume_from: Distributed only; the preserved temp folder of a failed run to resume and
+            merge (see ``runner.run``). Mutually exclusive with ``block_ids``.
 
     Returns:
         The mean and standard deviation, as a ``(mean, std)`` tuple.
     """
+    check_rerun_args(job_type, resume_from, block_ids)
     if _check_direct(job_type, num_workers, block_shape, mask, block_ids):
         src = as_source(input)
         d = src[_full_roi(src)]
         return float(np.mean(d)), float(np.std(d))
     runner = get_runner(job_type, job_config)
     results = runner.run(_mean_and_std_block, [input], num_workers=num_workers, block_shape=block_shape,
-                         mask=mask, block_ids=block_ids, has_return_val=True, name="mean_and_std")
+                         mask=mask, block_ids=block_ids, resume_from=resume_from,
+                         has_return_val=True, name="mean_and_std")
     results = [r for r in results if r is not None]
     if not results:
         raise ValueError("No values within the mask; cannot compute mean/std.")
@@ -245,6 +264,7 @@ def mean(
     job_config: Optional[RunnerConfig] = None,
     mask: Optional[SourceLike] = None,
     block_ids: Optional[Sequence[int]] = None,
+    resume_from: Optional[str] = None,
 ) -> float:
     """Compute the mean of the data, optionally restricted to a mask.
 
@@ -258,11 +278,14 @@ def mean(
         job_config: Backend configuration (a `RunnerConfig` / `SlurmConfig`).
         mask: Optional binary mask; values outside the mask are excluded from the computation.
         block_ids: Restrict processing to these block ids (e.g. to re-run previously failed blocks).
+        resume_from: Distributed only; the preserved temp folder of a failed run to resume and
+            merge (see ``runner.run``). Mutually exclusive with ``block_ids``.
 
     Returns:
         The mean value.
     """
-    return mean_and_std(input, num_workers, block_shape, job_type, job_config, mask, block_ids)[0]
+    return mean_and_std(input, num_workers, block_shape, job_type, job_config, mask, block_ids,
+                        resume_from)[0]
 
 
 def std(
@@ -273,6 +296,7 @@ def std(
     job_config: Optional[RunnerConfig] = None,
     mask: Optional[SourceLike] = None,
     block_ids: Optional[Sequence[int]] = None,
+    resume_from: Optional[str] = None,
 ) -> float:
     """Compute the standard deviation of the data, optionally restricted to a mask.
 
@@ -286,8 +310,11 @@ def std(
         job_config: Backend configuration (a `RunnerConfig` / `SlurmConfig`).
         mask: Optional binary mask; values outside the mask are excluded from the computation.
         block_ids: Restrict processing to these block ids (e.g. to re-run previously failed blocks).
+        resume_from: Distributed only; the preserved temp folder of a failed run to resume and
+            merge (see ``runner.run``). Mutually exclusive with ``block_ids``.
 
     Returns:
         The standard deviation.
     """
-    return mean_and_std(input, num_workers, block_shape, job_type, job_config, mask, block_ids)[1]
+    return mean_and_std(input, num_workers, block_shape, job_type, job_config, mask, block_ids,
+                        resume_from)[1]

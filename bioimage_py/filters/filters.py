@@ -13,7 +13,8 @@ import numpy as np
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
-from ..util import BlockDescriptor, ComputeFn, normalize_halo, sigma_to_halo, to_roi
+from ..util import (BlockDescriptor, ComputeFn, check_rerun_args, normalize_halo, sigma_to_halo,
+                    to_roi)
 
 __all__ = [
     "apply_filter",
@@ -129,6 +130,8 @@ def apply_filter(
     job_config: Optional[RunnerConfig] = None,
     num_workers: int = 1,
     mask: Optional[SourceLike] = None,
+    block_ids: Optional[Sequence[int]] = None,
+    resume_from: Optional[str] = None,
 ) -> SourceLike:
     """Apply a (gaussian-family) filter block-wise.
 
@@ -152,6 +155,11 @@ def apply_filter(
             backends).
         mask: Optional binary mask; values outside the mask are excluded from the computation
             (out-of-mask output voxels are left unchanged).
+        block_ids: Restrict processing to these block ids (e.g. to re-run previously failed blocks
+            into the existing ``output``). Mutually exclusive with ``resume_from``.
+        resume_from: Distributed only; the preserved temp folder of a failed run to resume (see
+            ``runner.run``); the missing blocks are written into ``output``. Mutually exclusive
+            with ``block_ids``.
 
     Returns:
         The output array (the provided ``output``, or a newly allocated numpy array).
@@ -160,6 +168,7 @@ def apply_filter(
         raise ValueError(f"Unknown filter {filter_name!r}; valid filters: {sorted(_FILTER_FUNCTIONS)}.")
     if filter_name == "structure_tensor_eigenvalues" and outer_scale is None:
         raise ValueError("structure_tensor_eigenvalues requires 'outer_scale'.")
+    check_rerun_args(job_type, resume_from, block_ids)
 
     src = as_source(input)
     ndim = src.ndim
@@ -168,7 +177,9 @@ def apply_filter(
         (float(outer_scale),) if filter_name == "structure_tensor_eigenvalues" else ()
     )
     multi_channel = filter_name in _MULTI_CHANNEL and return_channel is None
-    direct = job_type == "local" and num_workers == 1 and block_shape is None and mask is None
+    # A subset/resume rerun is inherently block-wise, so it cannot use the direct (whole-array) path.
+    direct = (job_type == "local" and num_workers == 1 and block_shape is None and mask is None
+              and block_ids is None and resume_from is None)
 
     if output is None:
         if job_type != "local":
@@ -192,7 +203,8 @@ def apply_filter(
     halo = normalize_halo(sigma_to_halo(sigma, order), ndim)
     runner = get_runner(job_type, job_config)
     runner.run(compute, [input], outputs=[out], halo=halo, block_shape=block_shape,
-               mask=mask, num_workers=num_workers, name=filter_name)
+               mask=mask, num_workers=num_workers, block_ids=block_ids, resume_from=resume_from,
+               name=filter_name)
     return out_array
 
 
@@ -207,7 +219,7 @@ def gaussian_smoothing(input: SourceLike, sigma: Sigma, output: Optional[SourceL
         output: The output array to write into. Optional for local execution — a numpy array
             is allocated and returned if omitted; **required** for distributed execution.
         **kwargs: Additional keyword arguments forwarded to :func:`apply_filter` (``block_shape``,
-            ``job_type``, ``job_config``, ``num_workers``, ``mask``).
+            ``job_type``, ``job_config``, ``num_workers``, ``mask``, ``block_ids``, ``resume_from``).
 
     Returns:
         The output array (the provided ``output``, or a newly allocated numpy array).
@@ -226,7 +238,7 @@ def gaussian_gradient_magnitude(input: SourceLike, sigma: Sigma,
         output: The output array to write into. Optional for local execution — a numpy array
             is allocated and returned if omitted; **required** for distributed execution.
         **kwargs: Additional keyword arguments forwarded to :func:`apply_filter` (``block_shape``,
-            ``job_type``, ``job_config``, ``num_workers``, ``mask``).
+            ``job_type``, ``job_config``, ``num_workers``, ``mask``, ``block_ids``, ``resume_from``).
 
     Returns:
         The output array (the provided ``output``, or a newly allocated numpy array).
@@ -245,7 +257,7 @@ def laplacian_of_gaussian(input: SourceLike, sigma: Sigma, output: Optional[Sour
         output: The output array to write into. Optional for local execution — a numpy array
             is allocated and returned if omitted; **required** for distributed execution.
         **kwargs: Additional keyword arguments forwarded to :func:`apply_filter` (``block_shape``,
-            ``job_type``, ``job_config``, ``num_workers``, ``mask``).
+            ``job_type``, ``job_config``, ``num_workers``, ``mask``, ``block_ids``, ``resume_from``).
 
     Returns:
         The output array (the provided ``output``, or a newly allocated numpy array).

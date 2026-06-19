@@ -79,6 +79,7 @@ class Runner(ABC):
         name: str = "",
         roi: Optional[Tuple[slice, ...]] = None,
         pre_cleanup: Optional[Callable[[str], None]] = None,
+        resume_from: Optional[str] = None,
     ) -> Optional[list]:
         """Run ``function`` block-wise over the inputs/outputs.
 
@@ -100,11 +101,24 @@ class Runner(ABC):
                 worth keeping from the temp folder (e.g. the per-task timing files under
                 ``tmp_folder/timings/``) before cleanup. Ignored by the local runner, which
                 has no temp folder.
+            resume_from: Distributed backends only. Path to the preserved temp folder of a
+                failed run (``RunnerError.tmp_folder``). Re-runs only the blocks that did not
+                complete and merges them with the already-completed ones, so the result is
+                correct and complete. The run is resumed from the serialized payload, so
+                ``function``/``inputs``/``outputs``/``block_shape``/... from this call are
+                **ignored** -- pass ``resume_from`` to *finish the same call*, not to start a
+                new one. Mutually exclusive with ``block_ids``.
 
         Returns:
             The list of per-block return values (in ``block_ids`` order) if
             ``has_return_val``, else ``None``.
         """
+        if resume_from is not None:
+            if block_ids is not None:
+                raise ValueError("resume_from and block_ids are mutually exclusive; resume_from "
+                                 "re-runs the original partition's un-done blocks.")
+            return self._resume_entry(resume_from, name=name, pre_cleanup=pre_cleanup)
+
         inputs = [as_source(i) for i in inputs]
         outputs = [as_source(o) for o in outputs]
         mask_source = as_source(mask) if mask is not None else None
@@ -160,6 +174,7 @@ class Runner(ABC):
         has_return_val: bool = True,
         name: str = "",
         pre_cleanup: Optional[Callable[[str], None]] = None,
+        resume_from: Optional[str] = None,
     ) -> Optional[list]:
         """Map ``function(index)`` over item indices in parallel, across any backend.
 
@@ -180,6 +195,9 @@ class Runner(ABC):
             name: A short name for progress display.
             pre_cleanup: Optional ``pre_cleanup(tmp_folder)`` callback (distributed backends
                 only); see :meth:`run`.
+            resume_from: Distributed backends only; the preserved temp folder of a failed run
+                (see :meth:`run`). Re-runs only the incomplete items and merges with those
+                already done. Mutually exclusive with ``item_ids``.
 
         Returns:
             The list of per-item return values (in ``item_ids`` order) if ``has_return_val``,
@@ -188,6 +206,12 @@ class Runner(ABC):
         Raises:
             ValueError: If neither ``n_items`` nor ``item_ids`` is given.
         """
+        if resume_from is not None:
+            if item_ids is not None:
+                raise ValueError("resume_from and item_ids are mutually exclusive; resume_from "
+                                 "re-runs the original partition's un-done items.")
+            return self._resume_entry(resume_from, name=name, pre_cleanup=pre_cleanup)
+
         if item_ids is None:
             if n_items is None:
                 raise ValueError("map() requires either n_items or item_ids.")
@@ -200,6 +224,18 @@ class Runner(ABC):
             num_workers=num_workers, name=name, pre_cleanup=pre_cleanup,
         )
         return results if has_return_val else None
+
+    def _resume_entry(self, tmp_folder: str, *, name: str,
+                      pre_cleanup: Optional[Callable[[str], None]]) -> Optional[list]:
+        """Resume a failed run from its temp folder; overridden by distributed runners.
+
+        The local runner keeps no temp folder, so resuming is not possible here.
+        """
+        raise ValueError(
+            "resume_from is only valid for distributed backends (subprocess/slurm); the local "
+            "runner keeps no temp folder. Re-run the operation to recompute in-process "
+            "(optionally with block_ids=err.failed_block_ids for a subset)."
+        )
 
     @staticmethod
     def _validate_write_safety(outputs: Sequence[Source], block_shape: Sequence[int]) -> None:

@@ -15,7 +15,7 @@ import numpy as np
 from .runner import get_runner
 from .runner.config import RunnerConfig
 from .sources import Source, SourceLike, as_source
-from .util import BlockDescriptor, ComputeFn, to_roi
+from .util import BlockDescriptor, ComputeFn, check_rerun_args, to_roi
 
 __all__ = ["copy"]
 
@@ -60,6 +60,8 @@ def _copy_source(
     num_workers: int,
     mask: Optional[SourceLike],
     name: str,
+    block_ids: Optional[Sequence[int]] = None,
+    resume_from: Optional[str] = None,
 ) -> SourceLike:
     """Materialize ``input`` into ``output`` block-wise (shared by :func:`copy` and downsample).
 
@@ -67,9 +69,12 @@ def _copy_source(
     distributed execution), the direct (whole-array) fast path, and the runner dispatch. The output
     shape and dtype are taken from ``input`` (so a shape-changing wrapper input is handled too).
     """
+    check_rerun_args(job_type, resume_from, block_ids)
     src = as_source(input)
     ndim = src.ndim
-    direct = job_type == "local" and num_workers == 1 and block_shape is None and mask is None
+    # A subset/resume rerun is block-wise, so it cannot use the direct (whole-array) path.
+    direct = (job_type == "local" and num_workers == 1 and block_shape is None and mask is None
+              and block_ids is None and resume_from is None)
 
     if output is None:
         if job_type != "local":
@@ -92,7 +97,8 @@ def _copy_source(
     compute = _make_compute()
     runner = get_runner(job_type, job_config)
     runner.run(compute, [src], outputs=[out], block_shape=block_shape,
-               mask=mask, num_workers=num_workers, name=name)
+               mask=mask, num_workers=num_workers, block_ids=block_ids, resume_from=resume_from,
+               name=name)
     return out_array
 
 
@@ -105,6 +111,8 @@ def copy(
     job_config: Optional[RunnerConfig] = None,
     num_workers: int = 1,
     mask: Optional[SourceLike] = None,
+    block_ids: Optional[Sequence[int]] = None,
+    resume_from: Optional[str] = None,
 ) -> SourceLike:
     """Copy a source into an output, block-wise.
 
@@ -127,9 +135,15 @@ def copy(
             backends).
         mask: Optional binary mask; only voxels within the mask are copied (out-of-mask output
             voxels are left unchanged).
+        block_ids: Restrict processing to these block ids (e.g. to re-run previously failed blocks
+            into the existing ``output``). Mutually exclusive with ``resume_from``.
+        resume_from: Distributed only; the preserved temp folder of a failed run to resume (see
+            ``runner.run``); the missing blocks are written into ``output``. Mutually exclusive
+            with ``block_ids``.
 
     Returns:
         The output array (the provided ``output``, or a newly allocated numpy array).
     """
     return _copy_source(input, output, block_shape=block_shape, job_type=job_type,
-                        job_config=job_config, num_workers=num_workers, mask=mask, name="copy")
+                        job_config=job_config, num_workers=num_workers, mask=mask, name="copy",
+                        block_ids=block_ids, resume_from=resume_from)

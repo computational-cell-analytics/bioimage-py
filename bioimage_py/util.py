@@ -141,6 +141,31 @@ def get_blocking(shape: Sequence[int], block_shape: Sequence[int],
     return bic.utils.Blocking(roi_begin, roi_end, [int(b) for b in block_shape])
 
 
+def check_rerun_args(job_type: str, resume_from: Optional[str],
+                     subset: Optional[Sequence[int]], *, subset_name: str = "block_ids") -> None:
+    """Validate an operation's rerun arguments (``resume_from`` vs a subset).
+
+    Args:
+        job_type: The execution backend (``"local"``/``"subprocess"``/``"slurm"``).
+        resume_from: The preserved temp folder to resume from, or ``None``.
+        subset: The explicit subset (``block_ids``/``item_ids``) to process, or ``None``.
+        subset_name: The subset argument's name, for error messages.
+
+    Raises:
+        ValueError: If both ``resume_from`` and ``subset`` are given, or if ``resume_from`` is
+            used with the local backend (which keeps no temp folder to resume from).
+    """
+    if resume_from is not None:
+        if subset is not None:
+            raise ValueError(f"Pass either 'resume_from' or '{subset_name}', not both.")
+        if job_type == "local":
+            raise ValueError(
+                "resume_from is only valid for distributed backends (subprocess/slurm); the "
+                "local runner keeps no temp folder. Re-run the operation in-process instead "
+                f"(optionally with {subset_name}=err.failed_block_ids for a subset)."
+            )
+
+
 def group_blocks_by_shard(
     blocking: Blocking,
     outputs: Sequence[Source],
