@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from concurrent import futures
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from bioimage_cpp.utils import Blocking
 from threadpoolctl import threadpool_limits
@@ -11,7 +11,8 @@ from tqdm import tqdm
 
 from ..sources.base import Source
 from ..sources.dispatch import SourceLike, as_source
-from ..util import ComputeFn, derive_block_shape, get_blocking, normalize_halo
+from ..util import (ComputeFn, derive_block_shape, get_blocking, group_blocks_by_shard,
+                    maybe_warn_imbalance, normalize_halo)
 from .config import RunnerConfig
 
 
@@ -207,11 +208,18 @@ class Runner(ABC):
         This prevents two blocks from concurrently writing the same chunk (which would
         corrupt it). Auto-derivation of a safe block shape is a flagged TODO.
 
+        Sharded outputs (``out.shards is not None``) are exempt: for them the atomic write
+        unit is the shard, and they are made safe by shard-exclusive routing (each shard's
+        blocks go to one worker, run sequentially) rather than by constraining the block
+        shape — see :func:`bioimage_py.util.group_blocks_by_shard`.
+
         ``block_shape`` is spatial-only, but an output may carry a leading channel axis (its
         ``chunks`` then have one extra leading entry); the block shape is aligned against the
         trailing (spatial) chunk axes, since the channel axis is fully written by every block.
         """
         for out in outputs:
+            if out.shards is not None:
+                continue
             chunks = out.chunks
             if chunks is None or len(chunks) < len(block_shape):
                 continue
@@ -290,7 +298,15 @@ class LocalRunner(Runner):
         def call_one(bid: int) -> Any:
             return run_block(function, blocking, bid, inputs, outputs, mask, halo)
 
-        return self._run_pool(block_ids, call_one, num_workers, name, unit="block")
+        # For sharded outputs, group blocks so each shard is written by a single thread
+        # (a group runs sequentially) and never corrupted by concurrent writes; otherwise
+        # each block is its own group, reproducing the plain one-future-per-block path.
+        groups = group_blocks_by_shard(blocking, outputs, block_ids)
+        if groups is None:
+            groups = [[int(b)] for b in block_ids]
+        else:
+            maybe_warn_imbalance([len(g) for g in groups], num_workers, len(groups), name)
+        return self._run_pool(groups, call_one, num_workers, name, unit="block")
 
     def _execute_map(
         self,
@@ -303,52 +319,73 @@ class LocalRunner(Runner):
         pre_cleanup: Optional[Callable[[str], None]] = None,
     ) -> List[Any]:
         """Run ``function(index)`` over ``item_ids`` in a thread pool (``pre_cleanup`` ignored)."""
-        return self._run_pool(item_ids, lambda i: function(int(i)), num_workers, name, unit="item")
+        groups = [[int(i)] for i in item_ids]
+        return self._run_pool(groups, lambda i: function(int(i)), num_workers, name, unit="item")
 
     @staticmethod
-    def _run_pool(ids: Sequence[int], call_one: Callable[[int], Any], num_workers: int,
-                  name: str, *, unit: str = "block") -> List[Any]:
+    def _run_pool(groups: Sequence[Sequence[int]], call_one: Callable[[int], Any],
+                  num_workers: int, name: str, *, unit: str = "block") -> List[Any]:
         """Run ``call_one(id)`` for each id in a thread pool, ordered, re-raising failures.
 
+        The schedulable unit is a *group*: the ids in a group are run sequentially within one
+        worker thread, while distinct groups run concurrently. Singleton groups reproduce the
+        one-future-per-id behavior; multi-id groups serialize same-shard writes (see
+        :func:`bioimage_py.util.group_blocks_by_shard`).
+
         Args:
-            ids: The work ids (block ids or item indices).
+            groups: The work groups; each is a list of ids (block ids or item indices) run
+                sequentially. Results are returned in flattened ``groups`` order.
             call_one: The per-id callable returning that id's result.
             num_workers: Number of worker threads.
             name: A short name for the progress bar (disabled when empty).
             unit: The noun used in the failure message ("block" or "item").
 
         Returns:
-            The per-id results in ``ids`` order.
+            The per-id results in flattened ``groups`` order.
 
         Raises:
-            RunnerError: If any id fails; the failed ids are attached for re-running.
+            RunnerError: If any id fails; the failed ids are attached for re-running. When an
+                id in a group fails, the remaining (un-run) ids of that group are reported as
+                failed too, since later same-shard writes cannot safely proceed.
         """
-        ids = list(ids)
-        results: list = [None] * len(ids)
+        groups = [list(g) for g in groups]
+        flat_ids = [i for g in groups for i in g]
+        result_by_id: Dict[int, Any] = {}
         failed: List[int] = []
         first_error: Optional[BaseException] = None
 
         @threadpool_limits.wrap(limits=1)
-        def _run(idx: int):
-            return idx, call_one(ids[idx])
+        def _run_group(group: List[int]):
+            local: Dict[int, Any] = {}
+            local_failed: List[int] = []
+            err: Optional[BaseException] = None
+            for k, bid in enumerate(group):
+                try:
+                    local[bid] = call_one(bid)
+                except Exception as error:  # noqa: BLE001 - we re-raise as RunnerError
+                    err = error
+                    local_failed = list(group[k:])
+                    break
+            return local, local_failed, err
 
         with futures.ThreadPoolExecutor(max(1, int(num_workers))) as tp:
-            fut_to_idx = {tp.submit(_run, idx): idx for idx in range(len(ids))}
-            for fut in tqdm(futures.as_completed(fut_to_idx), total=len(ids),
-                            desc=name or None, disable=not name):
-                idx = fut_to_idx[fut]
-                try:
-                    i, res = fut.result()
-                    results[i] = res
-                except Exception as error:  # noqa: BLE001 - we re-raise as RunnerError
-                    failed.append(ids[idx])
-                    if first_error is None:
-                        first_error = error
+            fut_to_group = {tp.submit(_run_group, g): g for g in groups}
+            with tqdm(total=len(flat_ids), desc=name or None, disable=not name) as pbar:
+                for fut in futures.as_completed(fut_to_group):
+                    group = fut_to_group[fut]
+                    local, local_failed, err = fut.result()
+                    result_by_id.update(local)
+                    if local_failed:
+                        failed.extend(local_failed)
+                        if first_error is None:
+                            first_error = err
+                    pbar.update(len(group))
 
         if failed:
+            failed = sorted(set(failed))
             raise RunnerError(
                 f"{len(failed)} {unit}(s) failed in '{name or 'run'}': "
-                f"{sorted(failed)[:10]}. First error: {first_error!r}",
-                failed_block_ids=sorted(failed),
+                f"{failed[:10]}. First error: {first_error!r}",
+                failed_block_ids=failed,
             )
-        return results
+        return [result_by_id[i] for i in flat_ids]

@@ -24,7 +24,7 @@ from bioimage_cpp.utils import Blocking
 from tqdm import tqdm
 
 from ..sources.base import Source
-from ..util import ComputeFn
+from ..util import ComputeFn, group_blocks_by_shard, maybe_warn_imbalance
 from .base import Runner, RunnerError
 from .config import RunnerConfig, SlurmConfig
 
@@ -39,6 +39,22 @@ def _partition(block_ids: Sequence[int], n_tasks: int) -> List[List[int]]:
         size = base + (1 if t < extra else 0)
         tasks.append(block_ids[start:start + size])
         start += size
+    return tasks
+
+
+def _pack_groups(groups: Sequence[Sequence[int]], num_workers: int, name: str) -> List[List[int]]:
+    """Bin-pack whole shard-groups into at most ``num_workers`` tasks (least-loaded first)."""
+    groups = [list(g) for g in groups if g]
+    if not groups:
+        return [[]]
+    n_tasks = max(1, min(int(num_workers), len(groups)))
+    tasks: List[List[int]] = [[] for _ in range(n_tasks)]
+    loads = [0] * n_tasks
+    for group in sorted(groups, key=len, reverse=True):
+        t = min(range(n_tasks), key=lambda i: loads[i])
+        tasks[t].extend(group)
+        loads[t] += len(group)
+    maybe_warn_imbalance(loads, num_workers, len(groups), name)
     return tasks
 
 
@@ -112,8 +128,12 @@ class _DistributedRunner(Runner):
             "roi": roi,
             "halo": None if halo is None else [int(h) for h in halo],
         }
+        # Sharded outputs: group blocks so each shard's blocks land in one task (the worker
+        # runs them sequentially), preventing concurrent same-shard writes. None => no
+        # sharded output, fall back to the default contiguous partition.
+        groups = group_blocks_by_shard(blocking, outputs, block_ids)
         return self._run_ids(function, block_ids, payload_extra, has_return_val,
-                             num_workers, name, pre_cleanup)
+                             num_workers, name, pre_cleanup, groups=groups)
 
     def _execute_map(
         self,
@@ -138,6 +158,7 @@ class _DistributedRunner(Runner):
         num_workers: int,
         name: str,
         pre_cleanup: Optional[Callable[[str], None]],
+        groups: Optional[List[List[int]]] = None,
     ) -> List[Any]:
         """Shared protocol: write the payload + per-task id lists, launch, and finalize.
 
@@ -153,6 +174,10 @@ class _DistributedRunner(Runner):
             num_workers: Number of parallel tasks.
             name: A short name for progress display.
             pre_cleanup: Optional pre-cleanup callback forwarded to :meth:`_finalize`.
+            groups: Optional shard-exclusive block groups (from
+                :func:`bioimage_py.util.group_blocks_by_shard`); when given, whole groups are
+                bin-packed into tasks so each shard is written by a single worker. ``None``
+                uses the default contiguous partition. Result order is by ``ids`` regardless.
 
         Returns:
             The per-id return values in ``ids`` order if ``has_return_val``, else ``None``s.
@@ -179,8 +204,12 @@ class _DistributedRunner(Runner):
         with open(os.path.join(tmp, "source.py"), "w") as f:
             f.write(source)
 
-        n_tasks = max(1, min(int(num_workers), len(ids))) if ids else 1
-        tasks = _partition(ids, n_tasks)
+        if groups is None:
+            n_tasks = max(1, min(int(num_workers), len(ids))) if ids else 1
+            tasks = _partition(ids, n_tasks)
+        else:
+            tasks = _pack_groups(groups, num_workers, name)
+            n_tasks = len(tasks)
         for task_id, task_ids in enumerate(tasks):
             with open(os.path.join(tmp, "blocks", f"{task_id}.json"), "w") as f:
                 json.dump([int(b) for b in task_ids], f)

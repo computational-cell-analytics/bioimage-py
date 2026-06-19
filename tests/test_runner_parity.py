@@ -43,6 +43,29 @@ def test_gaussian_parity(zarr_factory, rng):
                                    err_msg=f"mismatch for nw={nw} job={job}")
 
 
+def test_copy_sharded_parity(zarr_factory, rng):
+    # Sharded zarr v3 output: the atomic write unit is the shard, not the inner chunk. The
+    # block shape is deliberately NOT a shard multiple, so without shard-exclusive routing
+    # concurrent workers would corrupt shards. Parity across backends proves routing works.
+    a = rng.random((64, 64)).astype("float32")
+    z = zarr_factory(a, chunks=(16, 16))
+
+    # 4 blocks per 32x32 shard; block 16x16 is a chunk- but not a shard-multiple.
+    for nw, job in [(1, "local"), (4, "local"), (3, "subprocess")]:
+        out = zarr_factory(shape=(64, 64), chunks=(16, 16), shards=(32, 32),
+                           dtype="float32", fill=0.0)
+        bp.copy(z, out, block_shape=(16, 16), num_workers=nw, job_type=job)
+        np.testing.assert_array_equal(out[:], a, err_msg=f"sharded copy nw={nw} job={job}")
+
+    # Blocks straddling shard boundaries (block 32x16 vs shard 32x32): adjacent column blocks
+    # share a shard, so they must be routed to the same worker.
+    for nw, job in [(4, "local"), (3, "subprocess")]:
+        out = zarr_factory(shape=(64, 64), chunks=(16, 16), shards=(32, 32),
+                           dtype="float32", fill=0.0)
+        bp.copy(z, out, block_shape=(32, 16), num_workers=nw, job_type=job)
+        np.testing.assert_array_equal(out[:], a, err_msg=f"straddling copy nw={nw} job={job}")
+
+
 def test_morphology_parity(zarr_factory, rng):
     from skimage.measure import label as sklabel  # local import: test-only dependency.
 
