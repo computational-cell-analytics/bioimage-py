@@ -66,6 +66,34 @@ def test_copy_sharded_parity(zarr_factory, rng):
         np.testing.assert_array_equal(out[:], a, err_msg=f"straddling copy nw={nw} job={job}")
 
 
+def test_watershed_parity(zarr_factory, rng):
+    # Seeded watershed is single-stage and block-wise-approximate: a single block reproduces the
+    # whole-array reference exactly, and for a fixed (block_shape, halo) every backend is bit-identical.
+    shape, block_shape, halo = (48, 50), (16, 16), (8, 8)
+    hmap = bic.filters.gaussian_smoothing(rng.random(shape).astype("float32"), 2.0)
+    seeds = np.zeros(shape, dtype="uint32")
+    idx = tuple(rng.integers(0, s, size=12) for s in shape)
+    seeds[idx] = np.arange(1, 13, dtype="uint32")
+    zh = zarr_factory(hmap, chunks=block_shape)
+    zs = zarr_factory(seeds, chunks=block_shape)
+
+    # Single block (full block_shape) reproduces the whole-array reference exactly.
+    ref = bic.segmentation.watershed(hmap, seeds)
+    one = np.zeros(shape, dtype="uint64")
+    bp.segmentation.watershed(hmap, seeds, one, halo=(0, 0), block_shape=shape, num_workers=1)
+    np.testing.assert_array_equal(one, ref)
+
+    # Multi-block: bit-identical across backends / worker counts.
+    results = []
+    for nw, job in [(1, "local"), (4, "local"), (3, "subprocess")]:
+        out = zarr_factory(shape=shape, chunks=block_shape, dtype="uint64", fill=0)
+        bp.segmentation.watershed(zh, zs, out, halo=halo, block_shape=block_shape,
+                                  num_workers=nw, job_type=job)
+        results.append(out[:])
+    for r in results[1:]:
+        np.testing.assert_array_equal(results[0], r, err_msg="watershed backend mismatch")
+
+
 def test_morphology_parity(zarr_factory, rng):
     from skimage.measure import label as sklabel  # local import: test-only dependency.
 
