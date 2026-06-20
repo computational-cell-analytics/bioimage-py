@@ -53,10 +53,10 @@ class ArraySource(Source):
         """The wrapped array object."""
         return self._array
 
-    def __getitem__(self, roi: Tuple[slice, ...]) -> np.ndarray:
+    def _getitem(self, roi: Tuple[slice, ...]) -> np.ndarray:
         return np.asarray(self._array[roi])
 
-    def __setitem__(self, roi: Tuple[slice, ...], value: np.ndarray) -> None:
+    def _setitem(self, roi: Tuple[slice, ...], value: np.ndarray) -> None:
         self._array[roi] = value
 
     @property

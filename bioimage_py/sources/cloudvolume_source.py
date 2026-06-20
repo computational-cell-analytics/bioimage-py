@@ -94,13 +94,13 @@ class CloudVolumeSource(Source):
         ox, oy, oz = self._offset
         return (ox + x0, ox + x1), (oy + y0, oy + y1), (oz + z0, oz + z1)
 
-    def __getitem__(self, roi: Tuple[slice, ...]) -> np.ndarray:
+    def _getitem(self, roi: Tuple[slice, ...]) -> np.ndarray:
         (x0, x1), (y0, y1), (z0, z1) = self._abs_bounds(roi)
         block = np.asarray(self._vol[x0:x1, y0:y1, z0:z1])  # (x, y, z, c)
         block = block[..., 0]  # drop the single channel
         return block.transpose(2, 1, 0)  # -> (z, y, x)
 
-    def __setitem__(self, roi: Tuple[slice, ...], value: np.ndarray) -> None:
+    def _setitem(self, roi: Tuple[slice, ...], value: np.ndarray) -> None:
         (x0, x1), (y0, y1), (z0, z1) = self._abs_bounds(roi)
         arr = np.asarray(value).transpose(2, 1, 0)[..., None]  # (z,y,x) -> (x,y,z,1)
         self._vol[x0:x1, y0:y1, z0:z1] = arr

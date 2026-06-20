@@ -80,7 +80,7 @@ class ResizedSource(WrapperSource):
         """Resized sources are unsharded (input-space shards do not map to the output)."""
         return None
 
-    def __getitem__(self, roi: Tuple[slice, ...]) -> np.ndarray:
+    def _getitem(self, roi: Tuple[slice, ...]) -> np.ndarray:
         """Return the resized data for the output region ``roi``."""
         ndim = len(self._shape)
         out_start = [int(sl.start) if sl.start is not None else 0 for sl in roi]

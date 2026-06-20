@@ -13,7 +13,7 @@ See details below.
 
 A `Source` is the unit of data the runner reads from and writes to. It is a thin, **serializable** description of how to obtain (or reopen) an array, plus array-like access:
 
-- `__getitem__(roi)` / `__setitem__(roi, value)` — read/write a region of interest, given as a tuple of slices.
+- `__getitem__(index)` / `__setitem__(index, value)` — read/write a region of interest. The index is a numpy-style basic index (int / slice / ellipsis / tuple); the base class normalizes it to a full tuple of in-bounds slices and squeezes integer-indexed axes, then delegates to each source's `_getitem(roi)` / `_setitem(roi, value)`, which always receive a full tuple of slices.
 - `shape`, `dtype`, and (where applicable) `chunks` and `shards` — metadata needed for blocking and write-alignment.
 - `to_spec()` / `from_spec(spec)` — a serializable round-trip (path, internal path, storage options, …) so a worker on another node can reopen the same data. For distributed jobs this is what gets shipped, not the live handle.
 
@@ -62,7 +62,7 @@ The block descriptor comes from `bioimage_cpp.utils` (the blocking utilities `Bl
 - **No halo** (reductions like `max`, per-pixel ops): `block` is a `Block`, carrying the coordinate lists `block.begin`, `block.end`, `block.shape`, `block.ndim`. Read and write this one region.
 - **With halo** (filters, distance transforms, watershed, connected components): `block` is a `BlockWithHalo` exposing three `Block`s — `block.outer_block` (the read region, extended by the halo and clipped to the array), `block.inner_block` (the write region, no overlap, in global coordinates), and `block.inner_block_local` (the inner block expressed relative to the outer block, used to crop the result before writing). The pattern is: read `inputs[i][to_roi(block.outer_block)]`, compute on the padded array, then `outputs[j][to_roi(block.inner_block)] = result[to_roi(block.inner_block_local)]`.
 
-A `Block` has no `roi`/slice member — it carries `begin`/`end` coordinate lists. `Source` (like the underlying array) is indexed only with a tuple of slices, so the compute function converts the block explicitly with a small helper `to_roi(block) -> Tuple[slice, ...]` (`tuple(slice(b, e) for b, e in zip(block.begin, block.end))`) and indexes with the result, e.g. `input_[to_roi(block)]`. Keeping the conversion in the compute function (rather than overloading `Source` to accept a `Block`) keeps the source interface uniform — slices in, slices out — and makes it explicit which region (outer / inner / inner-local) is being indexed, which matters for halo ops where the same function touches all three.
+A `Block` has no `roi`/slice member — it carries `begin`/`end` coordinate lists. While a `Source` does accept numpy-style basic indices (normalized to slices internally), it does **not** accept a `Block`, so the compute function converts the block explicitly with a small helper `to_roi(block) -> Tuple[slice, ...]` (`tuple(slice(b, e) for b, e in zip(block.begin, block.end))`) and indexes with the result, e.g. `input_[to_roi(block)]`. Keeping the conversion in the compute function (rather than overloading `Source` to accept a `Block`) keeps it explicit which region (outer / inner / inner-local) is being indexed, which matters for halo ops where the same function touches all three.
 
 There are two **orthogonal** output channels, and a given function may use either or both:
 - **Output sources** (`outputs`): large array results written in place to storage. These never travel back to the master.

@@ -59,7 +59,7 @@ class FileSource(ArraySource):
         """Whether this source supports writing via :meth:`__setitem__`."""
         return self._writable
 
-    def __setitem__(self, roi: Tuple[slice, ...], value: np.ndarray) -> None:
+    def _setitem(self, roi: Tuple[slice, ...], value: np.ndarray) -> None:
         if not self._writable:
             raise TypeError(
                 f"FileSource for format {self._format!r} opened in mode {self._mode!r} is read-only."

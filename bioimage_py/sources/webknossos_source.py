@@ -128,12 +128,9 @@ class WebKnossosSource(Source):
         """WebKnossos sources are read-only."""
         return False
 
-    def __getitem__(self, roi: Tuple[slice, ...]) -> np.ndarray:
+    def _getitem(self, roi: Tuple[slice, ...]) -> np.ndarray:
         import webknossos as wk
 
-        if not isinstance(roi, tuple):
-            roi = (roi,)
-        roi = roi + (slice(None),) * (3 - len(roi))
         z0, z1 = _start_stop(roi[0], self.shape[0])  # mag-level ZYX
         y0, y1 = _start_stop(roi[1], self.shape[1])
         x0, x1 = _start_stop(roi[2], self.shape[2])
@@ -155,7 +152,7 @@ class WebKnossosSource(Source):
             )
         return np.transpose(data, (2, 1, 0))  # -> (z, y, x)
 
-    def __setitem__(self, roi: Tuple[slice, ...], value: np.ndarray) -> None:
+    def _setitem(self, roi: Tuple[slice, ...], value: np.ndarray) -> None:
         raise TypeError("WebKnossosSource is read-only.")
 
     def to_spec(self) -> SourceSpec:

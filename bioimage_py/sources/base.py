@@ -3,9 +3,16 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from types import EllipsisType
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
+
+from .._indexing import normalize_index, squeeze_singletons
+
+# A numpy-style basic index: an int, slice or ellipsis, or a tuple thereof.
+_IndexItem = Union[int, slice, EllipsisType]
+Index = Union[_IndexItem, Tuple[_IndexItem, ...]]
 
 
 @dataclass
@@ -33,17 +40,38 @@ class SourceSpec:
 class Source(ABC):
     """Array-like data handle with a serializable open-spec.
 
-    A source is indexed only with a tuple of slices (a region of interest). Block
-    descriptors from ``bioimage_cpp.utils`` are converted to such tuples by
-    :func:`bioimage_py.util.to_roi` in the compute function, never by the source.
+    A source supports numpy-style basic indexing: an integer, slice or ellipsis, or a tuple thereof.
+    The index is normalized to a full tuple of in-bounds slices (axes selected by an integer are
+    squeezed out of the result), so ``src[5]``, ``src[5, :]``, ``src[..., 0]`` and
+    ``src[(slice(0, 8), slice(0, 8))]`` all work. Subclasses implement the normalized read/write via
+    :meth:`_getitem` / :meth:`_setitem`, which always receive a full tuple of slices.
+
+    In the runner hot path, per-block compute functions build that full tuple explicitly with
+    :func:`bioimage_py.util.to_roi` (rather than relying on this normalization) so it is clear which
+    region -- outer / inner / inner-local -- is being indexed.
     """
 
+    def __getitem__(self, index: Index) -> np.ndarray:
+        """Read a region, normalizing ``index`` and squeezing integer-indexed axes."""
+        roi, to_squeeze = normalize_index(index, self.shape)
+        return squeeze_singletons(self._getitem(roi), to_squeeze)
+
+    def __setitem__(self, index: Index, value: np.ndarray) -> None:
+        """Write a region, normalizing ``index`` and re-inserting integer-indexed axes."""
+        roi, to_squeeze = normalize_index(index, self.shape)
+        value = np.asarray(value)
+        if to_squeeze:
+            value = np.expand_dims(value, to_squeeze)
+        self._setitem(roi, value)
+
     @abstractmethod
-    def __getitem__(self, roi: Tuple[slice, ...]) -> np.ndarray:
+    def _getitem(self, roi: Tuple[slice, ...]) -> np.ndarray:
+        """Read the region given by a full tuple of in-bounds slices."""
         ...
 
     @abstractmethod
-    def __setitem__(self, roi: Tuple[slice, ...], value: np.ndarray) -> None:
+    def _setitem(self, roi: Tuple[slice, ...], value: np.ndarray) -> None:
+        """Write the region given by a full tuple of in-bounds slices."""
         ...
 
     @property

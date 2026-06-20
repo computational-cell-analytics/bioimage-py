@@ -43,9 +43,12 @@ Conventions (follow these):
 
 - Every `__init__.py` is import-only; implementations live in dedicated modules and are re-exported.
 - Blocking comes from `bioimage_cpp.utils` (`Blocking` / `Block` / `BlockWithHalo`); do not reimplement it.
-- A `Source` is indexed only with a tuple of slices. Per-block functions convert a block with
-  `to_roi(block)` (or `to_roi(block.outer_block / .inner_block / .inner_block_local)` under a halo);
-  `Source` does not accept block objects.
+- A `Source` accepts numpy-style basic indexing (int / slice / ellipsis / tuple): the base class
+  normalizes the index to a full tuple of in-bounds slices and squeezes integer-indexed axes (via the
+  shared `bioimage_py._indexing` helpers), then delegates to each source's `_getitem` / `_setitem`,
+  which always receive a full tuple of slices. `Source` does not accept block objects: per-block
+  functions convert a block with `to_roi(block)` (or `to_roi(block.outer_block / .inner_block /
+  .inner_block_local)` under a halo) for explicitness, never relying on the index normalization.
 - Per-block functions have the fixed signature `function(block, inputs, outputs, mask)` (the `ComputeFn`
   alias). They are cloudpickled, so capture only picklable values — dispatch heavy callables (e.g.
   `bioimage_cpp` functions) by name, not by object.
