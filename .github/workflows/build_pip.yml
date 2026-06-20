@@ -1,7 +1,14 @@
 ---
 name: build (pip)
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -12,8 +19,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.11", "3.12", "3.13"]
-        # zarr>=3 does not support py3.10
+        # Trimmed to the newest supported Python only to save CI budget; the conda
+        # workflow keeps the full 3.11-3.13 matrix for lower-bound coverage.
+        # (zarr>=3 does not support py3.10, so 3.11 is the floor.)
+        python-version: ["3.13"]
 
     steps:
       - name: Checkout
