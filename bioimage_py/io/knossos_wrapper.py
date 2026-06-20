@@ -151,7 +151,10 @@ class KnossosFile(Mapping):
         return sum(1 for _ in self)
 
     def __contains__(self, name: object) -> bool:
-        return isinstance(name, str) and os.path.isdir(os.path.join(self.path, name.lstrip("/")))
+        # Match __iter__/__getitem__: only magnification folders are valid keys, so a stray
+        # non-mag subfolder must not test as present.
+        return (isinstance(name, str) and name.startswith("mag")
+                and os.path.isdir(os.path.join(self.path, name.lstrip("/"))))
 
     def __enter__(self) -> "KnossosFile":
         return self

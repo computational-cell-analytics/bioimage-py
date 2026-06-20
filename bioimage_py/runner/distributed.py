@@ -12,9 +12,11 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent import futures
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -24,7 +26,7 @@ from bioimage_cpp.utils import Blocking
 from tqdm import tqdm
 
 from ..sources.base import Source
-from ..util import ComputeFn
+from ..util import ComputeFn, group_blocks_by_shard, maybe_warn_imbalance
 from .base import Runner, RunnerError
 from .config import RunnerConfig, SlurmConfig
 
@@ -40,6 +42,71 @@ def _partition(block_ids: Sequence[int], n_tasks: int) -> List[List[int]]:
         tasks.append(block_ids[start:start + size])
         start += size
     return tasks
+
+
+def _pack_groups(groups: Sequence[Sequence[int]], num_workers: int, name: str) -> List[List[int]]:
+    """Bin-pack whole shard-groups into at most ``num_workers`` tasks (least-loaded first)."""
+    groups = [list(g) for g in groups if g]
+    if not groups:
+        return [[]]
+    n_tasks = max(1, min(int(num_workers), len(groups)))
+    tasks: List[List[int]] = [[] for _ in range(n_tasks)]
+    loads = [0] * n_tasks
+    for group in sorted(groups, key=len, reverse=True):
+        t = min(range(n_tasks), key=lambda i: loads[i])
+        tasks[t].extend(group)
+        loads[t] += len(group)
+    maybe_warn_imbalance(loads, num_workers, len(groups), name)
+    return tasks
+
+
+def _done_blocks(tmp: str, task_ids: Sequence[int]) -> set:
+    """Union of completed block ids across the given tasks' done-logs.
+
+    Parses only newline-terminated lines, so a torn final line (a worker crashed mid-append)
+    is ignored -- safe to call while a worker is still appending. This is the authoritative
+    "which blocks are done" set used for precise failure reporting and resume.
+    """
+    done: set = set()
+    for t in task_ids:
+        path = os.path.join(tmp, "progress", f"{t}.log")
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                if line.endswith("\n"):
+                    s = line.strip()
+                    if s:
+                        try:
+                            done.add(int(s))
+                        except ValueError:  # defensive: ignore a malformed line
+                            continue
+    return done
+
+
+def _count_done_blocks(tmp: str, n_tasks: int) -> int:
+    """Total processed-block count across all done-logs (cheap newline count for the bar).
+
+    Counts only newline-terminated lines, so a torn final line is not counted; use
+    :func:`_done_blocks` for the authoritative set.
+    """
+    total = 0
+    for t in range(n_tasks):
+        path = os.path.join(tmp, "progress", f"{t}.log")
+        if not os.path.exists(path):
+            continue
+        with open(path, "rb") as f:
+            total += f.read().count(b"\n")
+    return total
+
+
+def _total_blocks(tmp: str, n_tasks: int) -> int:
+    """Total assigned-block count across all tasks (from the per-task block lists)."""
+    total = 0
+    for t in range(n_tasks):
+        with open(os.path.join(tmp, "blocks", f"{t}.json")) as f:
+            total += len(json.load(f))
+    return total
 
 
 class _DistributedRunner(Runner):
@@ -112,8 +179,12 @@ class _DistributedRunner(Runner):
             "roi": roi,
             "halo": None if halo is None else [int(h) for h in halo],
         }
+        # Sharded outputs: group blocks so each shard's blocks land in one task (the worker
+        # runs them sequentially), preventing concurrent same-shard writes. None => no
+        # sharded output, fall back to the default contiguous partition.
+        groups = group_blocks_by_shard(blocking, outputs, block_ids)
         return self._run_ids(function, block_ids, payload_extra, has_return_val,
-                             num_workers, name, pre_cleanup)
+                             num_workers, name, pre_cleanup, groups=groups)
 
     def _execute_map(
         self,
@@ -138,6 +209,7 @@ class _DistributedRunner(Runner):
         num_workers: int,
         name: str,
         pre_cleanup: Optional[Callable[[str], None]],
+        groups: Optional[List[List[int]]] = None,
     ) -> List[Any]:
         """Shared protocol: write the payload + per-task id lists, launch, and finalize.
 
@@ -153,18 +225,23 @@ class _DistributedRunner(Runner):
             num_workers: Number of parallel tasks.
             name: A short name for progress display.
             pre_cleanup: Optional pre-cleanup callback forwarded to :meth:`_finalize`.
+            groups: Optional shard-exclusive block groups (from
+                :func:`bioimage_py.util.group_blocks_by_shard`); when given, whole groups are
+                bin-packed into tasks so each shard is written by a single worker. ``None``
+                uses the default contiguous partition. Result order is by ``ids`` regardless.
 
         Returns:
             The per-id return values in ``ids`` order if ``has_return_val``, else ``None``s.
         """
         ids = [int(b) for b in ids]
         tmp = tempfile.mkdtemp(prefix="bioimage_py_", dir=self.config.tmp_root)
-        for sub in ("blocks", "results", "success", "error", "timings"):
+        for sub in ("blocks", "results", "success", "error", "timings", "progress"):
             os.makedirs(os.path.join(tmp, sub), exist_ok=True)
 
         payload = {
             "function": function,
             "has_return_val": bool(has_return_val),
+            "num_workers": int(num_workers),  # persisted so resume() can relaunch without it
             "python": tuple(sys.version_info[:2]),
             **payload_extra,
         }
@@ -179,8 +256,12 @@ class _DistributedRunner(Runner):
         with open(os.path.join(tmp, "source.py"), "w") as f:
             f.write(source)
 
-        n_tasks = max(1, min(int(num_workers), len(ids))) if ids else 1
-        tasks = _partition(ids, n_tasks)
+        if groups is None:
+            n_tasks = max(1, min(int(num_workers), len(ids))) if ids else 1
+            tasks = _partition(ids, n_tasks)
+        else:
+            tasks = _pack_groups(groups, num_workers, name)
+            n_tasks = len(tasks)
         for task_id, task_ids in enumerate(tasks):
             with open(os.path.join(tmp, "blocks", f"{task_id}.json"), "w") as f:
                 json.dump([int(b) for b in task_ids], f)
@@ -224,11 +305,14 @@ class _DistributedRunner(Runner):
             RunnerError: If any task is missing its success sentinel; the preserved temp
                 folder and the failed block ids are attached.
         """
-        # Ground truth for success is the per-task sentinel file, not the launcher's status.
-        failed_tasks = [t for t in range(n_tasks)
-                        if not os.path.exists(os.path.join(tmp, "success", f"{t}.success"))]
-        if failed_tasks:
-            failed_block_ids = sorted(int(b) for t in failed_tasks for b in tasks[t])
+        # Per-block done-logs are the authority for what completed, so failure reporting is
+        # precise: only blocks not in any done-log are failed (not the whole task). A task that
+        # finished all its blocks but died before writing its sentinel thus contributes nothing.
+        done = _done_blocks(tmp, range(n_tasks))
+        failed_block_ids = sorted(int(b) for b in block_ids if int(b) not in done)
+        if failed_block_ids:
+            failed_tasks = [t for t in range(n_tasks)
+                            if not os.path.exists(os.path.join(tmp, "success", f"{t}.success"))]
             raise RunnerError(self._failure_message(tmp, failed_tasks, name),
                               failed_block_ids=failed_block_ids, tmp_folder=tmp)
 
@@ -243,31 +327,108 @@ class _DistributedRunner(Runner):
 
     @staticmethod
     def _collect(tmp: str, n_tasks: int, block_ids: Sequence[int]) -> List[Any]:
-        """Load and order the per-task results by block id."""
-        result_by_block = {}
+        """Load and order per-task results, reading length-framed per-block records.
+
+        Each ``results/<task_id>`` file is a sequence of ``<8-byte little-endian length>
+        <cloudpickled (bid, res)>`` records appended one per completed block (possibly across
+        an original run and a resume). Reading stops at the first short/torn record (only the
+        final record of a crashed write can be torn, since writes are flushed per record).
+        Results are deduped by block id (last-wins) and ordered by ``block_ids``.
+        """
+        result_by_block: Dict[int, Any] = {}
         for task_id in range(n_tasks):
-            with open(os.path.join(tmp, "results", f"{task_id}.pkl"), "rb") as f:
-                for bid, res in cloudpickle.load(f):
+            path = os.path.join(tmp, "results", f"{task_id}")
+            if not os.path.exists(path):  # a never-started task has no result file
+                continue
+            with open(path, "rb") as f:
+                while True:
+                    header = f.read(8)
+                    if len(header) < 8:
+                        break
+                    (length,) = struct.unpack("<Q", header)
+                    payload = f.read(length)
+                    if len(payload) < length:  # torn final record
+                        break
+                    bid, res = cloudpickle.loads(payload)
                     result_by_block[int(bid)] = res
+        missing = [int(b) for b in block_ids if int(b) not in result_by_block]
+        if missing:
+            raise RunnerError(
+                f"Result records missing for {len(missing)} block(s) after a successful run "
+                f"(first: {missing[:5]}). Temp folder: {tmp}.",
+                failed_block_ids=missing, tmp_folder=tmp)
         return [result_by_block[int(b)] for b in block_ids]
 
     @staticmethod
     def _failure_message(tmp: str, failed_tasks: Sequence[int], name: str) -> str:
         """Build an error message naming the preserved temp folder and first error."""
         first = None
-        err_path = os.path.join(tmp, "error", f"{failed_tasks[0]}.txt")
-        if os.path.exists(err_path):
-            with open(err_path) as f:
+        err_files = [os.path.join(tmp, "error", f"{t}.txt") for t in failed_tasks]
+        err_files = [p for p in err_files if os.path.exists(p)]
+        if err_files:
+            with open(err_files[0]) as f:
                 lines = f.read().strip().splitlines()
             first = lines[-1] if lines else None
+        n = len(failed_tasks) if failed_tasks else "some"
         return (
-            f"{len(failed_tasks)} task(s) failed in '{name or 'run'}'. "
+            f"{n} task(s) failed in '{name or 'run'}'. "
             f"Temp folder preserved for debugging: {tmp}. First error: {first!r}"
         )
 
-    def _launch_and_wait(self, tmp: str, n_tasks: int, num_workers: int, name: str) -> None:
-        """Launch the worker tasks and block until they have all finished."""
+    def _launch_and_wait(self, tmp: str, n_tasks: int, num_workers: int, name: str,
+                         task_ids: Optional[Sequence[int]] = None) -> None:
+        """Launch the worker tasks and block until they have all finished.
+
+        ``task_ids`` restricts the launch to a subset of task indices (used by :meth:`resume`
+        to relaunch only the incomplete tasks); ``None`` launches all ``0 .. n_tasks - 1``.
+        """
         raise NotImplementedError
+
+    def _resume_entry(self, tmp_folder: str, *, name: str,
+                      pre_cleanup: Optional[Callable[[str], None]]) -> Optional[list]:
+        """Distributed override of :meth:`Runner._resume_entry`: resume from the temp folder."""
+        return self.resume(tmp_folder, name=name or "resume", pre_cleanup=pre_cleanup)
+
+    def resume(self, tmp_folder: str, *, name: str = "resume", num_workers: Optional[int] = None,
+               pre_cleanup: Optional[Callable[[str], None]] = None) -> Optional[list]:
+        """Resume a previously-failed run from its preserved temp folder.
+
+        Reconstructs the original partition and payload, relaunches only the tasks that still
+        have un-done blocks (the worker harness skips blocks already in its done-log), then
+        finalizes over **all** persisted per-block results -- so a return-value op's reduction
+        runs over the previously-completed blocks merged with the freshly re-run ones.
+
+        Args:
+            tmp_folder: The preserved temp folder (``RunnerError.tmp_folder``).
+            name: A short name for the progress display.
+            num_workers: Override for the worker count; defaults to the run's persisted value.
+            pre_cleanup: Optional ``pre_cleanup(tmp)`` callback forwarded to :meth:`_finalize`.
+
+        Returns:
+            The per-block return values (if the run collected any), else ``None``.
+        """
+        with open(os.path.join(tmp_folder, "payload.pkl"), "rb") as f:
+            payload = cloudpickle.load(f)
+        has_return_val = bool(payload["has_return_val"])
+        if num_workers is None:
+            num_workers = int(payload.get("num_workers", 1))
+
+        # Reconstruct the partition in numeric task order (never glob: it sorts lexically).
+        tasks: List[List[int]] = []
+        task_id = 0
+        while os.path.exists(os.path.join(tmp_folder, "blocks", f"{task_id}.json")):
+            with open(os.path.join(tmp_folder, "blocks", f"{task_id}.json")) as f:
+                tasks.append([int(b) for b in json.load(f)])
+            task_id += 1
+        n_tasks = len(tasks)
+        block_ids = [b for task in tasks for b in task]
+
+        incomplete = [t for t, task_blocks in enumerate(tasks)
+                      if set(task_blocks) - _done_blocks(tmp_folder, [t])]
+        if incomplete:
+            self._launch_and_wait(tmp_folder, n_tasks, num_workers, name, task_ids=incomplete)
+        return self._finalize(tmp_folder, n_tasks, tasks, block_ids, has_return_val, name,
+                              pre_cleanup=pre_cleanup)
 
 
 class SubprocessRunner(_DistributedRunner):
@@ -277,18 +438,56 @@ class SubprocessRunner(_DistributedRunner):
     result/sentinel files, ``block_ids`` re-run) without a scheduler.
     """
 
-    def _launch_and_wait(self, tmp: str, n_tasks: int, num_workers: int, name: str) -> None:
-        """Run each task as a local subprocess, up to ``num_workers`` concurrently."""
+    def _launch_and_wait(self, tmp: str, n_tasks: int, num_workers: int, name: str,
+                         task_ids: Optional[Sequence[int]] = None) -> None:
+        """Run each task as a local subprocess, up to ``num_workers`` concurrently.
+
+        The progress bar counts processed *blocks* (summed from the per-task done-logs) rather
+        than tasks; a background thread polls the logs while the tasks run. ``task_ids``
+        restricts the launch to a subset (resume); the bar still spans all tasks.
+        """
+        ids = list(range(n_tasks)) if task_ids is None else list(task_ids)
         python = self.config.python_executable or sys.executable
         cmd_base = [python, "-m", "bioimage_py.runner._harness", tmp]
 
         def _run_task(task_id: int):
-            # Output is discarded; failures are reported via the harness's error file.
-            return subprocess.run(cmd_base + [str(task_id)], capture_output=True, text=True)
+            proc = subprocess.run(cmd_base + [str(task_id)], capture_output=True, text=True)
+            # The harness writes its own error/<id>.txt on a caught exception. But a failure
+            # *before* that try (e.g. an import error launching the module) would otherwise be
+            # silent, so capture the subprocess output as a fallback error file.
+            if proc.returncode != 0:
+                err_path = os.path.join(tmp, "error", f"{task_id}.txt")
+                if not os.path.exists(err_path):
+                    with open(err_path, "w") as f:
+                        f.write(f"Worker for task {task_id} exited with code {proc.returncode}.\n")
+                        if proc.stdout:
+                            f.write(f"--- stdout ---\n{proc.stdout}\n")
+                        if proc.stderr:
+                            f.write(f"--- stderr ---\n{proc.stderr}\n")
+            return proc
 
-        with futures.ThreadPoolExecutor(max(1, int(num_workers))) as tp:
-            list(tqdm(tp.map(_run_task, range(n_tasks)), total=n_tasks,
-                      desc=name or None, disable=not name))
+        # Drive a block-counting progress bar from the done-logs (single source of truth, so no
+        # double-counting); clamp to the total in case a resume re-reads prior lines.
+        n_blocks = _total_blocks(tmp, n_tasks)
+        stop = threading.Event()
+        bar_thread = None
+        if name:
+            def _poll_bar() -> None:
+                with tqdm(total=n_blocks, desc=name, unit="block") as pbar:
+                    while not stop.wait(0.5):
+                        pbar.n = min(_count_done_blocks(tmp, n_tasks), n_blocks)
+                        pbar.refresh()
+                    pbar.n = min(_count_done_blocks(tmp, n_tasks), n_blocks)
+                    pbar.refresh()
+            bar_thread = threading.Thread(target=_poll_bar, daemon=True)
+            bar_thread.start()
+        try:
+            with futures.ThreadPoolExecutor(max(1, int(num_workers))) as tp:
+                list(tp.map(_run_task, ids))
+        finally:
+            stop.set()
+            if bar_thread is not None:
+                bar_thread.join()
 
 
 # Scheduler states from which a task will not progress further. The ground truth for
@@ -332,54 +531,95 @@ class SlurmRunner(_DistributedRunner):
             )
         super().__init__(config)
 
-    def _launch_and_wait(self, tmp: str, n_tasks: int, num_workers: int, name: str) -> None:
+    def _launch_and_wait(self, tmp: str, n_tasks: int, num_workers: int, name: str,
+                         task_ids: Optional[Sequence[int]] = None) -> None:
         """Submit an sbatch array job for the tasks and poll until they all finish.
 
         Args:
             tmp: The job temp folder (must live on a shared filesystem).
-            n_tasks: The number of tasks (array indices ``0 .. n_tasks - 1``).
+            n_tasks: The total number of tasks the run was partitioned into.
             num_workers: The array throttle (max tasks running concurrently).
             name: A short name used for the job name and progress display.
+            task_ids: Restrict the submitted array to this subset of task indices (used by
+                :meth:`resume` to resubmit only the incomplete tasks); ``None`` submits all
+                ``0 .. n_tasks - 1``.
         """
+        launch_ids = list(range(n_tasks)) if task_ids is None else sorted(set(int(t) for t in task_ids))
+        is_resume = task_ids is not None
+
+        def _guard_fail(message: str) -> None:
+            # On a resume we must never remove the user's preserved temp folder.
+            if not is_resume:
+                shutil.rmtree(tmp, ignore_errors=True)
+            raise ValueError(message)
+
         if self.config.tmp_root is None:
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise ValueError(
+            _guard_fail(
                 "SlurmRunner requires config.tmp_root to be set to a shared filesystem "
                 "visible to all compute nodes (node-local /tmp is not usable)."
             )
 
         max_array = (self.config.max_array_size if self.config.max_array_size is not None
                      else self._max_array_size())
-        if n_tasks > max_array:
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise ValueError(
-                f"Run partitioned into {n_tasks} tasks exceeds the maximum array size "
+        if len(launch_ids) > max_array:
+            _guard_fail(
+                f"Run partitioned into {len(launch_ids)} tasks exceeds the maximum array size "
                 f"{max_array}. Lower num_workers or use a larger block_shape."
             )
 
         os.makedirs(os.path.join(tmp, "logs"), exist_ok=True)
-        throttle = max(1, min(int(num_workers), n_tasks))
+        throttle = max(1, min(int(num_workers), len(launch_ids)))
         script_path = os.path.join(tmp, "submit.sh")
         with open(script_path, "w") as f:
-            f.write(self._build_script(tmp, n_tasks, throttle, name))
+            f.write(self._build_script(tmp, launch_ids, throttle, name))
 
-        job_id = self._submit(script_path)
-        with open(os.path.join(tmp, "manifest.json"), "w") as f:
-            json.dump({
-                "job_id": job_id,
-                "n_tasks": n_tasks,
-                "throttle": throttle,
-                "name": name,
-                "tmp": tmp,
-                "script": script_path,
-                "python_executable": self.config.python_executable or sys.executable,
-                "submit_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }, f, indent=2)
+        # Unlike the tmp_root / max_array guards above, a submission failure deliberately does NOT
+        # remove the temp folder: the generated submit.sh, payload, and per-task block lists are
+        # exactly what's needed to diagnose why sbatch rejected the job. Re-raise naming the folder
+        # so the user knows where to look.
+        try:
+            job_id = self._submit(script_path)
+        except RuntimeError as err:
+            raise RuntimeError(f"{err} Temp folder preserved for debugging: {tmp}.") from err
+        manifest = {
+            "job_id": job_id,
+            "n_tasks": n_tasks,
+            "launch_ids": launch_ids,
+            "throttle": throttle,
+            "name": name,
+            "tmp": tmp,
+            "script": script_path,
+            "python_executable": self.config.python_executable or sys.executable,
+            "submit_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        manifest_path = os.path.join(tmp, "manifest.json")
+        if is_resume and os.path.exists(manifest_path):  # keep the prior job id for forensics
+            try:
+                with open(manifest_path) as f:
+                    manifest["resumed_from_job_id"] = json.load(f).get("job_id")
+            except (OSError, ValueError):
+                pass
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
 
-        self._poll(job_id, n_tasks, tmp, name)
+        self._poll(job_id, n_tasks, tmp, name, task_ids=launch_ids)
 
-    def _build_script(self, tmp: str, n_tasks: int, throttle: int, name: str) -> str:
-        """Render the sbatch array script for the run."""
+    @staticmethod
+    def _format_array_indices(task_ids: Sequence[int], throttle: int) -> str:
+        """Compress task ids into an sbatch ``--array`` spec, e.g. ``0,3,7-9%4``."""
+        ids = sorted(set(int(t) for t in task_ids))
+        parts: List[str] = []
+        i = 0
+        while i < len(ids):
+            j = i
+            while j + 1 < len(ids) and ids[j + 1] == ids[j] + 1:
+                j += 1
+            parts.append(str(ids[i]) if i == j else f"{ids[i]}-{ids[j]}")
+            i = j + 1
+        return ",".join(parts) + f"%{throttle}"
+
+    def _build_script(self, tmp: str, task_ids: Sequence[int], throttle: int, name: str) -> str:
+        """Render the sbatch array script for the given task indices."""
         cfg = self.config
         shebang, preamble = "#!/bin/bash", ""
         if cfg.shebang:
@@ -393,7 +633,7 @@ class SlurmRunner(_DistributedRunner):
         job_name = "_".join((name or "").split()) or "bioimage_py"
         directives = [
             f"--job-name={job_name}",
-            f"--array=0-{n_tasks - 1}%{throttle}",
+            f"--array={self._format_array_indices(task_ids, throttle)}",
             f"--cpus-per-task={int(cfg.cpus_per_task)}",
             f"--output={os.path.join(tmp, 'logs', 'slurm-%A_%a.out')}",
             f"--error={os.path.join(tmp, 'logs', 'slurm-%A_%a.err')}",
@@ -524,7 +764,8 @@ class SlurmRunner(_DistributedRunner):
                 time.sleep(self.config.poll_interval)
         return False
 
-    def _poll(self, job_id: str, n_tasks: int, tmp: str, name: str) -> None:
+    def _poll(self, job_id: str, n_tasks: int, tmp: str, name: str,
+              task_ids: Optional[Sequence[int]] = None) -> None:
         """Poll ``sacct`` until every task has a visible sentinel or is confirmed dead.
 
         The scheduler ``State`` is not subject to NFS lag, but the ``.success`` sentinels the
@@ -536,10 +777,14 @@ class SlurmRunner(_DistributedRunner):
 
         Args:
             job_id: The submitted array job id.
-            n_tasks: The number of tasks to await.
+            n_tasks: The total number of tasks (spans the block-counting progress bar).
             tmp: The job temp folder (where sentinels are written).
             name: A short name for the progress bar (disables it when empty).
+            task_ids: The subset of task indices this job actually runs (a resume submits only
+                the incomplete tasks); resolution is over this subset, ``None`` means all tasks.
         """
+        poll_ids = list(range(n_tasks)) if task_ids is None else sorted(set(int(t) for t in task_ids))
+
         def has_sentinel(t: int) -> bool:
             return os.path.exists(os.path.join(tmp, "success", f"{t}.success"))
 
@@ -548,18 +793,20 @@ class SlurmRunner(_DistributedRunner):
         terminal_since: Dict[int, float] = {}
         terminal_count: Dict[int, int] = {}
         resolved: set = set()
-        with tqdm(total=n_tasks, desc=name or None, disable=not name) as pbar:
-            while len(resolved) < n_tasks:
+        # The bar counts processed blocks across ALL tasks (a resume credits prior progress).
+        n_blocks = _total_blocks(tmp, n_tasks)
+        with tqdm(total=n_blocks, desc=name or None, disable=not name, unit="block") as pbar:
+            while len(resolved) < len(poll_ids):
                 states = self._sacct_states(job_id)
                 if states is None:  # transient sacct error: skip this poll.
                     time.sleep(self.config.poll_interval)
                     continue
 
                 now = time.monotonic()
-                ok = {t for t in range(n_tasks) if has_sentinel(t)}
+                ok = {t for t in poll_ids if has_sentinel(t)}
                 running = sum(1 for s in states.values() if s == "RUNNING")
                 dead = set()
-                for t in range(n_tasks):
+                for t in poll_ids:
                     if t in ok:
                         terminal_since.pop(t, None)
                         terminal_count.pop(t, None)
@@ -579,11 +826,11 @@ class SlurmRunner(_DistributedRunner):
                         terminal_count.pop(t, None)
 
                 resolved = ok | dead
-                pbar.n = len(resolved)
+                pbar.n = min(_count_done_blocks(tmp, n_tasks), n_blocks)
                 pbar.set_postfix(ok=len(ok), failed=len(dead), run=running,
-                                 pending=max(0, n_tasks - len(resolved) - running), refresh=False)
+                                 pending=max(0, len(poll_ids) - len(resolved) - running), refresh=False)
                 pbar.refresh()
-                if len(resolved) >= n_tasks:
+                if len(resolved) >= len(poll_ids):
                     break
                 try:
                     time.sleep(self.config.poll_interval)

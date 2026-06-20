@@ -76,7 +76,7 @@ class _Detached(Exception):
 class _DetachAfterSubmit(SlurmRunner):
     """Test double: submits + writes the manifest, then aborts before polling."""
 
-    def _poll(self, job_id, n_tasks, tmp, name):  # type: ignore[override]
+    def _poll(self, job_id, n_tasks, tmp, name, task_ids=None):  # type: ignore[override]
         raise _Detached(tmp)
 
 
@@ -132,4 +132,39 @@ def test_slurm_reattach(shared_zarr_factory, rng, shared_tmp_path):
     # A fresh runner picks the still-running job back up from the manifest and finalizes it.
     results = SlurmRunner(cfg).reattach(tmp, name="reattach")
     assert np.isclose(max(r for r in results if r is not None), float(a.max()))
+    assert not os.path.isdir(tmp)  # cleaned up on successful finalize
+
+
+def _make_shared_flaky(marker_path):
+    """Per-block fn that fails the corner block once, via a marker on the shared filesystem.
+
+    The marker must live on the shared FS so the compute node that re-runs the block (on resume)
+    sees that the first attempt already happened and succeeds.
+    """
+    def fn(block, inputs, outputs, mask):
+        is_corner = all(int(b) == 0 for b in block.begin)
+        if is_corner and not os.path.exists(marker_path):
+            open(marker_path, "w").close()
+            raise RuntimeError("transient boom")
+        return int(block.begin[0])
+    return fn
+
+
+def test_slurm_resume(shared_zarr_factory, rng, shared_tmp_path):
+    a = rng.random((32, 32)).astype("float32")
+    z = shared_zarr_factory(a, chunks=(16, 16))
+    cfg = _cfg(shared_tmp_path)
+    marker = os.path.join(shared_tmp_path, "marker.txt")
+    fn = _make_shared_flaky(marker)
+
+    with pytest.raises(RunnerError) as excinfo:
+        bp.get_runner("slurm", cfg).run(fn, [z], block_shape=(16, 16), num_workers=4,
+                                        has_return_val=True, name="slurm-flaky")
+    tmp = excinfo.value.tmp_folder
+    assert tmp is not None and os.path.isdir(tmp)
+
+    # resume resubmits a sparse array for only the incomplete tasks; the corner block now succeeds
+    # (marker exists), and the result merges with the blocks that completed in the first attempt.
+    results = SlurmRunner(cfg).resume(tmp, name="slurm-resume")
+    assert results is not None and all(r is not None for r in results)
     assert not os.path.isdir(tmp)  # cleaned up on successful finalize

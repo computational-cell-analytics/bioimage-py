@@ -80,14 +80,14 @@ class MRCFile(Mapping):
                 or "Unrecognised machine stamp: 0x00 0x00 0x00 0x00" in str(e)
             ):
                 try:
-                    self._f = mrcfile.mmap(self.path, self.mode, permissive="True")
+                    self._f = mrcfile.mmap(self.path, self.mode, permissive=True)
                 except ValueError:
-                    self._f = mrcfile.open(self.path, self.mode, permissive="True")
+                    self._f = mrcfile.open(self.path, self.mode, permissive=True)
             else:  # Other kind of error -> try to open without mmap.
                 try:
                     self._f = mrcfile.open(self.path, self.mode)
-                except ValueError as e:
-                    self._f = mrcfile.open(self.path, self.mode, permissive="True")
+                except ValueError:  # report the original error ``e`` (not this retry's).
+                    self._f = mrcfile.open(self.path, self.mode, permissive=True)
                     warnings.warn(
                         f"Opening mrcfile {self.path} failed with unknown error {e} without permissive opening."
                         "The file will still be opened but the contents may be incorrect."

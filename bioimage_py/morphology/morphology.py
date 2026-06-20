@@ -8,17 +8,15 @@ the ``local`` / ``subprocess`` / ``slurm`` backends. No custom C++ (nifty) code 
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
-from ..util import BlockDescriptor, to_roi
-
-if TYPE_CHECKING:
-    import pandas as pd
+from ..util import BlockDescriptor, check_rerun_args, to_roi
 
 __all__ = ["morphology"]
 
@@ -135,11 +133,6 @@ def _to_dataframe(labels: np.ndarray, size: np.ndarray, com: np.ndarray,
     ``bb_max`` is converted to an exclusive slice stop (``max_coordinate + 1``) so the bounding box of a
     row is ``tuple(slice(row.bb_min_<ax>, row.bb_max_<ax>) for ax in axes)``.
     """
-    try:
-        import pandas as pd
-    except ImportError as exc:  # pragma: no cover - exercised only without the optional dependency.
-        raise ImportError("morphology() returns a pandas DataFrame; install pandas to use it.") from exc
-
     axes = _axis_names(ndim)
     columns = {"label": labels.astype("uint64"), "size": size.astype("int64")}
     for a, ax in enumerate(axes):
@@ -172,6 +165,7 @@ def morphology(
     job_config: Optional[RunnerConfig] = None,
     mask: Optional[SourceLike] = None,
     block_ids: Optional[Sequence[int]] = None,
+    resume_from: Optional[str] = None,
     pre_cleanup: Optional[Callable[[str], None]] = None,
 ) -> "pd.DataFrame":
     """Compute per-label morphology (size, center of mass, bounding box) of a labeled volume.
@@ -190,6 +184,10 @@ def morphology(
         mask: Optional binary mask; voxels outside the mask are excluded from the computation.
         block_ids: Restrict processing to these block ids (e.g. to re-run previously failed blocks);
             the table then reflects only those blocks.
+        resume_from: Distributed only; the preserved temp folder of a failed run to resume and
+            merge (see ``runner.run``). The returned table then covers the full volume (the
+            already-completed blocks merged with the re-run ones). Mutually exclusive with
+            ``block_ids``.
         pre_cleanup: Optional ``pre_cleanup(tmp_folder)`` callback invoked on the orchestrating
             process with the job temp folder right before it is deleted (distributed backends only).
             Use it to read out the per-task timing files under ``tmp_folder/timings/`` before cleanup.
@@ -203,6 +201,7 @@ def morphology(
         is ``tuple(slice(bb_min_<axis>, bb_max_<axis>) for axis in axes)``. Axis names are ``z``/``y``/
         ``x`` for 2D/3D data and ``axis0`` ... otherwise.
     """
+    check_rerun_args(job_type, resume_from, block_ids)
     src = as_source(input)
     if not np.issubdtype(np.dtype(src.dtype), np.integer):
         raise ValueError(f"morphology expects an integer label image, got dtype {src.dtype}.")
@@ -215,7 +214,8 @@ def morphology(
         runner = get_runner(job_type, job_config)
         results = runner.run(_morphology_block, [input], num_workers=num_workers,
                              block_shape=block_shape, mask=mask, block_ids=block_ids,
-                             has_return_val=True, name="morphology", pre_cleanup=pre_cleanup)
+                             resume_from=resume_from, has_return_val=True, name="morphology",
+                             pre_cleanup=pre_cleanup)
         tables = [r for r in results if r is not None]
 
     return _to_dataframe(*_merge_tables(tables, ndim), ndim)

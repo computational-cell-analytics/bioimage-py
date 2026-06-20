@@ -47,9 +47,17 @@ def test_downsample_anisotropic(zarr_factory, rng):
     z = zarr_factory(a, chunks=(8, 16, 16))
     target = downscale_shape(a.shape, (1, 2, 2))
     assert target == (20, 20, 24)
-    out = zarr_factory(shape=target, chunks=(8, 8, 8), dtype="float32", fill=0.0)
-    bp.downsample(z, (1, 2, 2), output=out, block_shape=(8, 8, 8), num_workers=2)
-    assert out.shape == target
+
+    # Value-level check: the block-wise result must match the direct resize (a wrong-axis scale
+    # would change the values, not just the shape) — across workers and the subprocess backend.
+    expected = bp.downsample(a, (1, 2, 2), order=1, anti_aliasing=True)  # direct
+    assert expected.shape == target
+    for nw, job in [(1, "local"), (4, "local"), (3, "subprocess")]:
+        out = zarr_factory(shape=target, chunks=(8, 8, 8), dtype="float32", fill=0.0)
+        bp.downsample(z, (1, 2, 2), output=out, order=1, anti_aliasing=True,
+                      block_shape=(8, 8, 8), num_workers=nw, job_type=job)
+        assert out.shape == target
+        np.testing.assert_allclose(out[:], expected, atol=1e-4, err_msg=f"nw={nw} job={job}")
 
 
 def test_downsample_invalid_scale_factor(zarr_factory, rng):

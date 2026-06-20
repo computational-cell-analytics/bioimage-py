@@ -3,6 +3,13 @@
 The block-wise path runs three :meth:`~bioimage_py.runner.base.Runner.run` calls plus one
 in-process reduction, with the labeled volume persisted in the ``output`` source between
 stages. This mirrors cluster_tools' connected-components workflow.
+
+Inter-stage data visibility (distributed/slurm): stage N+1 is only launched after every stage-N
+task's ``.success`` sentinel is visible, i.e. after all stage-N workers have exited and flushed
+their writes. Stage N+1 then reads the output's chunks by direct path (zarr/n5 address a chunk by
+key, with no directory listing), so NFS close-to-open consistency guarantees it sees the fresh
+data -- the attribute-cache lag that affects sentinel *discovery* does not apply to reads of an
+already-named chunk file.
 """
 from __future__ import annotations
 
@@ -134,6 +141,11 @@ def label(
     mask: Optional[SourceLike] = None,
 ) -> SourceLike:
     """Label connected components of (optionally thresholded) data, block-wise.
+
+    Unlike the single-pass operations, ``label`` is multi-stage with a global cross-block merge
+    (per-block labeling, then a union-find over touching components across block faces), so it
+    does **not** accept ``block_ids`` or ``resume_from``: a failed run must be re-run whole (it is
+    idempotent given the same ``output``).
 
     Args:
         input: The input data (a numpy/zarr/n5 array or a `Source`).

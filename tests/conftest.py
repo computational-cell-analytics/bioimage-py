@@ -12,11 +12,20 @@ import zarr
 _SHARED_ROOT = os.environ.get("BIOIMAGE_PY_SHARED_TMP")
 
 
-def _write_zarr(path, array=None, chunks=None, *, shape=None, dtype=None, fill=None):
-    """Create a fresh on-disk zarr array, optionally filled from ``array`` or ``fill``."""
+def _write_zarr(path, array=None, chunks=None, *, shape=None, dtype=None, fill=None, shards=None):
+    """Create a fresh on-disk zarr array, optionally filled from ``array`` or ``fill``.
+
+    When ``shards`` is given a sharded zarr v3 array is created (``chunks`` are the inner
+    chunks); ``open_array(mode="w")`` does not accept ``shards`` so the ``create_array`` path
+    is used instead.
+    """
     if array is not None:
         shape, dtype = array.shape, array.dtype
-    z = zarr.open_array(path, mode="w", shape=shape, chunks=tuple(chunks), dtype=dtype)
+    if shards is not None:
+        z = zarr.create_array(store=path, shape=tuple(shape), chunks=tuple(chunks),
+                              shards=tuple(shards), dtype=dtype, overwrite=True)
+    else:
+        z = zarr.open_array(path, mode="w", shape=shape, chunks=tuple(chunks), dtype=dtype)
     if array is not None:
         z[:] = array
     elif fill is not None:
@@ -46,10 +55,10 @@ def shared_zarr_factory(shared_tmp_path):
     """Like :func:`zarr_factory` but writes the arrays under the shared filesystem."""
     counter = {"i": 0}
 
-    def _make(array=None, chunks=None, *, shape=None, dtype=None, fill=None):
+    def _make(array=None, chunks=None, *, shape=None, dtype=None, fill=None, shards=None):
         counter["i"] += 1
         path = os.path.join(shared_tmp_path, f"arr_{counter['i']}.zarr")
-        return _write_zarr(path, array, chunks, shape=shape, dtype=dtype, fill=fill)
+        return _write_zarr(path, array, chunks, shape=shape, dtype=dtype, fill=fill, shards=shards)
 
     return _make
 
@@ -184,9 +193,9 @@ def zarr_factory(tmp_path):
     """
     counter = {"i": 0}
 
-    def _make(array=None, chunks=None, *, shape=None, dtype=None, fill=None):
+    def _make(array=None, chunks=None, *, shape=None, dtype=None, fill=None, shards=None):
         counter["i"] += 1
         path = str(tmp_path / f"arr_{counter['i']}.zarr")
-        return _write_zarr(path, array, chunks, shape=shape, dtype=dtype, fill=fill)
+        return _write_zarr(path, array, chunks, shape=shape, dtype=dtype, fill=fill, shards=shards)
 
     return _make

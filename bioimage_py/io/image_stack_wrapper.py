@@ -28,6 +28,13 @@ def _require_imageio() -> None:
         raise AttributeError("imageio is required to read image stacks, but is not installed.")
 
 
+def _close_memmap(array: Any) -> None:
+    """Close the underlying mmap of a numpy memmap; a no-op for ordinary arrays."""
+    mmap = getattr(array, "_mmap", None)
+    if mmap is not None:
+        mmap.close()
+
+
 class ImageStackFile(Mapping):
     """Root handle for an image stack: a single multi-page file (key ``""``) or a folder of slices.
 
@@ -121,7 +128,12 @@ class ImageStackDataset:
         self._size = int(np.prod(list(self._shape)))
 
     def initialize_from_stack(self, files: Any) -> None:
-        """Initialize the dataset from a single multi-page stack file."""
+        """Initialize the dataset from a single multi-page stack file.
+
+        Note: the tif subclass holds a lazy ``tifffile.memmap``, but the base (imageio) path
+        reads the whole volume into memory eagerly, so block-wise reads of a non-tif multi-page
+        stack are not memory-lazy.
+        """
         self.files = files
         self._volume = self._read_volume()
 
@@ -204,8 +216,10 @@ class ImageStackDataset:
         def _load_and_write_image(z: int) -> None:
             z_abs = z + z0
             im = self._read_image(z_abs)
-            assert im.shape == self.im_shape, f"{im.shape}, {self.im_shape}"
+            if im.shape != self.im_shape:
+                raise ValueError(f"Image slice {z_abs} has shape {im.shape}, expected {self.im_shape}.")
             data[z] = im[im_roi]
+            _close_memmap(im)  # close the slice memmap (no-op for ordinary imageio arrays)
 
         with futures.ThreadPoolExecutor(self.n_threads) as tp:
             tasks = [tp.submit(_load_and_write_image, z) for z in range(roi_shape[0])]
@@ -228,20 +242,24 @@ class TifStackDataset(ImageStackDataset):
     tif_exts = (".tif", ".tiff")
 
     @staticmethod
+    def _is_memmappable(path: str) -> bool:
+        """Return whether ``path`` is a (closeable) memory-mappable tif, without leaking a handle."""
+        try:
+            mm = tifffile.memmap(path, mode="r")
+        except (ValueError, TypeError, tifffile.TiffFileError):
+            return False
+        _close_memmap(mm)
+        return True
+
+    @staticmethod
     def is_tif_slices(files: Sequence[str]) -> bool:
-        """Return whether all files are memory-mappable tif slices."""
+        """Return whether the slices are memory-mappable tifs (probing the first file only)."""
         if tifffile is None:
             return False
-        f0 = files[0]
-        ext = os.path.splitext(f0)[1]
+        ext = os.path.splitext(files[0])[1]
         if ext.lower() not in TifStackDataset.tif_exts:
             return False
-        try:
-            for ff in files:
-                tifffile.memmap(ff, mode="r")
-        except ValueError:
-            return False
-        return True
+        return TifStackDataset._is_memmappable(files[0])
 
     @staticmethod
     def is_tif_stack(path: str) -> bool:
@@ -251,11 +269,7 @@ class TifStackDataset(ImageStackDataset):
         ext = os.path.splitext(path)[1]
         if ext.lower() not in TifStackDataset.tif_exts:
             return False
-        try:
-            tifffile.memmap(path, mode="r")
-        except ValueError:
-            return False
-        return True
+        return TifStackDataset._is_memmappable(path)
 
     def _read_image(self, index: int) -> np.ndarray:
         return tifffile.memmap(self.files[index], mode="r")
@@ -264,10 +278,14 @@ class TifStackDataset(ImageStackDataset):
         return tifffile.memmap(self.files, mode="r")
 
     def get_im_shape_and_dtype(self, files: Sequence[str]) -> Tuple[Tuple[int, ...], np.dtype]:
-        """Return the per-slice shape and dtype, validating that all slices agree."""
-        im0 = tifffile.memmap(files[0], mode="r")
-        im_shape = im0.shape
-        im_shapes = [tifffile.memmap(ff, mode="r").shape for ff in files[1:]]
-        if any(sh != im_shape for sh in im_shapes):
-            raise ValueError("Incompatible shapes for Image Stack")
-        return im_shape, im0.dtype
+        """Return the per-slice shape and dtype, validating that all slices agree (no leaked handles)."""
+        def shape_dtype(path: str) -> Tuple[Tuple[int, ...], np.dtype]:
+            with tifffile.TiffFile(path) as tif:
+                series = tif.series[0]
+                return tuple(series.shape), series.dtype
+
+        im_shape, dtype = shape_dtype(files[0])
+        for ff in files[1:]:
+            if shape_dtype(ff)[0] != im_shape:
+                raise ValueError("Incompatible shapes for Image Stack")
+        return im_shape, dtype

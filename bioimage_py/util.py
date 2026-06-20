@@ -1,9 +1,11 @@
 """Shared helpers: block-to-roi conversion, blocking construction and filter halos."""
 from __future__ import annotations
 
+import itertools
 import numbers
+import warnings
 from math import ceil
-from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import bioimage_cpp as bic
 from bioimage_cpp.utils import Block, BlockWithHalo, Blocking
@@ -137,3 +139,122 @@ def get_blocking(shape: Sequence[int], block_shape: Sequence[int],
         roi_begin = [int(sl.start) if sl.start is not None else 0 for sl in roi]
         roi_end = [int(sl.stop) if sl.stop is not None else int(s) for sl, s in zip(roi, shape)]
     return bic.utils.Blocking(roi_begin, roi_end, [int(b) for b in block_shape])
+
+
+def check_rerun_args(job_type: str, resume_from: Optional[str],
+                     subset: Optional[Sequence[int]], *, subset_name: str = "block_ids") -> None:
+    """Validate an operation's rerun arguments (``resume_from`` vs a subset).
+
+    Args:
+        job_type: The execution backend (``"local"``/``"subprocess"``/``"slurm"``).
+        resume_from: The preserved temp folder to resume from, or ``None``.
+        subset: The explicit subset (``block_ids``/``item_ids``) to process, or ``None``.
+        subset_name: The subset argument's name, for error messages.
+
+    Raises:
+        ValueError: If both ``resume_from`` and ``subset`` are given, or if ``resume_from`` is
+            used with the local backend (which keeps no temp folder to resume from).
+    """
+    if resume_from is not None:
+        if subset is not None:
+            raise ValueError(f"Pass either 'resume_from' or '{subset_name}', not both.")
+        if job_type == "local":
+            raise ValueError(
+                "resume_from is only valid for distributed backends (subprocess/slurm); the "
+                "local runner keeps no temp folder. Re-run the operation in-process instead "
+                f"(optionally with {subset_name}=err.failed_block_ids for a subset)."
+            )
+
+
+def group_blocks_by_shard(
+    blocking: Blocking,
+    outputs: Sequence[Source],
+    block_ids: Sequence[int],
+) -> Optional[List[List[int]]]:
+    """Group blocks so that every shard is written by a single worker.
+
+    For a sharded zarr v3 array the atomic write unit is the *shard*, not the inner chunk:
+    two blocks writing different inner chunks of the same shard concurrently corrupt it. To
+    keep the block shape flexible (rather than forcing it to a shard multiple) the runners
+    route each group to one worker, which processes its blocks sequentially — so same-shard
+    writes never race. This computes those groups: blocks that share any shard (for any
+    sharded output) are placed in the same group via a union-find over the block ids.
+
+    The shard grid is anchored at coordinate 0 and considered along the trailing (spatial)
+    shard axes only; a leading channel axis on an output is fully written by every block and
+    is not a routing axis (mirrors the chunk handling in
+    :meth:`Runner._validate_write_safety`).
+
+    Args:
+        blocking: The blocking used to map a block id to its (non-halo) write region.
+        outputs: The output sources; only those with a ``shards`` shape drive the grouping.
+        block_ids: The block ids to group.
+
+    Returns:
+        A list of groups (each a sorted list of block ids), ordered by each group's smallest
+        id; ``None`` if no output is sharded (the caller should then use the default
+        one-block-per-unit path); an empty list if ``block_ids`` is empty.
+    """
+    sharded = [(idx, out) for idx, out in enumerate(outputs) if out.shards is not None]
+    if not sharded:
+        return None
+    block_ids = [int(b) for b in block_ids]
+    if not block_ids:
+        return []
+
+    ndim = len(blocking.get_block(block_ids[0]).begin)
+    # Per sharded output, the spatial (trailing) shard extent that defines its cell grid.
+    shard_spatial = [(idx, tuple(int(s) for s in out.shards[-ndim:])) for idx, out in sharded]
+
+    # Union-find over the positions in block_ids (dense 0..n-1); bic's UnionFind, as used in
+    # segmentation/label.py, instead of a hand-rolled one.
+    uf = bic.utils.UnionFind(len(block_ids))
+    cell_owner: Dict[Tuple[int, ...], int] = {}
+    for pos, bid in enumerate(block_ids):
+        block = blocking.get_block(bid)
+        begin = [int(b) for b in block.begin]
+        end = [int(e) for e in block.end]
+        for out_idx, shard in shard_spatial:
+            ranges = [range(begin[d] // shard[d], (end[d] + shard[d] - 1) // shard[d])
+                      for d in range(ndim)]
+            for cell in itertools.product(*ranges):
+                owner = cell_owner.setdefault((out_idx,) + cell, pos)
+                if owner != pos:
+                    uf.merge(pos, owner)
+
+    groups: Dict[int, List[int]] = {}
+    for pos, bid in enumerate(block_ids):
+        groups.setdefault(int(uf.find(pos)), []).append(bid)
+    return sorted((sorted(g) for g in groups.values()), key=lambda g: g[0])
+
+
+def maybe_warn_imbalance(loads: Sequence[int], num_workers: int, n_groups: int,
+                         name: str) -> None:
+    """Warn when shard-exclusive routing leaves workers idle or badly load-imbalanced.
+
+    Args:
+        loads: The per-worker (or per-task) block counts of the assignment.
+        num_workers: The requested number of workers.
+        n_groups: The number of shard groups (schedulable units) the blocks formed.
+        name: A short run name used in the warning message.
+    """
+    if not loads:
+        return
+    if n_groups < int(num_workers):
+        warnings.warn(
+            f"Shard routing for '{name or 'run'}' produced only {n_groups} shard-group(s) for "
+            f"{num_workers} workers, so {int(num_workers) - n_groups} worker(s) will be idle. "
+            "A few shards span the data; use a smaller shard shape or fewer workers to balance. "
+            "Results are still correct.",
+            stacklevel=2,
+        )
+        return
+    mx, mn = max(loads), min(loads)
+    mean = sum(loads) / len(loads)
+    if mx > mn and mx > 1.5 * mean:
+        warnings.warn(
+            f"Uneven worker load for '{name or 'run'}': block counts per worker range {mn}..{mx} "
+            f"(mean {mean:.1f}). Some shards span disproportionately many blocks; results are "
+            "still correct but parallelism is reduced.",
+            stacklevel=2,
+        )

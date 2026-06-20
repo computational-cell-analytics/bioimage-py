@@ -33,6 +33,8 @@ def downsample(
     job_config: Optional[RunnerConfig] = None,
     num_workers: int = 1,
     mask: Optional[SourceLike] = None,
+    block_ids: Optional[Sequence[int]] = None,
+    resume_from: Optional[str] = None,
 ) -> SourceLike:
     """Downsample a source by an integer factor, block-wise.
 
@@ -61,6 +63,12 @@ def downsample(
             backends).
         mask: Optional binary mask in the downscaled output space; only voxels within the mask are
             written (out-of-mask output voxels are left unchanged).
+        block_ids: Restrict processing to these block ids (in the downscaled output space), e.g. to
+            re-run previously failed blocks into the existing ``output``. Mutually exclusive with
+            ``resume_from``.
+        resume_from: Distributed only; the preserved temp folder of a failed run to resume (see
+            ``runner.run``); the missing blocks are written into ``output``. Mutually exclusive
+            with ``block_ids``.
 
     Returns:
         The output array (the provided ``output``, or a newly allocated numpy array).
@@ -84,4 +92,5 @@ def downsample(
     target_shape = downscale_shape(src.shape, factors)
     wrapped = ResizedSource(src, target_shape, order=order, anti_aliasing=anti_aliasing)
     return _copy_source(wrapped, output, block_shape=block_shape, job_type=job_type,
-                        job_config=job_config, num_workers=num_workers, mask=mask, name="downsample")
+                        job_config=job_config, num_workers=num_workers, mask=mask, name="downsample",
+                        block_ids=block_ids, resume_from=resume_from)
