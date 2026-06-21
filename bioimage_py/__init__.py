@@ -1,4 +1,8 @@
-"""bioimage_py: efficient, parallel, and distributed image analysis and segmentation."""
+"""bioimage_py: efficient, parallel, and distributed image analysis and segmentation.
+
+.. include:: ../docs/installation.md
+.. include:: ../docs/usage.md
+"""
 from . import filters, io, morphology, segmentation, stats  # noqa: F401
 from .copy import copy
 from .downsample import downsample

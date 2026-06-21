@@ -35,6 +35,7 @@ io-all = [
 ]
 test = ["pytest", "zarr>=3", "scikit-image", "scipy", "openpyxl"]
 dev = ["flake8", "pyflakes"]
+docs = ["pdoc"]
 
 [tool.setuptools.packages.find]
 include = ["bioimage_py*"]
