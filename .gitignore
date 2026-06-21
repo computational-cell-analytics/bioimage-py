@@ -5,6 +5,9 @@ __pycache__/
 build/
 dist/
 
+# pdoc output (built locally with `pdoc bioimage_py -o site`)
+site/
+
 # Local scratch for slurm smoke tests / BIOIMAGE_PY_SHARED_TMP runs
 .slurm_smoke/
 .slurm_test_tmp/
