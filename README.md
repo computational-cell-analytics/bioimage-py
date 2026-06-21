@@ -6,8 +6,6 @@ Efficient, parallel, and distributed implementation of image analysis and segmen
 python -m pip install -e .
 ```
 
-See the [documentation](https://constantinpape.github.io/bioimage-py/) for
-[installation](https://constantinpape.github.io/bioimage-py/bioimage_py.html) (including the optional
-I/O backends) and [usage examples](https://constantinpape.github.io/bioimage-py/bioimage_py.html)
-(`copy`, `downsample`, and re-running failed blocks). The installation and usage pages also live as
-markdown under [`docs/`](docs/).
+See the [documentation](https://computational-cell-analytics.github.io/bioimage-py/) 
+for [installation](https://computational-cell-analytics.github.io/bioimage-py/bioimage_py.html#installation) 
+and [usage examples](https://computational-cell-analytics.github.io/bioimage-py/bioimage_py.html#usage).
