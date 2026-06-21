@@ -1,8 +1,13 @@
-"""bioimage_py: efficient, parallel, and distributed image analysis and segmentation.
+"""Efficient, parallel, and distributed implementation of image analysis and segmentation functionality for biomedical imaging.
+
+Reimplements functionality from [elf](https://github.com/constantinpape/elf) and [cluster_tools](https://github.com/constantinpape/cluster_tools) in a more efficient and scalable manner.
+
+**Note:** this package is in an early state and mainly provides support for data conversion, downsampling, and some initial segmentation functionality (connected components and watershed).
+The functionality will be extended soon; the implementation of seamlessly switching between local and distributed execution (via slurm) is already in place. Any feedback on issues you find or on how to improve usability is welcome!
 
 .. include:: ../docs/installation.md
 .. include:: ../docs/usage.md
-"""
+"""  # noqa
 from . import filters, io, morphology, segmentation, stats  # noqa: F401
 from .copy import copy
 from .downsample import downsample

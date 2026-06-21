@@ -1,7 +1,15 @@
 # Installation
 
-Install the package in editable mode from a clone of the repository:
+This package can be installed via `pip`:
+```bash
+pip install bioimage-py
+```
+and `conda`:
+```bash
+conda install -c conda-forge bioimage-py
+```
 
+You can also install it from source by cloning the repository and then running 
 ```bash
 python -m pip install -e .
 ```
