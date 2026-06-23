@@ -9,29 +9,9 @@ import numpy as np
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
-from ..util import BlockDescriptor, check_rerun_args, to_roi
+from ..util import BlockDescriptor, check_direct, check_rerun_args, full_roi, to_roi
 
 __all__ = ["max", "min", "mean", "std", "mean_and_std", "min_and_max"]
-
-
-def _is_direct(job_type: str, num_workers: int, block_shape: Optional[Tuple[int, ...]]) -> bool:
-    """Return whether this call qualifies for direct (non-blocked) computation."""
-    return job_type == "local" and num_workers == 1 and block_shape is None
-
-
-def _check_direct(job_type: str, num_workers: int, block_shape: Optional[Tuple[int, ...]],
-                  mask: Optional[SourceLike], block_ids: Optional[Sequence[int]]) -> bool:
-    """Like :func:`_is_direct`, but reject masks/block_ids which the direct path can't honor."""
-    if _is_direct(job_type, num_workers, block_shape):
-        if mask is not None or block_ids is not None:
-            raise ValueError("Direct computation does not support 'mask' or 'block_ids'.")
-        return True
-    return False
-
-
-def _full_roi(source: Source) -> Tuple[slice, ...]:
-    """Return a slicing that selects the whole source."""
-    return tuple(slice(None) for _ in range(source.ndim))
 
 
 def _masked_block_data(input_: Source, mask: Optional[Source],
@@ -92,9 +72,9 @@ def max(
         The maximum value.
     """
     check_rerun_args(job_type, resume_from, block_ids)
-    if _check_direct(job_type, num_workers, block_shape, mask, block_ids):
+    if check_direct(job_type, num_workers, block_shape, mask, block_ids):
         src = as_source(input)
-        return float(np.max(src[_full_roi(src)]))
+        return float(np.max(src[full_roi(src.ndim)]))
     runner = get_runner(job_type, job_config)
     results = runner.run(_max_block, [input], num_workers=num_workers, block_shape=block_shape,
                          mask=mask, block_ids=block_ids, resume_from=resume_from,
@@ -145,9 +125,9 @@ def min_and_max(
         The minimum and maximum values, as a ``(min, max)`` tuple.
     """
     check_rerun_args(job_type, resume_from, block_ids)
-    if _check_direct(job_type, num_workers, block_shape, mask, block_ids):
+    if check_direct(job_type, num_workers, block_shape, mask, block_ids):
         src = as_source(input)
-        d = src[_full_roi(src)]
+        d = src[full_roi(src.ndim)]
         return float(np.min(d)), float(np.max(d))
     runner = get_runner(job_type, job_config)
     results = runner.run(_min_and_max_block, [input], num_workers=num_workers, block_shape=block_shape,
@@ -236,9 +216,9 @@ def mean_and_std(
         The mean and standard deviation, as a ``(mean, std)`` tuple.
     """
     check_rerun_args(job_type, resume_from, block_ids)
-    if _check_direct(job_type, num_workers, block_shape, mask, block_ids):
+    if check_direct(job_type, num_workers, block_shape, mask, block_ids):
         src = as_source(input)
-        d = src[_full_roi(src)]
+        d = src[full_roi(src.ndim)]
         return float(np.mean(d)), float(np.std(d))
     runner = get_runner(job_type, job_config)
     results = runner.run(_mean_and_std_block, [input], num_workers=num_workers, block_shape=block_shape,

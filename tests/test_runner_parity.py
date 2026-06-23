@@ -122,3 +122,46 @@ def test_regionprops_parity(zarr_factory):
     for nw, job in [(1, "local"), (4, "local"), (3, "subprocess")]:
         out = bp.morphology.regionprops(z, table, resolution=res, num_workers=nw, job_type=job)
         pd.testing.assert_frame_equal(expected, out, obj=f"regionprops nw={nw} job={job}")
+
+
+def _assert_ct_equal(a, b, msg=""):
+    """Assert two ContingencyTable objects are element-wise identical."""
+    for field in ("pairs", "counts", "labels_a", "sizes_a", "labels_b", "sizes_b"):
+        np.testing.assert_array_equal(getattr(a, field), getattr(b, field), err_msg=f"{field} {msg}")
+    assert a.n_points == b.n_points, f"n_points {msg}"
+
+
+def test_contingency_table_parity(zarr_factory, rng):
+    from skimage.measure import label as sklabel  # local import: test-only dependency.
+
+    # Two labeled volumes whose objects straddle block boundaries, so the cross-block merge is exercised.
+    seg_a = sklabel(rng.random((37, 41, 23)) > 0.55).astype("uint64")
+    seg_b = sklabel(rng.random((37, 41, 23)) > 0.5).astype("uint64")
+    za, zb = zarr_factory(seg_a, chunks=(16, 16, 16)), zarr_factory(seg_b, chunks=(16, 16, 16))
+    expected = bp.evaluation.contingency_table(seg_a, seg_b)  # direct
+
+    for nw, job in [(1, "local"), (4, "local"), (3, "subprocess")]:
+        out = bp.evaluation.contingency_table(za, zb, num_workers=nw, block_shape=(16, 16, 16),
+                                              job_type=job)
+        _assert_ct_equal(expected, out, msg=f"nw={nw} job={job}")
+
+
+def test_evaluation_metrics_parity(zarr_factory, rng):
+    from skimage.measure import label as sklabel  # local import: test-only dependency.
+
+    seg = sklabel(rng.random((37, 41, 23)) > 0.55).astype("uint64")
+    gt = sklabel(rng.random((37, 41, 23)) > 0.5).astype("uint64")
+    zs, zg = zarr_factory(seg, chunks=(16, 16, 16)), zarr_factory(gt, chunks=(16, 16, 16))
+    exp_vi = bp.evaluation.variation_of_information(seg, gt)
+    exp_match = bp.evaluation.matching(seg, gt)
+    exp_dice = bp.evaluation.dice_score(seg, gt)
+    exp_centroid = bp.evaluation.centroid_matching(seg, gt, distance_threshold=3.0)
+
+    for nw, job in [(1, "local"), (4, "local"), (3, "subprocess")]:
+        kw = dict(num_workers=nw, block_shape=(16, 16, 16), job_type=job)
+        assert np.allclose(bp.evaluation.variation_of_information(zs, zg, **kw), exp_vi), f"vi {job}"
+        assert bp.evaluation.matching(zs, zg, **kw) == exp_match, f"matching {job}"
+        assert np.isclose(bp.evaluation.dice_score(zs, zg, **kw), exp_dice), f"dice {job}"
+        # Centroid extraction runs block-wise through morphology, so this exercises the parity guarantee.
+        assert (bp.evaluation.centroid_matching(zs, zg, distance_threshold=3.0, **kw)
+                == exp_centroid), f"centroid_matching {job}"
