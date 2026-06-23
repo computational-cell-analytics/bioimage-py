@@ -13,8 +13,8 @@ import numpy as np
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
-from ..util import (BlockDescriptor, ComputeFn, check_rerun_args, normalize_halo, sigma_to_halo,
-                    to_roi)
+from ..util import (BlockDescriptor, ComputeFn, check_rerun_args, full_roi, is_direct, normalize_halo,
+                    sigma_to_halo, to_roi)
 
 __all__ = [
     "apply_filter",
@@ -45,11 +45,6 @@ _ORDERS = {
 
 # Filters whose response has a trailing channel axis.
 _MULTI_CHANNEL = {"hessian_of_gaussian_eigenvalues", "structure_tensor_eigenvalues"}
-
-
-def _full_roi(ndim: int) -> Tuple[slice, ...]:
-    """Return a slicing that selects the whole array."""
-    return tuple(slice(None) for _ in range(ndim))
 
 
 def _same_array(a: Source, b: Source) -> bool:
@@ -107,14 +102,14 @@ def _make_compute(filter_name: str, sigma: Sigma, extra_args: Tuple[float, ...],
 def _apply_direct(src: Source, out: Source, filter_name: str, sigma: Sigma,
                   extra_args: Tuple[float, ...], ndim: int, return_channel: Optional[int]) -> None:
     """Apply the filter to the whole array at once (no blocking, no halo)."""
-    data = src[_full_roi(ndim)]
+    data = src[full_roi(ndim)]
     response = _FILTER_FUNCTIONS[filter_name](data, sigma, *extra_args)
     if return_channel is not None:
         response = response[..., return_channel]
     if response.ndim > ndim:
-        out[_full_roi(out.ndim)] = np.moveaxis(response, -1, 0)
+        out[full_roi(out.ndim)] = np.moveaxis(response, -1, 0)
     else:
-        out[_full_roi(ndim)] = response
+        out[full_roi(ndim)] = response
 
 
 def apply_filter(
@@ -178,7 +173,7 @@ def apply_filter(
     )
     multi_channel = filter_name in _MULTI_CHANNEL and return_channel is None
     # A subset/resume rerun is inherently block-wise, so it cannot use the direct (whole-array) path.
-    direct = (job_type == "local" and num_workers == 1 and block_shape is None and mask is None
+    direct = (is_direct(job_type, num_workers, block_shape) and mask is None
               and block_ids is None and resume_from is None)
 
     if output is None:

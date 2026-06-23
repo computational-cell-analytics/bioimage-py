@@ -13,6 +13,7 @@ authors = [{ name = "Constantin Pape", email = "constantin.pape@cs.uni-goettinge
 dependencies = [
     "numpy",
     "pandas",
+    "scipy",
     "scikit-image>=0.20",
     "cloudpickle",
     "tqdm",

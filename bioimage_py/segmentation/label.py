@@ -21,14 +21,9 @@ import numpy as np
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
-from ..util import BlockDescriptor, ComputeFn, get_blocking, to_roi
+from ..util import BlockDescriptor, ComputeFn, full_roi, get_blocking, is_direct, to_roi
 
 __all__ = ["label"]
-
-
-def _full_roi(ndim: int) -> Tuple[slice, ...]:
-    """Return a slicing that selects the whole array."""
-    return tuple(slice(None) for _ in range(ndim))
 
 
 def _binarize(data: np.ndarray, threshold: Optional[float]) -> np.ndarray:
@@ -174,7 +169,7 @@ def label(
     if not 1 <= conn <= ndim:
         raise ValueError(f"connectivity must be in [1, {ndim}], got {conn}.")
 
-    direct = job_type == "local" and num_workers == 1 and block_shape is None and mask is None
+    direct = is_direct(job_type, num_workers, block_shape) and mask is None
     if conn > 1 and not direct:
         raise NotImplementedError(
             "Block-wise labeling only supports connectivity=1 (orthogonal). Use the direct "
@@ -196,9 +191,9 @@ def label(
         raise ValueError(f"output must have dtype uint64, got {out.dtype}.")
 
     if direct:
-        binary = _binarize(src[_full_roi(ndim)], threshold)
+        binary = _binarize(src[full_roi(ndim)], threshold)
         comp = bic.segmentation.label(binary, connectivity=conn).astype("uint64", copy=False)
-        out[_full_roi(ndim)] = comp
+        out[full_roi(ndim)] = comp
         return out_array
 
     block_shape = _resolve_block_shape(src, out, block_shape)

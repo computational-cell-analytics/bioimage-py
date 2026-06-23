@@ -21,18 +21,13 @@ import numpy as np
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
-from ..util import BlockDescriptor, check_rerun_args, to_roi
+from ..util import BlockDescriptor, check_rerun_args, full_roi, is_direct, to_roi
 
 __all__ = ["watershed"]
 
 # Dtypes that bic.segmentation.watershed accepts directly (no copy needed).
 _HMAP_DTYPES = (np.float32, np.float64)
 _SEED_DTYPES = (np.uint32, np.uint64, np.int32, np.int64)
-
-
-def _full_roi(ndim: int) -> Tuple[slice, ...]:
-    """Return a slicing that selects the whole array."""
-    return tuple(slice(None) for _ in range(ndim))
 
 
 def _as_hmap(data: np.ndarray) -> np.ndarray:
@@ -132,7 +127,7 @@ def watershed(
         )
 
     # A subset/resume rerun is inherently block-wise, so it cannot use the direct (whole-array) path.
-    direct = (job_type == "local" and num_workers == 1 and block_shape is None
+    direct = (is_direct(job_type, num_workers, block_shape)
               and block_ids is None and resume_from is None)
 
     if output is None:
@@ -150,10 +145,10 @@ def watershed(
         raise ValueError(f"output must have an integer dtype, got {out.dtype}.")
 
     if direct:
-        block_hmap = _as_hmap(src[_full_roi(ndim)])
-        block_seeds = _as_seeds(seeds_src[_full_roi(ndim)])
-        block_mask = as_source(mask)[_full_roi(ndim)].astype(bool) if mask is not None else None
-        out[_full_roi(ndim)] = bic.segmentation.watershed(block_hmap, block_seeds, mask=block_mask)
+        block_hmap = _as_hmap(src[full_roi(ndim)])
+        block_seeds = _as_seeds(seeds_src[full_roi(ndim)])
+        block_mask = as_source(mask)[full_roi(ndim)].astype(bool) if mask is not None else None
+        out[full_roi(ndim)] = bic.segmentation.watershed(block_hmap, block_seeds, mask=block_mask)
         return out_array
 
     if halo is None:

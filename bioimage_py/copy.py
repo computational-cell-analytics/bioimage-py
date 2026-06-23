@@ -15,14 +15,9 @@ import numpy as np
 from .runner import get_runner
 from .runner.config import RunnerConfig
 from .sources import Source, SourceLike, as_source
-from .util import BlockDescriptor, ComputeFn, check_rerun_args, to_roi
+from .util import BlockDescriptor, ComputeFn, check_rerun_args, full_roi, is_direct, to_roi
 
 __all__ = ["copy"]
-
-
-def _full_roi(ndim: int) -> Tuple[slice, ...]:
-    """Return a slicing that selects the whole array."""
-    return tuple(slice(None) for _ in range(ndim))
 
 
 def _same_array(a: Source, b: Source) -> bool:
@@ -73,7 +68,7 @@ def _copy_source(
     src = as_source(input)
     ndim = src.ndim
     # A subset/resume rerun is block-wise, so it cannot use the direct (whole-array) path.
-    direct = (job_type == "local" and num_workers == 1 and block_shape is None and mask is None
+    direct = (is_direct(job_type, num_workers, block_shape) and mask is None
               and block_ids is None and resume_from is None)
 
     if output is None:
@@ -91,7 +86,7 @@ def _copy_source(
         raise ValueError(f"Block-wise {name} needs 'output' to differ from 'input'.")
 
     if direct:
-        out[_full_roi(out.ndim)] = src[_full_roi(ndim)]
+        out[full_roi(out.ndim)] = src[full_roi(ndim)]
         return out_array
 
     compute = _make_compute()

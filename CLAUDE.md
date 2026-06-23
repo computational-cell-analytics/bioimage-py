@@ -29,15 +29,27 @@ The package lives in `bioimage_py/`:
 - `wrapper/` — on-the-fly transformation sources: `WrapperSource` (`base.py`), `ThresholdSource`
   (`generic.py`), and `ResizedSource` (`resize.py`, a shape-changing resize/resample wrapper that
   reads through a halo and delegates interpolation to `bioimage_cpp.transformation`).
-- `stats/`, `filters/`, `segmentation/` — the operations (`stats.max/min/mean/std`,
-  `filters.apply_filter` + the gaussian family, `segmentation.label`).
+- `stats/`, `filters/`, `segmentation/`, `morphology/` — the operations (`stats.max/min/mean/std`,
+  `filters.apply_filter` + the gaussian family, `segmentation.label` + `segmentation.watershed`,
+  `morphology.morphology` + `morphology.regionprops`).
+- `evaluation/` — segmentation-comparison metrics built on a parallel contingency table. `contingency_table`
+  returns the `ContingencyTable` dataclass primitive (sparse overlap counts via
+  `bioimage_cpp.utils.segmentation_overlap`, additive across blocks with no halo; has a `drop_ignore`
+  post-filter for ignore labels). Each metric — `variation_of_information` / `object_vi`, `rand_index`,
+  `cremi_score`, `matching` / `mean_segmentation_accuracy`, `dice_score`, `symmetric_best_dice_score` —
+  has a low-level `*_scores(table, …)` form and a high-level `(segmentation, groundtruth, …)` wrapper
+  that builds the table in parallel then scores. `dice_score` is its own small sum-reduction (not table-based).
+  `centroid_matching` / `coordinate_matching` are also non-table: they match objects by centroid distance
+  under a threshold (high-level derives centroids via `morphology`'s center of mass, then defers to the
+  coordinate-level form), reusing matching's precision/recall/f1/segmentation-accuracy formulas.
 - `copy.py` — `copy` (block-wise copy of one source into another, e.g. format conversion or
   persisting a wrapper to file) plus the shared `_copy_source` core (output handling + direct path +
   runner dispatch).
 - `downsample.py` — `downsample` (block-wise downsampling; wraps the input in a `ResizedSource` at the
   downscaled shape and reuses `_copy_source`).
 - `util.py` — shared helpers: `to_roi`, `get_blocking`, `derive_block_shape`, `sigma_to_halo`,
-  `downscale_shape`, and the `BlockDescriptor` / `ComputeFn` type aliases.
+  `downscale_shape`, `check_rerun_args`, the direct-fast-path trio `is_direct` / `check_direct` /
+  `full_roi`, and the `BlockDescriptor` / `ComputeFn` type aliases.
 
 Conventions (follow these):
 
@@ -52,10 +64,19 @@ Conventions (follow these):
 - Per-block functions have the fixed signature `function(block, inputs, outputs, mask)` (the `ComputeFn`
   alias). They are cloudpickled, so capture only picklable values — dispatch heavy callables (e.g.
   `bioimage_cpp` functions) by name, not by object.
-- Array-output ops (`filters.*`, `segmentation.label`, `copy`, `downsample`) take an optional `output`:
-  for local execution a numpy array is allocated and returned when omitted; for distributed execution
-  `output` is required and the runner validates it is file-backed (reopenable). These ops return the
-  output array object.
+- Array-output ops (`filters.*`, `segmentation.label`, `segmentation.watershed`, `copy`, `downsample`)
+  take an optional `output`: for local execution a numpy array is allocated and returned when omitted;
+  for distributed execution `output` is required and the runner validates it is file-backed (reopenable).
+  These ops return the output array object.
+- Every block-wise op has a *direct* fast path (whole-array, no runner / no blocking) for
+  `job_type="local"`, `num_workers==1`, `block_shape is None`, built on the shared `util.is_direct` /
+  `util.check_direct` / `util.full_roi` — do not reimplement these per op. The two op families use them
+  differently: reduction ops (`stats`, `morphology`, `evaluation.contingency_table`,
+  `evaluation.dice_score`) call `check_direct(...)`, which *raises* when a `mask`/`block_ids` is passed
+  alongside the direct conditions (the whole-array path can't honor them — pass a `block_shape` to go
+  blocked); array-output ops compute `direct = is_direct(...) and <their mask/block_ids/resume_from are
+  None>` and silently fall through to the blocked path instead (per-op extra conditions vary, e.g.
+  `watershed`'s direct path does honor a mask). `full_roi(ndim)` builds the whole-array slicing for both.
 - numpy arrays are local-only (their `to_spec()` raises); distributed backends need a reopenable source.
 - A `Source` exposes a `writable` property (default `True`; `False` for wrappers, read-only `FileSource`s,
   and `WebKnossosSource`). The distributed runner rejects non-writable outputs, and rejects HDF5 as an
@@ -89,8 +110,9 @@ Use pyflakes and flake8 for linting: `python -m flake8 bioimage_py tests` and
 Implemented and tested: the full `local` path, the `subprocess` backend (the real distributed protocol —
 cloudpickle payload, generated harness, per-task result/sentinel files, `block_ids` re-run, failure
 reporting), the `slurm` backend (sbatch array submission, `sacct` polling, reattach via a manifest), and
-the operations above (`stats`, `filters`, `segmentation.label`, `copy`, and `downsample` — the latter
-built on the `ResizedSource` wrapper). The slurm-only tests in `tests/test_slurm_runner.py` are skipped unless
+the operations above (`stats`, `filters`, `segmentation.label` + `segmentation.watershed`, `morphology`
++ `regionprops`, `copy`, and `downsample` — the latter built on the `ResizedSource` wrapper — and the
+`evaluation` package: the parallel `contingency_table` primitive plus the metrics built on it). The slurm-only tests in `tests/test_slurm_runner.py` are skipped unless
 `sbatch` is on `PATH` and `BIOIMAGE_PY_SHARED_TMP` points at a shared filesystem; `subprocess` stays the
 CI proxy for the shared protocol. Note the slurm runner's key subtlety: per-task `.success` sentinels are
 written on compute nodes but can take up to the NFS attribute-cache timeout (~60 s) to become visible to

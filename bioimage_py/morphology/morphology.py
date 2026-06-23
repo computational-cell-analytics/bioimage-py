@@ -16,29 +16,9 @@ import pandas as pd
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
-from ..util import BlockDescriptor, check_rerun_args, to_roi
+from ..util import BlockDescriptor, check_direct, check_rerun_args, full_roi, to_roi
 
 __all__ = ["morphology"]
-
-
-def _is_direct(job_type: str, num_workers: int, block_shape: Optional[Tuple[int, ...]]) -> bool:
-    """Return whether this call qualifies for direct (non-blocked) computation."""
-    return job_type == "local" and num_workers == 1 and block_shape is None
-
-
-def _check_direct(job_type: str, num_workers: int, block_shape: Optional[Tuple[int, ...]],
-                  mask: Optional[SourceLike], block_ids: Optional[Sequence[int]]) -> bool:
-    """Like :func:`_is_direct`, but reject masks/block_ids which the direct path can't honor."""
-    if _is_direct(job_type, num_workers, block_shape):
-        if mask is not None or block_ids is not None:
-            raise ValueError("Direct computation does not support 'mask' or 'block_ids'.")
-        return True
-    return False
-
-
-def _full_roi(source: Source) -> Tuple[slice, ...]:
-    """Return a slicing that selects the whole source."""
-    return tuple(slice(None) for _ in range(source.ndim))
 
 
 def _axis_names(ndim: int) -> List[str]:
@@ -207,8 +187,8 @@ def morphology(
         raise ValueError(f"morphology expects an integer label image, got dtype {src.dtype}.")
     ndim = src.ndim
 
-    if _check_direct(job_type, num_workers, block_shape, mask, block_ids):
-        table = _block_table(src[_full_roi(src)], [0] * ndim)
+    if check_direct(job_type, num_workers, block_shape, mask, block_ids):
+        table = _block_table(src[full_roi(src.ndim)], [0] * ndim)
         tables = [table] if table is not None else []
     else:
         runner = get_runner(job_type, job_config)

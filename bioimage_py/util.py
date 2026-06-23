@@ -5,12 +5,15 @@ import itertools
 import numbers
 import warnings
 from math import ceil
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import bioimage_cpp as bic
 from bioimage_cpp.utils import Block, BlockWithHalo, Blocking
 
 from .sources.base import Source
+
+if TYPE_CHECKING:
+    from .sources import SourceLike
 
 # A per-block descriptor handed to compute functions: a plain ``Block`` (no halo) or a
 # ``BlockWithHalo`` (halo operations).
@@ -34,6 +37,26 @@ def to_roi(block: BlockDescriptor) -> Tuple[slice, ...]:
         A tuple of slices that indexes a source or array.
     """
     return tuple(slice(int(b), int(e)) for b, e in zip(block.begin, block.end))
+
+
+def full_roi(ndim: int) -> Tuple[slice, ...]:
+    """Return a slicing tuple that selects an entire ``ndim``-dimensional array."""
+    return tuple(slice(None) for _ in range(ndim))
+
+
+def is_direct(job_type: str, num_workers: int, block_shape: Optional[Tuple[int, ...]]) -> bool:
+    """Return whether a call qualifies for the direct (whole-array, non-blocked) fast path."""
+    return job_type == "local" and num_workers == 1 and block_shape is None
+
+
+def check_direct(job_type: str, num_workers: int, block_shape: Optional[Tuple[int, ...]],
+                 mask: "Optional[SourceLike]", block_ids: Optional[Sequence[int]]) -> bool:
+    """Like :func:`is_direct`, but reject mask/block_ids the direct reduction path cannot honor."""
+    if is_direct(job_type, num_workers, block_shape):
+        if mask is not None or block_ids is not None:
+            raise ValueError("Direct computation does not support 'mask' or 'block_ids'.")
+        return True
+    return False
 
 
 def normalize_halo(halo: Union[int, Sequence[int]], ndim: int) -> List[int]:
