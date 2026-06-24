@@ -8,7 +8,7 @@ The functionality will be extended soon; the implementation of seamlessly switch
 .. include:: ../docs/installation.md
 .. include:: ../docs/usage.md
 """  # noqa
-from . import evaluation, filters, io, morphology, segmentation, stats  # noqa: F401
+from . import evaluation, filters, io, morphology, operations, segmentation, stats  # noqa: F401
 from .copy import copy
 from .downsample import downsample
 from .runner import get_runner
@@ -23,6 +23,7 @@ __all__ = [
     "segmentation",
     "morphology",
     "evaluation",
+    "operations",
     "io",
     "copy",
     "downsample",

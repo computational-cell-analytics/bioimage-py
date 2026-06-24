@@ -15,14 +15,9 @@ import numpy as np
 from .runner import get_runner
 from .runner.config import RunnerConfig
 from .sources import Source, SourceLike, as_source
-from .util import BlockDescriptor, ComputeFn, check_rerun_args, full_roi, is_direct, to_roi
+from .util import BlockDescriptor, ComputeFn, check_rerun_args, full_roi, is_direct, same_array, to_roi
 
 __all__ = ["copy"]
-
-
-def _same_array(a: Source, b: Source) -> bool:
-    """Return whether two sources wrap the same underlying array object."""
-    return getattr(a, "array", None) is getattr(b, "array", object())
 
 
 def _make_compute() -> ComputeFn:
@@ -82,7 +77,7 @@ def _copy_source(
         out_array = output
 
     out = as_source(out_array)
-    if not direct and _same_array(out, src):
+    if not direct and same_array(out, src):
         raise ValueError(f"Block-wise {name} needs 'output' to differ from 'input'.")
 
     if direct:
