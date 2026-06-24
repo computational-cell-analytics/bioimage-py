@@ -102,3 +102,32 @@ global cross-block merge, so a failed `label` is re-run **whole** (it accepts ne
 `morphology.regionprops` re-runs per object via `item_ids` / `resume_from`. A `local` run keeps no
 temp folder, so re-run it (optionally with `block_ids=e.failed_block_ids`); `resume_from` is rejected
 for `job_type="local"`.
+
+## Slurm configuration
+
+Slurm settings are cluster- and user-specific (partition, account, qos, node constraint, the shared
+`tmp_root`, ...). Pass them per call as a `SlurmConfig`:
+
+```python
+from bioimage_py import SlurmConfig
+
+cfg = SlurmConfig(tmp_root="/scratch/shared/me", partition="gpu", account="myproj", time="01:00:00")
+bp.copy(src, out, block_shape=(64, 64, 64), num_workers=64, job_type="slurm", job_config=cfg)
+```
+
+To avoid repeating these every time, store them once as user defaults in
+`~/.config/bioimage-py/config.toml` (honoring `$XDG_CONFIG_HOME`). Use the helper rather than
+editing the file by hand — it validates field names and preserves the rest of the file:
+
+```python
+from bioimage_py import write_slurm_config
+
+write_slurm_config(tmp_root="/scratch/shared/me", partition="gpu", account="myproj")
+```
+
+These defaults are picked up automatically whenever a slurm run gets no explicit `job_config`
+(e.g. `bp.copy(..., job_type="slurm")`). To combine the stored defaults with per-run tweaks, use
+`SlurmConfig.load(**overrides)` (overrides win); a directly constructed `SlurmConfig(...)` is used
+verbatim and does **not** read the file. Set `BIOIMAGE_PY_NO_CONFIG=1` to ignore the file
+(reproducible CI), or `BIOIMAGE_PY_CONFIG=/path/to/config.toml` to point at a specific file (e.g. a
+shared cluster-wide config).

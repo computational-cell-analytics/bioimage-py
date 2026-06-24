@@ -15,8 +15,11 @@ The package lives in `bioimage_py/`:
 - `runner/` — execution backends. `base.py` (the `Runner` ABC + the backend-independent `run()` +
   `LocalRunner` + the shared `run_block`), `distributed.py` (`_DistributedRunner` base + the shared
   `_finalize`, `SubprocessRunner`, and `SlurmRunner` — sbatch array submission, `sacct` polling and
-  reattach), `_harness.py` (worker entry point), `config.py` (`RunnerConfig` / `SlurmConfig`),
-  `factory.py` (`get_runner`).
+  reattach), `_harness.py` (worker entry point), `config.py` (`RunnerConfig` / `SlurmConfig` plus
+  the user config file: `config_file_path`, `write_slurm_config`, and `SlurmConfig.load` — a
+  TOML `[slurm]` table under `~/.config/bioimage-py/config.toml` supplies cluster-specific
+  defaults; auto-loaded when `SlurmRunner`/`get_runner("slurm")` get no config, gated by
+  `BIOIMAGE_PY_NO_CONFIG` / `BIOIMAGE_PY_CONFIG`), `factory.py` (`get_runner`).
 - `sources/` — `Source` ABC + `SourceSpec` (`base.py`), `ArraySource` for numpy/zarr/z5py
   (`array_source.py`), the `as_source` / `from_spec` / `SourceLike` dispatch (`dispatch.py`),
   `FileSource` + `open_source` (`file_source.py`, the `kind="file"` spec over the `io/` layer),

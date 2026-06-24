@@ -11,7 +11,7 @@ The functionality will be extended soon; the implementation of seamlessly switch
 from . import evaluation, filters, io, morphology, operations, segmentation, stats  # noqa: F401
 from .copy import copy
 from .downsample import downsample
-from .runner import get_runner
+from .runner import SlurmConfig, config_file_path, get_runner, write_slurm_config
 from .sources import as_source, open_cloudvolume, open_source, open_webknossos
 from .util import to_roi
 from .__version__ import __version__
@@ -28,6 +28,9 @@ __all__ = [
     "copy",
     "downsample",
     "get_runner",
+    "SlurmConfig",
+    "config_file_path",
+    "write_slurm_config",
     "as_source",
     "open_source",
     "open_cloudvolume",

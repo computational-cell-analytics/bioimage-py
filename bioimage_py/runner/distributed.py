@@ -516,14 +516,16 @@ class SlurmRunner(_DistributedRunner):
         """Create the runner, requiring a :class:`SlurmConfig`.
 
         Args:
-            config: The slurm configuration. ``None`` uses an all-default ``SlurmConfig``
-                (which still requires ``tmp_root`` to be set before running).
+            config: The slurm configuration. ``None`` loads the user defaults from the config
+                file via :meth:`SlurmConfig.load` (honoring ``BIOIMAGE_PY_NO_CONFIG`` /
+                ``BIOIMAGE_PY_CONFIG``); ``tmp_root`` must still be set, here or in the file,
+                before running.
 
         Raises:
             TypeError: If ``config`` is a non-slurm ``RunnerConfig``.
         """
         if config is None:
-            config = SlurmConfig()
+            config = SlurmConfig.load()
         if not isinstance(config, SlurmConfig):
             raise TypeError(
                 f"SlurmRunner requires a SlurmConfig, got {type(config).__name__}. "
