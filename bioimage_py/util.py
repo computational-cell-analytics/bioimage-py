@@ -59,6 +59,11 @@ def check_direct(job_type: str, num_workers: int, block_shape: Optional[Tuple[in
     return False
 
 
+def same_array(a: Source, b: Source) -> bool:
+    """Return whether two sources wrap the same underlying array object."""
+    return getattr(a, "array", None) is getattr(b, "array", object())
+
+
 def normalize_halo(halo: Union[int, Sequence[int]], ndim: int) -> List[int]:
     """Broadcast a halo to a per-axis list of length ``ndim``."""
     if isinstance(halo, numbers.Integral):
