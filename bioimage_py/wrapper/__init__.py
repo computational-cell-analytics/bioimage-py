@@ -9,7 +9,7 @@ from .base import (
     register_wrapper,
     wrapper_from_spec,
 )
-from .generic import NormalizeSource, PadSource, RoiSource, ThresholdSource
+from .generic import ExpandDimsSource, NormalizeSource, PadSource, RoiSource, ThresholdSource
 from .resize import ResizedSource
 
 __all__ = [
@@ -22,6 +22,7 @@ __all__ = [
     "NormalizeSource",
     "RoiSource",
     "PadSource",
+    "ExpandDimsSource",
     "AffineSource",
     "ResizedSource",
     "register_wrapper",
