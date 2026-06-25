@@ -25,5 +25,6 @@ dependencies:
   - pytest
   - scipy
   - openpyxl
+  - tomli-w
   # The remaining optional backends (cloud-volume, webknossos, msr-reader) are pip-only;
   # the tests that need them are skipped in the conda environment.
