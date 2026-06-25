@@ -34,7 +34,14 @@ The package lives in `bioimage_py/`:
   reads through a halo and delegates interpolation to `bioimage_cpp.transformation`).
 - `stats/`, `filters/`, `segmentation/`, `morphology/` — the operations (`stats.max/min/mean/std`,
   `filters.apply_filter` + the gaussian family, `segmentation.label` + `segmentation.watershed`,
-  `morphology.morphology` + `morphology.regionprops`).
+  `morphology.morphology` + `morphology.regionprops`). `segmentation/multicut.py` ports the
+  bioimage-cpp-backed multicut cost transform + solvers (`compute_edge_costs`,
+  `multicut_decomposition` / `_gaec` / `_kernighan_lin`); meant to grow into multicut-based
+  segmentation. `segmentation/stitching.py` (`stitch_segmentation` / `stitch_tiled_segmentation`)
+  merges a tile-wise over-segmentation via a multicut over tile-interface object overlaps — the
+  per-voxel phases (tile segmentation, overlap counting) run through the runner; RAG build +
+  multicut solve are in-process private helpers (`_compute_rag` / `_project_node_labels_to_pixels`,
+  with a TODO to move to dedicated distributed graph functionality).
 - `evaluation/` — segmentation-comparison metrics built on a parallel contingency table. `contingency_table`
   returns the `ContingencyTable` dataclass primitive (sparse overlap counts via
   `bioimage_cpp.utils.segmentation_overlap`, additive across blocks with no halo; has a `drop_ignore`
@@ -114,8 +121,10 @@ Implemented and tested: the full `local` path, the `subprocess` backend (the rea
 cloudpickle payload, generated harness, per-task result/sentinel files, `block_ids` re-run, failure
 reporting), the `slurm` backend (sbatch array submission, `sacct` polling, reattach via a manifest), and
 the operations above (`stats`, `filters`, `segmentation.label` + `segmentation.watershed`, `morphology`
-+ `regionprops`, `copy`, and `downsample` — the latter built on the `ResizedSource` wrapper — and the
-`evaluation` package: the parallel `contingency_table` primitive plus the metrics built on it). The slurm-only tests in `tests/test_slurm_runner.py` are skipped unless
++ `regionprops`, `copy`, and `downsample` — the latter built on the `ResizedSource` wrapper — the
+`evaluation` package: the parallel `contingency_table` primitive plus the metrics built on it — and
+`segmentation.stitch_segmentation` / `stitch_tiled_segmentation` on the new `segmentation.multicut`
+solvers). The slurm-only tests in `tests/test_slurm_runner.py` are skipped unless
 `sbatch` is on `PATH` and `BIOIMAGE_PY_SHARED_TMP` points at a shared filesystem; `subprocess` stays the
 CI proxy for the shared protocol. Note the slurm runner's key subtlety: per-task `.success` sentinels are
 written on compute nodes but can take up to the NFS attribute-cache timeout (~60 s) to become visible to
