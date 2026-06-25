@@ -4,7 +4,7 @@ import pytest
 
 import bioimage_py as bp
 from bioimage_py.sources import from_spec
-from bioimage_py.wrapper import NormalizeSource, PadSource, RoiSource, ThresholdSource
+from bioimage_py.wrapper import ExpandDimsSource, NormalizeSource, PadSource, RoiSource, ThresholdSource
 
 
 def test_threshold_operator(zarr_factory, rng):
@@ -127,5 +127,52 @@ def test_pad_source_spec_roundtrip(zarr_factory, rng):
     src = PadSource(z, (8, 4))
     rebuilt = from_spec(src.to_spec())
     assert isinstance(rebuilt, PadSource)
+    assert rebuilt.shape == src.shape
+    np.testing.assert_array_equal(bp.copy(rebuilt), bp.copy(src))
+
+
+def test_expand_dims_source(zarr_factory, rng):
+    a = rng.random((40, 48)).astype("float32")
+    z = zarr_factory(a, chunks=(16, 16))
+
+    src = ExpandDimsSource(z, axis=0)
+    assert src.ndim == 3
+    assert src.shape == (1, 40, 48)
+    assert src.chunks == (1, 16, 16)
+    np.testing.assert_array_equal(bp.copy(src), a[None])
+    # A block-wise read tiles cleanly and matches the whole-array read.
+    blocked = bp.copy(src, block_shape=(1, 16, 16), num_workers=4)
+    np.testing.assert_array_equal(blocked, a[None])
+
+
+def test_expand_dims_source_multi_axis(zarr_factory, rng):
+    a = rng.random((40, 48)).astype("float32")
+    z = zarr_factory(a, chunks=(16, 16))
+
+    src = ExpandDimsSource(z, axis=(0, 3))
+    assert src.ndim == 4
+    assert src.shape == (1, 40, 48, 1)
+    np.testing.assert_array_equal(bp.copy(src), np.expand_dims(a, (0, 3)))
+
+    # Negative axes count from the end (numpy expand_dims semantics).
+    neg = ExpandDimsSource(z, axis=-1)
+    assert neg.shape == (40, 48, 1)
+    np.testing.assert_array_equal(bp.copy(neg), np.expand_dims(a, -1))
+
+
+def test_expand_dims_source_invalid_axis(zarr_factory, rng):
+    z = zarr_factory(rng.random((8, 8)).astype("float32"), chunks=(8, 8))
+    with pytest.raises(ValueError):
+        ExpandDimsSource(z, axis=5)  # out of bounds for expanded ndim 3
+    with pytest.raises(ValueError):
+        ExpandDimsSource(z, axis=(0, 0))  # repeated axis
+
+
+def test_expand_dims_spec_roundtrip(zarr_factory, rng):
+    a = rng.random((40, 48)).astype("float32")
+    z = zarr_factory(a, chunks=(16, 16))
+    src = ExpandDimsSource(z, axis=0)
+    rebuilt = from_spec(src.to_spec())
+    assert isinstance(rebuilt, ExpandDimsSource)
     assert rebuilt.shape == src.shape
     np.testing.assert_array_equal(bp.copy(rebuilt), bp.copy(src))

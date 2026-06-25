@@ -237,3 +237,77 @@ class PadSource(WrapperSource):
     def _params(self) -> dict:
         """Return the keyword arguments needed to reconstruct this wrapper."""
         return {"pad_width": self._pad_width, "mode": self._mode}
+
+
+@register_wrapper
+class ExpandDimsSource(WrapperSource):
+    """Insert one or more singleton axes into the wrapped source on read.
+
+    The inverse of a squeezing :class:`RoiSource`: the wrapper presents the wrapped source with
+    extra length-1 axes inserted at ``axis``, following :func:`numpy.expand_dims` semantics (``axis``
+    refers to positions in the *expanded* result). Use this to promote e.g. a 2d image to a 3d
+    volume ``(1, y, x)`` without materializing a copy. This is a read-only view.
+
+    Args:
+        source: The wrapped source-like object.
+        axis: Position(s) in the expanded result at which to insert a new singleton axis. May be a
+            single int or a sequence of ints; negative values count from the end.
+    """
+
+    def __init__(self, source: SourceLike, axis: Union[int, Sequence[int]] = 0) -> None:
+        super().__init__(source)
+        self._axis = axis
+        axes = (axis,) if isinstance(axis, (int, np.integer)) else tuple(int(a) for a in axis)
+        out_ndim = self._source.ndim + len(axes)
+        normalized = []
+        for a in axes:
+            a = int(a)
+            if a < 0:
+                a += out_ndim
+            if not 0 <= a < out_ndim:
+                raise ValueError(f"axis {axis} is out of bounds for expanded ndim {out_ndim}.")
+            normalized.append(a)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(f"repeated axis in {axis}.")
+        self._new_axes = tuple(sorted(normalized))
+        # Axes of the expanded shape that map back to the wrapped source (in order).
+        self._kept_axes = tuple(ax for ax in range(out_ndim) if ax not in self._new_axes)
+
+    @property
+    def ndim(self) -> int:
+        return self._source.ndim + len(self._new_axes)
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        out = [1] * self.ndim
+        for ax, sh in zip(self._kept_axes, self._source.shape):
+            out[ax] = sh
+        return tuple(out)
+
+    @property
+    def chunks(self) -> Optional[Tuple[int, ...]]:
+        src_chunks = self._source.chunks
+        if src_chunks is None:
+            return None
+        out = [1] * self.ndim
+        for ax, c in zip(self._kept_axes, src_chunks):
+            out[ax] = c
+        return tuple(out)
+
+    @property
+    def shards(self) -> Optional[Tuple[int, ...]]:
+        # Inserting singleton axes does not in general preserve the parent's shard grid.
+        return None
+
+    def _getitem(self, roi: Tuple[slice, ...]) -> np.ndarray:
+        """Return the wrapped data at ``roi`` with the singleton axes inserted.
+
+        ``roi`` is a full tuple of slices over the expanded shape (the inserted axes are
+        ``slice(0, 1)``); read the wrapped source over the kept axes, then re-insert the axes.
+        """
+        src_index = tuple(roi[ax] for ax in self._kept_axes)
+        return np.expand_dims(self._source[src_index], self._new_axes)
+
+    def _params(self) -> dict:
+        """Return the keyword arguments needed to reconstruct this wrapper."""
+        return {"axis": self._axis}
