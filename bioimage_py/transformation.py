@@ -229,3 +229,65 @@ def transform_subvolume_affine(
     if is_bool:
         res = res.astype(bool)
     return res
+
+
+def transform_subvolume_coordinates(
+    source: SourceLike,
+    coordinates: np.ndarray,
+    order: int = 1,
+    fill_value: Number = 0,
+) -> np.ndarray:
+    """Resample the output region of a source from an explicit per-voxel coordinate field.
+
+    The counterpart of :func:`transform_subvolume_affine` for a precomputed deformation field:
+    ``coordinates`` has shape ``(ndim, *output_shape)`` and gives, for each output voxel, the source
+    coordinate to sample (in numpy axis order). The bounding box of the input region those
+    coordinates span is read once - extended by an interpolation halo so block-wise reads are
+    seam-free - and resampled in memory, delegating to ``bioimage_cpp.transformation.map_coordinates``.
+
+    Args:
+        source: The input source-like object (2D or 3D).
+        coordinates: The source coordinate field, of shape ``(ndim, *output_shape)`` in numpy axis order.
+        order: The interpolation order, supports orders 0 to 5.
+        fill_value: The value used for output voxels whose coordinate maps outside the input.
+
+    Returns:
+        The resampled output region, of shape ``coordinates.shape[1:]``.
+    """
+    source = as_source(source)
+    src_shape = source.shape
+    ndim = len(src_shape)
+    coords = np.asarray(coordinates, dtype="float64")
+    if coords.ndim != ndim + 1 or coords.shape[0] != ndim:
+        raise ValueError(
+            f"coordinates must have shape (ndim, *output_shape) with ndim={ndim}, got shape {coords.shape}"
+        )
+    out_shape = tuple(int(s) for s in coords.shape[1:])
+
+    # The input region these coordinates sample from (their per-axis span), extended by the
+    # interpolation halo (order + 1 taps) and clamped to the source extent.
+    halo = order + 1
+    in_start = [max(0, int(np.floor(float(coords[d].min()))) - halo) for d in range(ndim)]
+    in_stop = [min(int(src_shape[d]), int(np.ceil(float(coords[d].max()))) + halo) for d in range(ndim)]
+
+    if any(sto <= sta for sta, sto in zip(in_start, in_stop)):
+        # Every coordinate maps outside the input.
+        return np.full(out_shape, fill_value, dtype=source.dtype)
+
+    in_bb = tuple(slice(sta, sto) for sta, sto in zip(in_start, in_stop))
+    in_region = np.asarray(source[in_bb])
+    is_bool = np.dtype(source.dtype) == np.dtype(bool)
+    if is_bool:
+        in_region = in_region.astype("uint8")
+
+    # Shift the coordinates into the local frame of the read sub-region.
+    local_coords = np.empty_like(coords)
+    for d in range(ndim):
+        local_coords[d] = coords[d] - in_start[d]
+
+    res = bic.transformation.map_coordinates(
+        in_region, local_coords, order=order, fill_value=fill_value,
+    )
+    if is_bool:
+        res = res.astype(bool)
+    return res
