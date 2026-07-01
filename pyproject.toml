@@ -19,7 +19,7 @@ dependencies = [
     "tqdm",
     "threadpoolctl",
     "tomli-w",
-    "bioimage-cpp",
+    "bioimage-cpp>=0.5",
 ]
 
 [project.optional-dependencies]
