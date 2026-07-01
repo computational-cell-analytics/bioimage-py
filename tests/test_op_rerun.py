@@ -39,6 +39,33 @@ def test_filter_block_ids_subset(zarr_factory, rng):
     assert np.all(out[16:32, 16:32] == 0)  # block 3 was not
 
 
+@pytest.mark.parametrize("dict_mode", [False, True])
+def test_relabel_block_ids_subset(zarr_factory, rng, dict_mode):
+    # block_ids restricts a fresh run to those blocks (written into the existing output). The
+    # array mode also exercises persisting the numpy node labels for the subprocess backend.
+    a = rng.integers(1, 8, size=(32, 32)).astype("uint64")  # 2x2 = 4 blocks
+    labels = (np.arange(int(a.max()) + 1) * 5 + 1).astype("uint64")
+    labels[0] = 0
+    node_labels = {i: int(v) for i, v in enumerate(labels)} if dict_mode else labels
+    z = zarr_factory(a, chunks=(16, 16))
+    out = zarr_factory(shape=(32, 32), chunks=(16, 16), dtype="uint64", fill=0)
+    bp.segmentation.relabel(z, node_labels, out, block_shape=(16, 16), num_workers=2,
+                            job_type="subprocess", block_ids=[0])
+    np.testing.assert_array_equal(out[0:16, 0:16], np.take(labels, a[0:16, 0:16]))  # block 0
+    assert np.all(out[0:16, 16:32] == 0)  # the other blocks untouched
+    assert np.all(out[16:32, :] == 0)
+
+
+def test_relabel_resume_from_and_subset_mutually_exclusive(zarr_factory, rng):
+    a = rng.integers(1, 8, size=(32, 32)).astype("uint64")
+    z = zarr_factory(a, chunks=(16, 16))
+    out = zarr_factory(shape=(32, 32), chunks=(16, 16), dtype="uint64", fill=0)
+    labels = np.arange(int(a.max()) + 1, dtype="uint64")
+    with pytest.raises(ValueError, match="not both"):
+        bp.segmentation.relabel(z, labels, out, block_shape=(16, 16), block_ids=[0],
+                                resume_from="/x")
+
+
 def test_regionprops_item_ids_subset(zarr_factory):
     seg = np.zeros((24, 32, 28), dtype="uint64")
     seg[2:9, 3:14, 4:12] = 1
