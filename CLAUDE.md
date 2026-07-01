@@ -34,7 +34,13 @@ The package lives in `bioimage_py/`:
   reads through a halo and delegates interpolation to `bioimage_cpp.transformation`).
 - `stats/`, `filters/`, `segmentation/`, `morphology/` — the operations (`stats.max/min/mean/std`,
   `filters.apply_filter` + the gaussian family, `segmentation.label` + `segmentation.watershed`,
-  `morphology.morphology` + `morphology.regionprops`). `segmentation/multicut.py` ports the
+  `morphology.morphology` + `morphology.regionprops`). `segmentation/relabel.py` holds `relabel`
+  (applies an externally-supplied labeling — a `{old_id: new_id}` dict or a dense 1D array/source —
+  to a segmentation block-wise, in place by default; a numpy labeling array is persisted to a temp
+  zarr under the runner temp root for distributed backends, cleaned on success via `pre_cleanup`,
+  preserved on failure for `resume_from`) and `relabel_consecutive` (derives a consecutive mapping
+  via a global `unique` reduction, then delegates the block-wise write to `relabel`; in place by
+  default). `segmentation/multicut.py` ports the
   bioimage-cpp-backed multicut cost transform + solvers (`compute_edge_costs`,
   `multicut_decomposition` / `_gaec` / `_kernighan_lin`); meant to grow into multicut-based
   segmentation. `segmentation/stitching.py` (`stitch_segmentation` / `stitch_tiled_segmentation`)
@@ -87,6 +93,20 @@ Conventions (follow these):
   blocked); array-output ops compute `direct = is_direct(...) and <their mask/block_ids/resume_from are
   None>` and silently fall through to the blocked path instead (per-op extra conditions vary, e.g.
   `watershed`'s direct path does honor a mask). `full_roi(ndim)` builds the whole-array slicing for both.
+- `segmentation.relabel` is the canonical way to write a *node labeling* (a relabeling of segment ids)
+  onto pixels — any op that produces per-object labels (multicut, clustering, agglomeration, graph
+  partitioning, size/property filters, …) should apply its result through `relabel` rather than a
+  bespoke block-wise write. Performance findings (benchmarked): prefer a **dense 1D array/source**
+  labeling (`labeling[old_id] = new_id`) over a dict — the per-block kernel is then `numpy.take`, which
+  is O(block) *independent* of the labeling size (~0.3 ms/block even at 1e8 entries). A dict labeling
+  uses `bioimage_cpp.utils.take_dict`, which rebuilds a hash map from the *whole* dict every block
+  (O(dict size)/block); `relabel` mitigates this with **gated per-block subsampling** — for large dicts
+  it restricts the mapping to the block's `np.unique` ids before `take_dict` (gated by
+  `_RELABEL_SUBSAMPLE_MIN_DICT` / `_RELABEL_SUBSAMPLE_MAX_DIVERSITY` so it never regresses on small
+  dicts or pathologically diverse blocks; ~7–8× faster over a large volume) — but a dense array is
+  still fastest. `relabel_consecutive` derives its `{old_id: new_id}` mapping and delegates the write to
+  `relabel` (kept as a dict, not a dense array, so it stays memory-safe for sparse/large input id
+  spaces — the case it is most often used to compact). `bioimage_cpp` has no dense-array `take`.
 - numpy arrays are local-only (their `to_spec()` raises); distributed backends need a reopenable source.
 - A `Source` exposes a `writable` property (default `True`; `False` for wrappers, read-only `FileSource`s,
   and `WebKnossosSource`). The distributed runner rejects non-writable outputs, and rejects HDF5 as an
@@ -122,7 +142,9 @@ cloudpickle payload, generated harness, per-task result/sentinel files, `block_i
 reporting), the `slurm` backend (sbatch array submission, `sacct` polling, reattach via a manifest), and
 the operations above (`stats`, `filters`, `segmentation.label` + `segmentation.watershed`, `morphology`
 + `regionprops`, `copy`, and `downsample` — the latter built on the `ResizedSource` wrapper — the
-`evaluation` package: the parallel `contingency_table` primitive plus the metrics built on it — and
+`evaluation` package: the parallel `contingency_table` primitive plus the metrics built on it —
+`segmentation.relabel` (apply a node labeling / relabeling map, in place by default; the canonical
+node-label writer, see Conventions) + `segmentation.relabel_consecutive`, and
 `segmentation.stitch_segmentation` / `stitch_tiled_segmentation` on the new `segmentation.multicut`
 solvers). The slurm-only tests in `tests/test_slurm_runner.py` are skipped unless
 `sbatch` is on `PATH` and `BIOIMAGE_PY_SHARED_TMP` points at a shared filesystem; `subprocess` stays the
