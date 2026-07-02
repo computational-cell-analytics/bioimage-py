@@ -121,9 +121,8 @@ def test_relabel_mask(rng):
 def test_relabel_dict_subsample(monkeypatch, rng):
     # Force the gated subsampling path with a small threshold (instead of a 100k-entry dict), then
     # exercise both branches of the diversity gate. Correctness must match the dense reference.
-    import importlib
-    rl = importlib.import_module("bioimage_py.segmentation.relabel")  # the module (not the re-exported fn)
-    monkeypatch.setattr(rl, "_RELABEL_SUBSAMPLE_MIN_DICT", 4)
+    import bioimage_py.util as util  # the subsampling kernel/constants now live here (take_mapping)
+    monkeypatch.setattr(util, "_SUBSAMPLE_MIN_DICT", 4)
 
     labels = ((np.arange(64, dtype="uint64") * 5 + 1) % 97).astype("uint64")
     labels[0] = 0

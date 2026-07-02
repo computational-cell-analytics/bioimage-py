@@ -100,11 +100,13 @@ Conventions (follow these):
   labeling (`labeling[old_id] = new_id`) over a dict — the per-block kernel is then `numpy.take`, which
   is O(block) *independent* of the labeling size (~0.3 ms/block even at 1e8 entries). A dict labeling
   uses `bioimage_cpp.utils.take_dict`, which rebuilds a hash map from the *whole* dict every block
-  (O(dict size)/block); `relabel` mitigates this with **gated per-block subsampling** — for large dicts
-  it restricts the mapping to the block's `np.unique` ids before `take_dict` (gated by
-  `_RELABEL_SUBSAMPLE_MIN_DICT` / `_RELABEL_SUBSAMPLE_MAX_DIVERSITY` so it never regresses on small
-  dicts or pathologically diverse blocks; ~7–8× faster over a large volume) — but a dense array is
-  still fastest. `relabel_consecutive` derives its `{old_id: new_id}` mapping and delegates the write to
+  (O(dict size)/block); the shared `util.take_mapping` kernel mitigates this with **gated per-block
+  subsampling** — for large dicts it restricts the mapping to the block's `np.unique` ids before
+  `take_dict` (gated by `_SUBSAMPLE_MIN_DICT` / `_SUBSAMPLE_MAX_DIVERSITY` so it never regresses on
+  small dicts or pathologically diverse blocks; ~7–8× faster over a large volume) — but a dense array
+  is still fastest. `util.take_mapping` is the single dict-relabel kernel: `relabel`, `label` (final
+  relabel), `stitch_segmentation` (densify) and `size_filter` all route through it (the first three via
+  `relabel` itself). `relabel_consecutive` derives its `{old_id: new_id}` mapping and delegates the write to
   `relabel` (kept as a dict, not a dense array, so it stays memory-safe for sparse/large input id
   spaces — the case it is most often used to compact). `bioimage_cpp` has no dense-array `take`.
 - numpy arrays are local-only (their `to_spec()` raises); distributed backends need a reopenable source.
@@ -152,3 +154,16 @@ CI proxy for the shared protocol. Note the slurm runner's key subtlety: per-task
 written on compute nodes but can take up to the NFS attribute-cache timeout (~60 s) to become visible to
 the orchestrating node, so success is detected via the sentinel while the lag-free `sacct` `State`
 distinguishes a `COMPLETED`-but-not-yet-visible task (wait `latency_wait`) from a genuinely dead one.
+
+# Distributed-runner review backlog
+
+A design/implementation review of the distributed runner (2026-07-02) is recorded as a local Claude
+memory — `distributed-runner-review-findings` (in this project's `.claude` memory dir, indexed in its
+`MEMORY.md`; surfaced automatically at session start). **Addressed:** #1 (`segmentation.label`'s
+cross-block union-find is now sized to the component count, not the voxel count) and #7 (the bespoke
+per-block relabel writes in `label` / `stitch_segmentation` / `size_filter` now route through
+`segmentation.relabel` / the shared `util.take_mapping` kernel). **Open backlog:** #2 in-process
+RAG/multicut in `stitch_segmentation` (the top scaling win), #3 slurm task count pinned to
+`num_workers` (no array work-stealing), plus #4 reduce-in-master memory, #5 Python-only version stamp,
+#6 `roi` write-safety alignment, #8 subprocess per-task timeout, #9 poll re-reads all done-logs. See
+the memory for the full detail.

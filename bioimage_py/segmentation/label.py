@@ -22,6 +22,7 @@ from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
 from ..util import BlockDescriptor, ComputeFn, full_roi, get_blocking, is_direct, to_roi
+from .relabel import relabel
 
 __all__ = ["label"]
 
@@ -106,19 +107,6 @@ def _make_stage2(shape: Tuple[int, ...], block_shape: Tuple[int, ...]) -> Comput
         if not pairs:
             return None
         return np.unique(np.concatenate(pairs, axis=0), axis=0)
-
-    return _compute
-
-
-def _make_stage4(mapping: Dict[int, int]) -> ComputeFn:
-    """Build stage 4: apply the final label mapping in place."""
-
-    def _compute(block: BlockDescriptor, inputs: Sequence[Source], outputs: Sequence[Source],
-                 mask: Optional[Source]) -> None:
-        output_ = outputs[0]
-        roi = to_roi(block)
-        output_[roi] = bic.utils.take_dict(mapping, output_[roi])
-        return None
 
     return _compute
 
@@ -215,7 +203,6 @@ def label(
                             name="label-blocks")
     id_arrays = [a for a in id_results if a is not None and len(a)]
     real_labels = np.unique(np.concatenate(id_arrays)) if id_arrays else np.zeros((0,), dtype="uint64")
-    max_label = int(real_labels.max()) if real_labels.size else 0
 
     # Stage 2: collect label equivalences across lower block faces.
     stage2 = _make_stage2(tuple(src.shape), block_shape)
@@ -225,20 +212,27 @@ def label(
     assignments = (np.unique(np.concatenate(pairs, axis=0), axis=0)
                    if pairs else np.zeros((0, 2), dtype="uint64"))
 
-    # Stage 3 (in process): union-find merge, then relabel only the labels that exist to
-    # consecutive ids (the offset space is sparse, so relabeling over it would not be compact).
-    uf = bic.utils.UnionFind(max_label + 1)
-    if len(assignments):
-        uf.merge(assignments.astype("uint64"))
+    # Stage 3 (in process): union-find merge, then relabel the labels that exist to consecutive ids.
+    # The stage-1 offset space is sparse (ids run up to ~voxel count), so the union-find is built over
+    # a dense [0..K) compaction of the labels that actually exist -- sized to the component count K,
+    # not the max offset id -- keeping this in-process step O(components) rather than O(voxels). Every
+    # id in `assignments` exists in `real_labels` (stage 2 only reads what stage 1 wrote), so the
+    # compaction covers all pair ids.
     mapping: Dict[int, int] = {0: 0}
     if real_labels.size:
-        roots = np.asarray(uf.find(real_labels.astype("uint64")))
-        root_to_new = {int(r): i + 1 for i, r in enumerate(np.unique(roots).tolist())}
-        for lab, root in zip(real_labels.tolist(), roots.tolist()):
-            mapping[int(lab)] = root_to_new[int(root)]
+        n_components = int(real_labels.size)
+        dense = {int(lab): idx for idx, lab in enumerate(real_labels.tolist())}
+        uf = bic.utils.UnionFind(n_components)
+        if len(assignments):
+            pu = bic.utils.take_dict(dense, np.ascontiguousarray(assignments[:, 0].astype("uint64")))
+            pv = bic.utils.take_dict(dense, np.ascontiguousarray(assignments[:, 1].astype("uint64")))
+            uf.merge(np.stack([pu, pv], axis=1).astype("uint64"))
+        roots = np.asarray(uf.find(np.arange(n_components, dtype="uint64")))
+        _, new_ids = np.unique(roots, return_inverse=True)  # consecutive component ranks (0-based)
+        for lab, new_id in zip(real_labels.tolist(), new_ids.tolist()):
+            mapping[int(lab)] = int(new_id) + 1  # reserve 0 for background
 
-    # Stage 4: apply the mapping in place.
-    stage4 = _make_stage4(mapping)
-    runner.run(stage4, [], outputs=[out_array], block_shape=block_shape,
-               num_workers=num_workers, has_return_val=False, name="relabel")
+    # Stage 4: apply the mapping in place through the canonical node-label writer (relabel).
+    out_array = relabel(out_array, mapping, output=out_array, block_shape=block_shape,
+                        job_type=job_type, job_config=job_config, num_workers=num_workers)
     return out_array

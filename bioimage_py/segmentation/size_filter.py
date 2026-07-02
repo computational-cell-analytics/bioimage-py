@@ -12,14 +12,14 @@ from __future__ import annotations
 
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
-import bioimage_cpp as bic
 import numpy as np
 
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
 from ..stats.unique import unique
-from ..util import BlockDescriptor, ComputeFn, check_rerun_args, full_roi, is_direct, same_array, to_roi
+from ..util import (BlockDescriptor, ComputeFn, check_rerun_args, full_roi, is_direct, same_array,
+                    take_mapping, to_roi)
 
 __all__ = ["segmentation_filter", "size_filter"]
 
@@ -146,9 +146,9 @@ def _make_size_relabel(mapping: Dict[int, int]) -> BlockFn:
 
     def relabel(block_seg: np.ndarray, block_mask: Optional[np.ndarray]) -> np.ndarray:
         if block_mask is None:
-            return bic.utils.take_dict(mapping, block_seg)
+            return take_mapping(mapping, block_seg)
         out = block_seg.copy()
-        out[block_mask] = bic.utils.take_dict(mapping, block_seg[block_mask])
+        out[block_mask] = take_mapping(mapping, block_seg[block_mask])
         return out
 
     return relabel

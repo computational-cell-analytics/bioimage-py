@@ -32,6 +32,7 @@ from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source, from_spec
 from ..util import BlockDescriptor, ComputeFn, full_roi, get_blocking, to_roi
 from .multicut import compute_edge_costs, multicut_decomposition
+from .relabel import relabel
 
 __all__ = ["stitch_segmentation", "stitch_tiled_segmentation"]
 
@@ -206,19 +207,6 @@ def _make_segment(shape: Tuple[int, ...], tile_shape: Tuple[int, ...], tile_over
 
         nz = block_seg[block_seg != 0]
         return np.unique(nz) if nz.size else None
-
-    return _compute
-
-
-def _make_relabel(mapping: dict) -> ComputeFn:
-    """Build the in-place relabel stage applying ``mapping`` (offset ids -> dense ids)."""
-
-    def _compute(block: BlockDescriptor, inputs: Sequence[Source], outputs: Sequence[Source],
-                 mask: Optional[Source]) -> None:
-        output_ = outputs[0]
-        roi = to_roi(block)
-        output_[roi] = bic.utils.take_dict(mapping, output_[roi])
-        return None
 
     return _compute
 
@@ -499,10 +487,11 @@ def stitch_segmentation(
         for i, lab in enumerate(real.tolist()):
             mapping[int(lab)] = i + 1
 
-        # Stage 2: apply the dense relabeling to the pre-stitch output in place.
+        # Stage 2: apply the dense relabeling to the pre-stitch output in place, through the canonical
+        # node-label writer (relabel). output=out_array keeps it in place (no copy for a numpy output).
         if real.size:
-            runner.run(_make_relabel(mapping), [], outputs=[out_array], block_shape=tile_shape,
-                       num_workers=num_workers, has_return_val=False, name="stitch-densify")
+            relabel(out_array, mapping, output=out_array, block_shape=tile_shape,
+                    job_type=job_type, job_config=job_config, num_workers=num_workers)
 
         # Stage 3: count object overlaps in the halo bands, reading haloed tiles from the store.
         overlap_fn = _make_seg_overlap(shape, tile_shape, tile_overlap, store_handle, ndim)
