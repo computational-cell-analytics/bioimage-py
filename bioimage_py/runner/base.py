@@ -6,7 +6,7 @@ from concurrent import futures
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from bioimage_cpp.utils import Blocking
-from threadpoolctl import threadpool_limits
+from threadpoolctl import ThreadpoolController
 from tqdm import tqdm
 
 from ..sources.base import Source
@@ -14,6 +14,15 @@ from ..sources.dispatch import SourceLike, as_source
 from ..util import (ComputeFn, derive_block_shape, get_blocking, group_blocks_by_shard,
                     maybe_warn_imbalance, normalize_halo)
 from .config import RunnerConfig
+
+# A single, process-wide threadpool controller, built once here at import time (in the main
+# thread). Worker threads reuse it via ``_TP_CONTROLLER.limit(...)`` instead of constructing their
+# own controller: ``ThreadpoolController()`` runs a ``dl_iterate_phdr`` library scan whose ctypes
+# callback needs the GIL while the glibc loader lock is held, so constructing it inside worker
+# threads deadlocks against any concurrent first-time import (dlopen) in another thread. Building it
+# once at import avoids that; ``.limit()`` on an existing controller only reads/sets per-library
+# thread counts and does no further scan.
+_TP_CONTROLLER = ThreadpoolController()
 
 
 class RunnerError(RuntimeError):
@@ -390,19 +399,22 @@ class LocalRunner(Runner):
         failed: List[int] = []
         first_error: Optional[BaseException] = None
 
-        @threadpool_limits.wrap(limits=1)
         def _run_group(group: List[int]):
-            local: Dict[int, Any] = {}
-            local_failed: List[int] = []
-            err: Optional[BaseException] = None
-            for k, bid in enumerate(group):
-                try:
-                    local[bid] = call_one(bid)
-                except Exception as error:  # noqa: BLE001 - we re-raise as RunnerError
-                    err = error
-                    local_failed = list(group[k:])
-                    break
-            return local, local_failed, err
+            # Limit nested BLAS/OpenMP parallelism to 1 within this worker thread, reusing the
+            # process-wide controller (see _TP_CONTROLLER) so no per-thread dl_iterate_phdr scan
+            # is performed here -- that scan would deadlock against concurrent first-time imports.
+            with _TP_CONTROLLER.limit(limits=1):
+                local: Dict[int, Any] = {}
+                local_failed: List[int] = []
+                err: Optional[BaseException] = None
+                for k, bid in enumerate(group):
+                    try:
+                        local[bid] = call_one(bid)
+                    except Exception as error:  # noqa: BLE001 - we re-raise as RunnerError
+                        err = error
+                        local_failed = list(group[k:])
+                        break
+                return local, local_failed, err
 
         with futures.ThreadPoolExecutor(max(1, int(num_workers))) as tp:
             fut_to_group = {tp.submit(_run_group, g): g for g in groups}
