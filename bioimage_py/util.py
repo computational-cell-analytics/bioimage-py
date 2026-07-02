@@ -8,6 +8,7 @@ from math import ceil
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import bioimage_cpp as bic
+import numpy as np
 from bioimage_cpp.utils import Block, BlockWithHalo, Blocking
 
 from .sources.base import Source
@@ -23,6 +24,39 @@ BlockDescriptor = Union[Block, BlockWithHalo]
 ComputeFn = Callable[
     [BlockDescriptor, Sequence[Source], Sequence[Source], Optional[Source]], Any
 ]
+
+# Gated per-block subsampling for the dict relabeling kernel. ``bioimage_cpp.utils.take_dict``
+# rebuilds a hash map from the *full* mapping on every call (O(dict size) per block, regardless of
+# how few ids the block holds), so for a large dict we first restrict it to the ids actually present
+# in the block. Benchmarked crossovers: the full rebuild is <10 ms below ~1e5 entries (not worth
+# subsampling), and subsampling only pays off while the block's distinct-id count is well below the
+# dict size -- for a nearly-as-diverse-as-the-dict block, building the per-block dict costs more than
+# the rebuild it saves.
+_SUBSAMPLE_MIN_DICT = 100_000
+_SUBSAMPLE_MAX_DIVERSITY = 8
+
+
+def take_mapping(mapping: Dict[int, int], seg: np.ndarray) -> np.ndarray:
+    """Apply a ``{old_id: new_id}`` dict to an array, subsampling the dict when that is cheaper.
+
+    ``bioimage_cpp.utils.take_dict`` rebuilds a hash map from the whole ``mapping`` on every call, so
+    for a large dict this first restricts it to the ids present in ``seg`` -- but only while they are
+    far fewer than the dict (otherwise the per-block dict costs more than the rebuild it saves). This
+    is the shared kernel behind the canonical :func:`bioimage_py.segmentation.relabel` and the other
+    dict-based per-block relabel writers.
+
+    Args:
+        mapping: The relabeling to apply; every id present in ``seg`` must be a key.
+        seg: The array of ids to map.
+
+    Returns:
+        The mapped array (same shape as ``seg``).
+    """
+    if len(mapping) > _SUBSAMPLE_MIN_DICT:
+        present = np.unique(seg)
+        if len(present) * _SUBSAMPLE_MAX_DIVERSITY < len(mapping):
+            mapping = {int(x): mapping[int(x)] for x in present.tolist()}
+    return bic.utils.take_dict(mapping, seg)
 
 
 def to_roi(block: BlockDescriptor) -> Tuple[slice, ...]:

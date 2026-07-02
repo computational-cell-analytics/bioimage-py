@@ -31,18 +31,10 @@ from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, SourceSpec, as_source, from_spec
 from ..stats.unique import unique
-from ..util import BlockDescriptor, ComputeFn, check_rerun_args, full_roi, is_direct, to_roi
+from ..util import (BlockDescriptor, ComputeFn, check_rerun_args, full_roi, is_direct, take_mapping,
+                    to_roi)
 
 __all__ = ["relabel", "relabel_consecutive"]
-
-# Gated per-block subsampling for the dict kernel. ``bioimage_cpp.utils.take_dict`` rebuilds a hash
-# map from the *full* mapping on every call (O(dict size) per block, regardless of how few ids the
-# block holds), so for a large dict we first restrict it to the ids actually present in the block.
-# Benchmarked crossovers: the full rebuild is <10 ms below ~1e5 entries (not worth subsampling), and
-# subsampling only pays off while the block's distinct-id count is well below the dict size -- for a
-# nearly-as-diverse-as-the-dict block, building the per-block dict costs more than the rebuild.
-_RELABEL_SUBSAMPLE_MIN_DICT = 100_000
-_RELABEL_SUBSAMPLE_MAX_DIVERSITY = 8
 
 
 def _require_integer(source: Source, message: str) -> None:
@@ -56,23 +48,8 @@ def _is_inmemory_numpy(source: Source) -> bool:
     return isinstance(getattr(source, "array", None), np.ndarray)
 
 
-def _take_mapping(mapping: Dict[int, int], seg: np.ndarray, subsample: bool) -> np.ndarray:
-    """Map ``seg`` through ``mapping``, restricting the dict to the block's ids when that is cheaper.
-
-    ``take_dict`` rebuilds a hash map from the whole ``mapping`` per call, so for a large dict we
-    subsample it to the ids present in ``seg`` -- but only while they are far fewer than the dict
-    (otherwise the per-block dict costs more than the rebuild it saves).
-    """
-    if subsample:
-        present = np.unique(seg)
-        if len(present) * _RELABEL_SUBSAMPLE_MAX_DIVERSITY < len(mapping):
-            mapping = {int(x): mapping[int(x)] for x in present.tolist()}
-    return bic.utils.take_dict(mapping, seg)
-
-
 def _make_relabel_block(mapping: Dict[int, int]) -> ComputeFn:
     """Build the per-block write function applying the label mapping (picklable dict)."""
-    subsample = len(mapping) > _RELABEL_SUBSAMPLE_MIN_DICT
 
     def _compute(block: BlockDescriptor, inputs: Sequence[Source], outputs: Sequence[Source],
                  mask: Optional[Source]) -> None:
@@ -80,14 +57,14 @@ def _make_relabel_block(mapping: Dict[int, int]) -> ComputeFn:
         roi = to_roi(block)
         seg = input_[roi]
         if mask is None:
-            output_[roi] = _take_mapping(mapping, seg, subsample)
+            output_[roi] = take_mapping(mapping, seg)
             return None
         m = mask[roi].astype(bool)
         if not m.any():
             return None
         # Only in-mask voxels are in the mapping; out-of-mask output voxels are left unchanged.
         out_block = output_[roi].copy()
-        out_block[m] = _take_mapping(mapping, seg[m], subsample)
+        out_block[m] = take_mapping(mapping, seg[m])
         output_[roi] = out_block
         return None
 
