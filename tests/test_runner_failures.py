@@ -70,9 +70,10 @@ def test_failure_then_rerun(job_type, zarr_factory, rng, tmp_path):
 
 
 def test_failed_block_ids_are_precise(zarr_factory, rng, tmp_path):
-    # 16 blocks over 4 contiguous tasks -> task 0 = [0, 1, 2, 3]. Fail the LAST block of task 0
-    # (id 3, begin (0, 48)): blocks 0,1,2 complete and only block 3 is reported failed -- per
-    # block, not the whole task. (Pre-change this reported the whole task [0,1,2,3].)
+    # 16 blocks over 4 contiguous tasks -> task 0 = [0, 1, 2, 3]. With the default
+    # tasks_per_worker=1, n_tasks == num_workers, so the contiguous partition holds. Fail the LAST
+    # block of task 0 (id 3, begin (0, 48)): blocks 0,1,2 complete and only block 3 is reported
+    # failed -- per block, not the whole task. (Pre-change this reported the whole task [0,1,2,3].)
     a = rng.random((64, 64)).astype("float32")
     z = zarr_factory(a, chunks=(16, 16))
     marker = str(tmp_path / "marker.txt")

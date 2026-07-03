@@ -38,6 +38,16 @@ def test_write_then_load_round_trips(cfg_path):
     assert cfg.latency_wait == 120.0
 
 
+def test_tasks_per_worker_round_trips(cfg_path):
+    # A field inherited from RunnerConfig is a valid [slurm] TOML key (the file plumbing keys off
+    # fields(SlurmConfig), which includes inherited fields).
+    write_slurm_config(tmp_root="/scratch/shared", tasks_per_worker=4)
+    assert SlurmConfig.load().tasks_per_worker == 4
+    # Also settable as an override, and defaults to 1.
+    assert SlurmConfig.load(tasks_per_worker=8).tasks_per_worker == 8
+    assert SlurmConfig().tasks_per_worker == 1
+
+
 def test_overrides_take_precedence_over_file(cfg_path):
     write_slurm_config(partition="cpu", time="01:00:00", tmp_root="/scratch/shared")
     cfg = SlurmConfig.load(partition="gpu", mem="16G")

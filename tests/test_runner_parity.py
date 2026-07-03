@@ -5,6 +5,7 @@ import pytest
 
 import bioimage_cpp as bic
 import bioimage_py as bp
+from bioimage_py.runner import RunnerConfig
 
 
 def test_max_parity(zarr_factory, rng):
@@ -64,6 +65,24 @@ def test_copy_sharded_parity(zarr_factory, rng):
                            dtype="float32", fill=0.0)
         bp.copy(z, out, block_shape=(32, 16), num_workers=nw, job_type=job)
         np.testing.assert_array_equal(out[:], a, err_msg=f"straddling copy nw={nw} job={job}")
+
+    # Over-partitioning (tasks_per_worker > 1) must not split a shard-group across tasks: each
+    # group is indivisible, so shard-exclusive routing is preserved and the result stays correct.
+    out = zarr_factory(shape=(64, 64), chunks=(16, 16), shards=(32, 32), dtype="float32", fill=0.0)
+    bp.copy(z, out, block_shape=(16, 16), num_workers=3, job_type="subprocess",
+            job_config=RunnerConfig(tasks_per_worker=3))
+    np.testing.assert_array_equal(out[:], a, err_msg="sharded copy over-partitioned")
+
+
+def test_over_partition_parity(zarr_factory, rng):
+    # Over-partitioning changes only scheduling: a subprocess copy split into num_workers *
+    # tasks_per_worker tasks reproduces the input exactly, like the one-task-per-worker partition.
+    a = rng.random((64, 48)).astype("float32")
+    z = zarr_factory(a, chunks=(16, 16))
+    out = zarr_factory(shape=a.shape, chunks=(16, 16), dtype="float32", fill=0.0)
+    bp.copy(z, out, block_shape=(16, 16), num_workers=2, job_type="subprocess",
+            job_config=RunnerConfig(tasks_per_worker=4))
+    np.testing.assert_array_equal(out[:], a)
 
 
 def test_watershed_parity(zarr_factory, rng):

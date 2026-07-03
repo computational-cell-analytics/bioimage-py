@@ -44,12 +44,19 @@ def _partition(block_ids: Sequence[int], n_tasks: int) -> List[List[int]]:
     return tasks
 
 
-def _pack_groups(groups: Sequence[Sequence[int]], num_workers: int, name: str) -> List[List[int]]:
-    """Bin-pack whole shard-groups into at most ``num_workers`` tasks (least-loaded first)."""
+def _pack_groups(groups: Sequence[Sequence[int]], n_tasks: int, num_workers: int,
+                 name: str) -> List[List[int]]:
+    """Bin-pack whole shard-groups into at most ``n_tasks`` tasks (least-loaded first).
+
+    ``n_tasks`` is the resolved target task count (from :meth:`_DistributedRunner._resolve_n_tasks`,
+    i.e. ``num_workers * tasks_per_worker`` clamped); it is further capped at ``len(groups)`` since a
+    shard-group is indivisible. ``num_workers`` is passed through only for the imbalance warning
+    (which compares the shard-group count against the concurrency, not the task count).
+    """
     groups = [list(g) for g in groups if g]
     if not groups:
         return [[]]
-    n_tasks = max(1, min(int(num_workers), len(groups)))
+    n_tasks = max(1, min(int(n_tasks), len(groups)))
     tasks: List[List[int]] = [[] for _ in range(n_tasks)]
     loads = [0] * n_tasks
     for group in sorted(groups, key=len, reverse=True):
@@ -84,20 +91,43 @@ def _done_blocks(tmp: str, task_ids: Sequence[int]) -> set:
     return done
 
 
-def _count_done_blocks(tmp: str, n_tasks: int) -> int:
-    """Total processed-block count across all done-logs (cheap newline count for the bar).
+class _DoneLogCounter:
+    """Incremental processed-block count across the per-task done-logs (drives the progress bar).
 
-    Counts only newline-terminated lines, so a torn final line is not counted; use
-    :func:`_done_blocks` for the authoritative set.
+    Each done-log is append-only and single-writer -- the worker harness appends one flushed
+    ``{block_id}\\n`` per completed block (``_harness.py``) -- so a poll only needs the bytes
+    appended since the previous tick. This tracks a per-task byte offset and running newline
+    count and reads only each log's new tail per :meth:`count`, making a tick ``O(new bytes)``
+    instead of ``O(total bytes)``. Only complete newline-terminated lines are counted, so a torn
+    final line is deferred to the next tick; use :func:`_done_blocks` for the authoritative set.
+
+    The counter spans all ``n_tasks`` (the bar credits prior progress on a resume): a completed
+    task's full log is read once on the first :meth:`count`, then contributes an empty tail read.
+    Instantiate one per poll loop; it is single-threaded (no locking).
     """
-    total = 0
-    for t in range(n_tasks):
-        path = os.path.join(tmp, "progress", f"{t}.log")
-        if not os.path.exists(path):
-            continue
-        with open(path, "rb") as f:
-            total += f.read().count(b"\n")
-    return total
+
+    def __init__(self, tmp: str, n_tasks: int) -> None:
+        self._tmp = tmp
+        self._n_tasks = n_tasks
+        self._offsets = [0] * n_tasks
+        self._counts = [0] * n_tasks
+
+    def count(self) -> int:
+        """Return the total processed-block count, reading only newly-appended bytes."""
+        for t in range(self._n_tasks):
+            path = os.path.join(self._tmp, "progress", f"{t}.log")
+            try:
+                with open(path, "rb") as f:
+                    f.seek(self._offsets[t])
+                    chunk = f.read()
+            except FileNotFoundError:  # task has not started writing its log yet
+                continue
+            last_nl = chunk.rfind(b"\n")
+            if last_nl == -1:  # no new complete line; leave a partial tail unread for next tick
+                continue
+            self._counts[t] += chunk[:last_nl + 1].count(b"\n")
+            self._offsets[t] += last_nl + 1
+        return sum(self._counts)
 
 
 def _total_blocks(tmp: str, n_tasks: int) -> int:
@@ -147,6 +177,36 @@ class _DistributedRunner(Runner):
                             "HDF5 is not safe as a distributed output (concurrent multi-process writes "
                             "to one file corrupt it). Use zarr or n5 for distributed outputs."
                         )
+
+    def _max_tasks(self) -> int:
+        """Backend cap on the number of tasks a run may be partitioned into.
+
+        The base (subprocess) has no hard limit -- only the number of schedulable units bounds
+        it -- so this returns a sentinel. :class:`SlurmRunner` overrides it with the cluster's
+        ``MaxArraySize``.
+        """
+        return sys.maxsize
+
+    def _resolve_n_tasks(self, num_workers: int, n_items: int) -> int:
+        """Resolve the task count for ``n_items`` schedulable units.
+
+        Over-partitions into ``num_workers * config.tasks_per_worker`` tasks so a free worker
+        pulls the next queued task (load-balancing), clamped to ``n_items`` (never more tasks
+        than units) and to :meth:`_max_tasks` (the backend cap). ``tasks_per_worker == 1``
+        (the default) reproduces the one-task-per-worker partition.
+
+        Args:
+            num_workers: The requested worker count (also the concurrency / array throttle).
+            n_items: The number of schedulable units (block ids, or shard-groups).
+
+        Returns:
+            The number of tasks to partition the work into (at least 1).
+        """
+        if n_items <= 0:
+            return 1
+        tasks_per_worker = max(1, int(self.config.tasks_per_worker))
+        desired = max(1, int(num_workers)) * tasks_per_worker
+        return max(1, min(desired, int(n_items), self._max_tasks()))
 
     def _execute(
         self,
@@ -257,10 +317,11 @@ class _DistributedRunner(Runner):
             f.write(source)
 
         if groups is None:
-            n_tasks = max(1, min(int(num_workers), len(ids))) if ids else 1
+            n_tasks = self._resolve_n_tasks(num_workers, len(ids))
             tasks = _partition(ids, n_tasks)
         else:
-            tasks = _pack_groups(groups, num_workers, name)
+            tasks = _pack_groups(groups, self._resolve_n_tasks(num_workers, len(groups)),
+                                 num_workers, name)
             n_tasks = len(tasks)
         for task_id, task_ids in enumerate(tasks):
             with open(os.path.join(tmp, "blocks", f"{task_id}.json"), "w") as f:
@@ -473,11 +534,12 @@ class SubprocessRunner(_DistributedRunner):
         bar_thread = None
         if name:
             def _poll_bar() -> None:
+                counter = _DoneLogCounter(tmp, n_tasks)
                 with tqdm(total=n_blocks, desc=name, unit="block") as pbar:
                     while not stop.wait(0.5):
-                        pbar.n = min(_count_done_blocks(tmp, n_tasks), n_blocks)
+                        pbar.n = min(counter.count(), n_blocks)
                         pbar.refresh()
-                    pbar.n = min(_count_done_blocks(tmp, n_tasks), n_blocks)
+                    pbar.n = min(counter.count(), n_blocks)
                     pbar.refresh()
             bar_thread = threading.Thread(target=_poll_bar, daemon=True)
             bar_thread.start()
@@ -532,6 +594,21 @@ class SlurmRunner(_DistributedRunner):
                 "Pass job_config=SlurmConfig(...) (it carries partition/account/time/etc.)."
             )
         super().__init__(config)
+        self._max_array_cache: Optional[int] = None
+
+    def _max_tasks(self) -> int:
+        """The cluster's ``MaxArraySize`` -- the hard cap on the number of tasks per array job.
+
+        Uses ``config.max_array_size`` when set, else queries ``scontrol`` once and memoizes it
+        (a cluster property, stable for this runner's lifetime). This bounds
+        :meth:`_resolve_n_tasks` so over-partitioning degrades gracefully to the array limit
+        instead of failing at submit.
+        """
+        if self.config.max_array_size is not None:
+            return int(self.config.max_array_size)
+        if self._max_array_cache is None:
+            self._max_array_cache = self._max_array_size()
+        return self._max_array_cache
 
     def _launch_and_wait(self, tmp: str, n_tasks: int, num_workers: int, name: str,
                          task_ids: Optional[Sequence[int]] = None) -> None:
@@ -561,12 +638,11 @@ class SlurmRunner(_DistributedRunner):
                 "visible to all compute nodes (node-local /tmp is not usable)."
             )
 
-        max_array = (self.config.max_array_size if self.config.max_array_size is not None
-                     else self._max_array_size())
+        max_array = self._max_tasks()
         if len(launch_ids) > max_array:
             _guard_fail(
                 f"Run partitioned into {len(launch_ids)} tasks exceeds the maximum array size "
-                f"{max_array}. Lower num_workers or use a larger block_shape."
+                f"{max_array}. Lower num_workers/tasks_per_worker or use a larger block_shape."
             )
 
         os.makedirs(os.path.join(tmp, "logs"), exist_ok=True)
@@ -797,6 +873,7 @@ class SlurmRunner(_DistributedRunner):
         resolved: set = set()
         # The bar counts processed blocks across ALL tasks (a resume credits prior progress).
         n_blocks = _total_blocks(tmp, n_tasks)
+        counter = _DoneLogCounter(tmp, n_tasks)
         with tqdm(total=n_blocks, desc=name or None, disable=not name, unit="block") as pbar:
             while len(resolved) < len(poll_ids):
                 states = self._sacct_states(job_id)
@@ -828,7 +905,7 @@ class SlurmRunner(_DistributedRunner):
                         terminal_count.pop(t, None)
 
                 resolved = ok | dead
-                pbar.n = min(_count_done_blocks(tmp, n_tasks), n_blocks)
+                pbar.n = min(counter.count(), n_blocks)
                 pbar.set_postfix(ok=len(ok), failed=len(dead), run=running,
                                  pending=max(0, len(poll_ids) - len(resolved) - running), refresh=False)
                 pbar.refresh()

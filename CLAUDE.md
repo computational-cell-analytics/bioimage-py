@@ -15,7 +15,9 @@ The package lives in `bioimage_py/`:
 - `runner/` — execution backends. `base.py` (the `Runner` ABC + the backend-independent `run()` +
   `LocalRunner` + the shared `run_block`), `distributed.py` (`_DistributedRunner` base + the shared
   `_finalize`, `SubprocessRunner`, and `SlurmRunner` — sbatch array submission, `sacct` polling and
-  reattach), `_harness.py` (worker entry point), `config.py` (`RunnerConfig` / `SlurmConfig` plus
+  reattach; task count = `num_workers * config.tasks_per_worker` via `_resolve_n_tasks`, clamped by
+  `_max_tasks` — over-partition for scheduler work-stealing, default 1 = one task per worker),
+  `_harness.py` (worker entry point), `config.py` (`RunnerConfig` / `SlurmConfig` plus
   the user config file: `config_file_path`, `write_slurm_config`, and `SlurmConfig.load` — a
   TOML `[slurm]` table under `~/.config/bioimage-py/config.toml` supplies cluster-specific
   defaults; auto-loaded when `SlurmRunner`/`get_runner("slurm")` get no config, gated by

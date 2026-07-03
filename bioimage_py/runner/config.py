@@ -18,11 +18,22 @@ class RunnerConfig:
             For distributed jobs this must be on a shared filesystem.
         python_executable: Interpreter used to launch worker tasks. ``None`` uses the
             current interpreter (``sys.executable``).
+        tasks_per_worker: Over-partitioning factor for the distributed backends
+            (``subprocess`` / ``slurm``). The work is split into
+            ``num_workers * tasks_per_worker`` tasks instead of one contiguous task per
+            worker, so a worker that finishes its (smaller) task early pulls the next queued
+            one -- load-balancing / "work-stealing" via the scheduler (slurm array
+            ``%throttle``) or the thread pool (subprocess). ``1`` (the default) reproduces the
+            one-task-per-worker behavior. The value is clamped to the number of schedulable
+            units (blocks, or shard-groups for a sharded output) and, on slurm, to the
+            cluster's ``MaxArraySize``. Ignored by the local runner, which already schedules
+            one task per block.
     """
 
     poll_interval: float = 10.0
     tmp_root: Optional[str] = None
     python_executable: Optional[str] = None
+    tasks_per_worker: int = 1
 
 
 @dataclass
@@ -34,7 +45,8 @@ class SlurmConfig(RunnerConfig):
     shared filesystem visible to all compute nodes (not node-local ``/tmp``), and
     ``num_workers`` (passed to the op / ``run``) is interpreted as the array throttle — the
     maximum number of tasks allowed to run concurrently — independently of how many tasks
-    the work is partitioned into.
+    the work is partitioned into (the partition granularity is set by ``tasks_per_worker``;
+    see :class:`RunnerConfig`).
 
     Cluster-specific values (``partition``, ``account``, ``constraint``, ``tmp_root``, ...)
     can be stored once in a user config file and reused as defaults; see
