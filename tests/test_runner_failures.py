@@ -59,7 +59,7 @@ def _make_timeout(marker_path):
         if is_corner and not os.path.exists(marker_path):
             with open(marker_path, "w") as f:
                 f.write("hung once")
-            time.sleep(30)
+            time.sleep(60)
         return int(block.begin[0])
 
     return fn
@@ -146,7 +146,11 @@ def test_task_timeout_reported_and_resumable(zarr_factory, rng, tmp_path):
     z = zarr_factory(a, chunks=(16, 16))
     marker = str(tmp_path / "marker.txt")
     fn = _make_timeout(marker)
-    runner = SubprocessRunner(RunnerConfig(task_timeout=2, tmp_root=str(tmp_path)))
+    # task_timeout is wall-clock over the whole subprocess, so it must comfortably exceed a cold
+    # worker's startup (interpreter + heavy imports: numpy/bioimage_cpp/zarr, ~1s+ even warm) on a
+    # slow/loaded runner -- otherwise the healthy workers are killed mid-startup too and every block
+    # is (flakily) reported failed. Keep it well above that and well below the hung block's sleep.
+    runner = SubprocessRunner(RunnerConfig(task_timeout=15, tmp_root=str(tmp_path)))
 
     with pytest.raises(RunnerError) as excinfo:
         runner.run(fn, [z], block_shape=(16, 16), num_workers=4, has_return_val=True, name="timeout")
