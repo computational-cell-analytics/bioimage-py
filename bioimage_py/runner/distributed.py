@@ -18,10 +18,13 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 from concurrent import futures
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import bioimage_cpp
 import cloudpickle
+import numpy
 from bioimage_cpp.utils import Blocking
 from tqdm import tqdm
 
@@ -29,6 +32,53 @@ from ..sources.base import Source
 from ..util import ComputeFn, group_blocks_by_shard, maybe_warn_imbalance
 from .base import Runner, RunnerError
 from .config import RunnerConfig, SlurmConfig
+
+
+def _env_versions() -> Dict[str, Any]:
+    """Versions the distributed payload is stamped with (a submit-vs-runtime skew guard)."""
+    return {
+        "python": tuple(sys.version_info[:2]),
+        "numpy": numpy.__version__,
+        "bioimage_cpp": bioimage_cpp.__version__,
+    }
+
+
+def _version_major(lib: str, version: Any) -> Optional[int]:
+    """Best-effort major-version integer for ``version``; ``None`` if it cannot be parsed."""
+    try:
+        return int(version[0]) if lib == "python" else int(str(version).split(".", 1)[0])
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def _check_versions(recorded: Mapping[str, Any], *, role: str) -> None:
+    """Guard against submit-vs-runtime version skew stamped into the payload.
+
+    Compares each recorded library version against the current environment: a differing
+    *major* version raises :class:`RuntimeError`, while a differing minor/patch under a
+    matching major (or a version that cannot be parsed) only warns. Libraries missing from
+    ``recorded`` -- an older payload -- are skipped.
+
+    Args:
+        recorded: The ``versions`` mapping stamped into the payload at submit time.
+        role: Where the check runs (``"worker"`` or ``"orchestrator"``), used in messages.
+    """
+    current = _env_versions()
+    for lib, expected in recorded.items():
+        if expected is None or lib not in current:
+            continue
+        actual = current[lib]
+        if expected == actual:
+            continue
+        detail = (f"{lib} version skew ({role}): payload built with {expected!r}, "
+                  f"environment has {actual!r}.")
+        exp_major, act_major = _version_major(lib, expected), _version_major(lib, actual)
+        if exp_major is not None and act_major is not None and exp_major != act_major:
+            raise RuntimeError(
+                detail + " Major versions differ; the runtime environment must match the "
+                "submitting environment."
+            )
+        warnings.warn(detail + " Major versions agree; proceeding.", stacklevel=2)
 
 
 def _partition(block_ids: Sequence[int], n_tasks: int) -> List[List[int]]:
@@ -238,11 +288,13 @@ class _DistributedRunner(Runner):
         for sub in ("blocks", "results", "success", "error", "timings", "progress"):
             os.makedirs(os.path.join(tmp, sub), exist_ok=True)
 
+        versions = _env_versions()
         payload = {
             "function": function,
             "has_return_val": bool(has_return_val),
             "num_workers": int(num_workers),  # persisted so resume() can relaunch without it
-            "python": tuple(sys.version_info[:2]),
+            "versions": versions,
+            "python": versions["python"],  # legacy alias; an older harness still finds it
             **payload_extra,
         }
         with open(os.path.join(tmp, "payload.pkl"), "wb") as f:
@@ -867,7 +919,11 @@ class SlurmRunner(_DistributedRunner):
             manifest = json.load(f)
         job_id, n_tasks = str(manifest["job_id"]), int(manifest["n_tasks"])
         with open(os.path.join(tmp_folder, "payload.pkl"), "rb") as f:
-            has_return_val = bool(cloudpickle.load(f)["has_return_val"])
+            payload = cloudpickle.load(f)
+        # A reattaching orchestrator unpickles/reduces the per-block results locally, so guard
+        # its environment against skew from the submitting one just as the workers do.
+        _check_versions(payload.get("versions", {"python": payload.get("python")}), role="orchestrator")
+        has_return_val = bool(payload["has_return_val"])
 
         # Reconstruct the partition in numeric task order (never glob: it sorts lexically).
         tasks: List[List[int]] = []

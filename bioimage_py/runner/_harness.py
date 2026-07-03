@@ -30,19 +30,14 @@ import cloudpickle
 from ..sources.dispatch import from_spec
 from ..util import get_blocking
 from .base import run_block
+from .distributed import _check_versions
 
 
 def _run_task(tmp: str, task_id: int) -> None:
     with open(os.path.join(tmp, "payload.pkl"), "rb") as f:
         payload = cloudpickle.load(f)
 
-    expected = tuple(payload["python"])
-    actual = tuple(sys.version_info[:2])
-    if expected != actual:
-        raise RuntimeError(
-            f"Python version mismatch: payload built with {expected}, worker is {actual}. "
-            "The worker environment must match the submitting environment."
-        )
+    _check_versions(payload.get("versions", {"python": payload.get("python")}), role="worker")
 
     with open(os.path.join(tmp, "blocks", f"{task_id}.json")) as f:
         block_ids = json.load(f)

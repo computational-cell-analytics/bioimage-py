@@ -66,7 +66,7 @@ A `Block` has no `roi`/slice member — it carries `begin`/`end` coordinate list
 
 There are two **orthogonal** output channels, and a given function may use either or both:
 - **Output sources** (`outputs`): large array results written in place to storage. These never travel back to the master.
-- **Return value** (`has_return_val=True`): a *small* value per block (e.g. a scalar or a tiny array) that the runner collects and the caller reduces locally. The local reduction must be associative and commutative, since block order is not guaranteed.
+- **Return value** (`has_return_val=True`): a *small* value per block (e.g. a scalar or a tiny array) that the runner collects and the caller reduces locally. The local reduction must be associative and commutative, since block order is not guaranteed. *Limitation (deferred):* the master currently accumulates **all** per-block return values in memory (`_collect`) before reducing, so a run with very many blocks or large per-block returns is bounded by master RAM. An incremental/streaming reduction — folding each result into the accumulator as it arrives, rather than materializing the full list — is a future improvement; it relies only on the associativity/commutativity already required here.
 
 ### Runner configuration
 
@@ -98,14 +98,14 @@ The per-block function and its (small) bound arguments are serialized with **`cl
 
 For debuggability we write a human-readable artifact next to the payload: a best-effort `inspect.getsource(fn)` dump (and the call metadata) in the job temp folder. Correctness never depends on it; it is only there to make a failed job easy to inspect.
 
-To guard against version skew, the payload is stamped with the Python (major, minor) version, validated by the worker before running so a mismatch fails loudly and early. (Stamping a fuller environment/library hash is a possible later hardening.)
+To guard against version skew, the payload is stamped with the Python (major, minor) version plus the `numpy` and `bioimage_cpp` `__version__`. It is validated before running — by each worker, and by a reattaching orchestrator before it unpickles and reduces the per-block results locally. A **major**-version mismatch fails loudly and early; a differing minor/patch under a matching major (or a version that cannot be parsed) only warns, so routine patch drift does not block a run. (Stamping a fuller environment/library hash is a possible later hardening.)
 
 ### Validation in `run()`
 
 Before dispatching, `run()` validates the job and fails early with actionable errors:
 
 - **Shape consistency.** The mask and all inputs must describe the same shape (so a single block indexes them consistently). A mask at a different resolution is brought onto the input grid with an up-/down-sampling wrapper that *reports the wrapped (effective) shape* — so the check is simply "do the reported shapes match"; it does not special-case resolution. Outputs are allowed to differ in shape from the inputs (e.g. a downsampled output), and are blocked on their own grid.
-- **Write safety (implemented as a conservative guard).** When there are `outputs`, `run()` must guarantee concurrency-safe writes. zarr/n5 are safe for concurrent writes to *different* chunks / shards but corrupt on concurrent writes to the *same* chunk / shard. The rule: the output write-blocks (`block.inner_block` under a halo, otherwise the block itself) must align to the output's chunk grid so that each chunk is written by exactly one block. `run()` currently validates that, for any chunked output, the block shape is a multiple of the output chunk shape, and raises otherwise. Auto-deriving a safe block shape (instead of raising) remains a future improvement.
+- **Write safety (implemented as a conservative guard).** When there are `outputs`, `run()` must guarantee concurrency-safe writes. zarr/n5 are safe for concurrent writes to *different* chunks / shards but corrupt on concurrent writes to the *same* chunk / shard. The rule: the output write-blocks (`block.inner_block` under a halo, otherwise the block itself) must align to the output's chunk grid so that each chunk is written by exactly one block. `run()` currently validates that, for any chunked output, the block shape is a multiple of the output chunk shape, and raises otherwise. Auto-deriving a safe block shape (instead of raising) remains a future improvement. *Latent gap (deferred):* the guard validates only the block *shape* against the chunk grid, not a `roi` *offset*'s alignment to it — a `roi` whose origin is not chunk-aligned would shift every write-block off the chunk grid and let two blocks share an edge chunk. This is harmless today because no op passes `roi=`, but the offset alignment must be added to `_validate_write_safety` before any op does.
 
 ### Optimization: skipping empty blocks (later)
 
