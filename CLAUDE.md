@@ -156,16 +156,3 @@ CI proxy for the shared protocol. Note the slurm runner's key subtlety: per-task
 written on compute nodes but can take up to the NFS attribute-cache timeout (~60 s) to become visible to
 the orchestrating node, so success is detected via the sentinel while the lag-free `sacct` `State`
 distinguishes a `COMPLETED`-but-not-yet-visible task (wait `latency_wait`) from a genuinely dead one.
-
-# Distributed-runner review backlog
-
-A design/implementation review of the distributed runner (2026-07-02) is recorded as a local Claude
-memory — `distributed-runner-review-findings` (in this project's `.claude` memory dir, indexed in its
-`MEMORY.md`; surfaced automatically at session start). **Addressed:** #1 (`segmentation.label`'s
-cross-block union-find is now sized to the component count, not the voxel count) and #7 (the bespoke
-per-block relabel writes in `label` / `stitch_segmentation` / `size_filter` now route through
-`segmentation.relabel` / the shared `util.take_mapping` kernel). **Open backlog:** #2 in-process
-RAG/multicut in `stitch_segmentation` (the top scaling win), #3 slurm task count pinned to
-`num_workers` (no array work-stealing), plus #4 reduce-in-master memory, #5 Python-only version stamp,
-#6 `roi` write-safety alignment, #8 subprocess per-task timeout, #9 poll re-reads all done-logs. See
-the memory for the full detail.

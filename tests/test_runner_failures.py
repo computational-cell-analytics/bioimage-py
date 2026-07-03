@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from bioimage_py.runner import RunnerConfig, RunnerError, SubprocessRunner, get_runner
+from bioimage_py.runner import distributed
 from bioimage_py.util import to_roi
 
 
@@ -185,3 +186,63 @@ def test_launch_failure_raises_runner_error(zarr_factory, rng, tmp_path):
     assert err_files
     with open(err_files[0]) as f:
         assert "OSError" in f.read().strip().splitlines()[-1]
+
+
+def test_check_versions_major_mismatch_raises():
+    # A differing MAJOR version is a hard failure (naming the offending library).
+    bogus = dict(distributed._env_versions())
+    bogus["numpy"] = "999.0.0"
+    with pytest.raises(RuntimeError, match="numpy version skew"):
+        distributed._check_versions(bogus, role="worker")
+
+
+@pytest.mark.parametrize("skewed", ["{major}.999.999", "not-a-version"])
+def test_check_versions_minor_or_unparseable_only_warns(skewed):
+    # A minor/patch difference under a matching major -- or a version that cannot be parsed --
+    # warns rather than failing, so routine patch drift does not block a run.
+    current = dict(distributed._env_versions())
+    major = str(current["numpy"]).split(".", 1)[0]
+    current["numpy"] = skewed.format(major=major)
+    with pytest.warns(UserWarning, match="version skew"):
+        distributed._check_versions(current, role="orchestrator")
+
+
+def test_check_versions_matching_is_silent(recwarn):
+    # An exact match neither raises nor warns; a missing key (older payload) is skipped.
+    distributed._check_versions(distributed._env_versions(), role="worker")
+    distributed._check_versions({"python": None}, role="worker")
+    assert len(recwarn) == 0
+
+
+def _make_copy_fn():
+    """Per-block copy fn as a nested closure so cloudpickle captures it by value."""
+    def fn(block, inputs, outputs, mask):
+        roi = to_roi(block)
+        outputs[0][roi] = inputs[0][roi]
+    return fn
+
+
+def test_version_skew_fails_the_distributed_run(zarr_factory, rng, monkeypatch):
+    # Stamp a bogus MAJOR numpy version into the payload; each worker subprocess reads its real
+    # numpy, the majors differ, and the raised RuntimeError surfaces as a RunnerError naming numpy.
+    bogus = dict(distributed._env_versions())
+    bogus["numpy"] = "999.0.0"
+    monkeypatch.setattr(distributed, "_env_versions", lambda: bogus)
+    a = rng.random((32, 32)).astype("float32")
+    z = zarr_factory(a, chunks=(16, 16))
+    out = zarr_factory(shape=(32, 32), chunks=(16, 16), dtype="float32", fill=0.0)
+    runner = get_runner("subprocess")
+    with pytest.raises(RunnerError, match="numpy"):
+        runner.run(_make_copy_fn(), [z], outputs=[out], block_shape=(16, 16), num_workers=2,
+                   name="verskew")
+
+
+def test_matching_version_stamp_runs_cleanly(zarr_factory, rng):
+    # The happy path: with a real (matching) stamp the extended check is a no-op and the
+    # distributed run completes correctly.
+    a = rng.random((32, 32)).astype("float32")
+    z = zarr_factory(a, chunks=(16, 16))
+    out = zarr_factory(shape=(32, 32), chunks=(16, 16), dtype="float32", fill=0.0)
+    runner = get_runner("subprocess")
+    runner.run(_make_copy_fn(), [z], outputs=[out], block_shape=(16, 16), num_workers=2, name="verok")
+    np.testing.assert_array_equal(out[:], a)
