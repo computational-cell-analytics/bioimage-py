@@ -1,10 +1,12 @@
 """Failure handling: RunnerError, preserved temp folder, block_ids re-run, and resume_from."""
+import glob
 import os
+import time
 
 import numpy as np
 import pytest
 
-from bioimage_py.runner import RunnerError, get_runner
+from bioimage_py.runner import RunnerConfig, RunnerError, SubprocessRunner, get_runner
 from bioimage_py.util import to_roi
 
 
@@ -42,6 +44,23 @@ def _make_flaky_target(marker_path, fail_begin):
             outputs[0][roi] = inputs[0][roi]
             return None
         return int(inputs[0][roi].sum())
+
+    return fn
+
+
+def _make_timeout(marker_path):
+    """Per-block fn that hangs on the corner block once (until a marker exists).
+
+    Sleeps far longer than the test's ``task_timeout`` so the worker is killed; writes the
+    marker first so the re-run returns immediately (a transient hang that re-run clears).
+    """
+    def fn(block, inputs, outputs, mask):
+        is_corner = all(int(b) == 0 for b in block.begin)
+        if is_corner and not os.path.exists(marker_path):
+            with open(marker_path, "w") as f:
+                f.write("hung once")
+            time.sleep(30)
+        return int(block.begin[0])
 
     return fn
 
@@ -117,3 +136,48 @@ def test_resume_from_array_output(zarr_factory, rng, tmp_path):
     runner.run(fn, [z], outputs=[out], block_shape=(16, 16), num_workers=4,
                resume_from=excinfo.value.tmp_folder, name="resume")
     np.testing.assert_array_equal(out[:], a)
+
+
+def test_task_timeout_reported_and_resumable(zarr_factory, rng, tmp_path):
+    # A hung worker must be killed and reported as a normal (resumable) block failure rather
+    # than hanging the run. 4 blocks over num_workers=4 (tasks_per_worker=1) -> one block per
+    # task, so only the hung corner block's task (block 0) times out.
+    a = rng.random((32, 32)).astype("float32")
+    z = zarr_factory(a, chunks=(16, 16))
+    marker = str(tmp_path / "marker.txt")
+    fn = _make_timeout(marker)
+    runner = SubprocessRunner(RunnerConfig(task_timeout=2, tmp_root=str(tmp_path)))
+
+    with pytest.raises(RunnerError) as excinfo:
+        runner.run(fn, [z], block_shape=(16, 16), num_workers=4, has_return_val=True, name="timeout")
+    err = excinfo.value
+    assert err.failed_block_ids == [0]
+    assert err.tmp_folder is not None and os.path.isdir(err.tmp_folder)
+    with open(os.path.join(err.tmp_folder, "error", "0.txt")) as f:
+        assert "TimeoutError" in f.read().strip().splitlines()[-1]
+
+    # Re-running the timed-out block now succeeds (marker exists -> no hang).
+    results = runner.run(fn, [z], block_shape=(16, 16), num_workers=4, has_return_val=True,
+                         block_ids=err.failed_block_ids, name="timeout-rerun")
+    assert all(r is not None for r in results)
+
+
+def test_launch_failure_raises_runner_error(zarr_factory, rng, tmp_path):
+    # A worker that cannot be launched at all (bad python_executable -> OSError at fork/exec)
+    # must surface as the standard RunnerError with a preserved temp folder, not as an escaping
+    # OSError that bypasses _finalize (which would also leak the temp folder).
+    a = rng.random((32, 32)).astype("float32")
+    z = zarr_factory(a, chunks=(16, 16))
+    fn = _make_flaky(str(tmp_path / "never"))  # never fails; the launch itself does
+    runner = SubprocessRunner(RunnerConfig(python_executable="/nonexistent/python",
+                                           tmp_root=str(tmp_path)))
+
+    with pytest.raises(RunnerError) as excinfo:
+        runner.run(fn, [z], block_shape=(16, 16), num_workers=4, has_return_val=True, name="badpy")
+    err = excinfo.value
+    assert len(err.failed_block_ids) == 4  # no worker launched -> every block failed
+    assert err.tmp_folder is not None and os.path.isdir(err.tmp_folder)  # preserved, not leaked
+    err_files = glob.glob(os.path.join(err.tmp_folder, "error", "*.txt"))
+    assert err_files
+    with open(err_files[0]) as f:
+        assert "OSError" in f.read().strip().splitlines()[-1]

@@ -511,20 +511,43 @@ class SubprocessRunner(_DistributedRunner):
         python = self.config.python_executable or sys.executable
         cmd_base = [python, "-m", "bioimage_py.runner._harness", tmp]
 
+        def _write_error(task_id: int, summary: str, stdout: Optional[str] = None,
+                         stderr: Optional[str] = None) -> None:
+            # Synthesize error/<id>.txt for a failure the harness could not report itself. The
+            # human summary is written *last* so it is the line _failure_message surfaces
+            # (it reads lines[-1]). Never clobber an error file the harness already wrote.
+            err_path = os.path.join(tmp, "error", f"{task_id}.txt")
+            if os.path.exists(err_path):
+                return
+            with open(err_path, "w") as f:
+                if stdout:
+                    f.write(f"--- stdout ---\n{stdout}\n")
+                if stderr:
+                    f.write(f"--- stderr ---\n{stderr}\n")
+                f.write(summary + "\n")
+
         def _run_task(task_id: int):
-            proc = subprocess.run(cmd_base + [str(task_id)], capture_output=True, text=True)
+            # A timeout kill or a launch failure raises here; both are turned into an error
+            # file + a normal return so _launch_and_wait always returns and _finalize can raise
+            # the standard RunnerError (with failed_block_ids + preserved tmp) instead of an
+            # escaping exception. Blocks completed before a timeout kill are already in the
+            # done-log, so _finalize reports only the un-done ones and resume skips the rest.
+            try:
+                proc = subprocess.run(cmd_base + [str(task_id)], capture_output=True, text=True,
+                                      timeout=self.config.task_timeout)
+            except subprocess.TimeoutExpired as err:
+                _write_error(task_id, f"TimeoutError: worker for task {task_id} exceeded "
+                             f"{self.config.task_timeout}s and was killed.", err.stdout, err.stderr)
+                return None
+            except OSError as err:
+                _write_error(task_id, f"OSError: failed to launch worker for task {task_id}: {err!r}")
+                return None
             # The harness writes its own error/<id>.txt on a caught exception. But a failure
             # *before* that try (e.g. an import error launching the module) would otherwise be
             # silent, so capture the subprocess output as a fallback error file.
             if proc.returncode != 0:
-                err_path = os.path.join(tmp, "error", f"{task_id}.txt")
-                if not os.path.exists(err_path):
-                    with open(err_path, "w") as f:
-                        f.write(f"Worker for task {task_id} exited with code {proc.returncode}.\n")
-                        if proc.stdout:
-                            f.write(f"--- stdout ---\n{proc.stdout}\n")
-                        if proc.stderr:
-                            f.write(f"--- stderr ---\n{proc.stderr}\n")
+                _write_error(task_id, f"Worker for task {task_id} exited with code {proc.returncode}.",
+                             proc.stdout, proc.stderr)
             return proc
 
         # Drive a block-counting progress bar from the done-logs (single source of truth, so no

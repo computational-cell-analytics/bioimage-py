@@ -28,12 +28,18 @@ class RunnerConfig:
             units (blocks, or shard-groups for a sharded output) and, on slurm, to the
             cluster's ``MaxArraySize``. Ignored by the local runner, which already schedules
             one task per block.
+        task_timeout: Per-task wall-clock limit in seconds for the ``subprocess`` backend.
+            ``None`` (the default) means no timeout. A worker that exceeds it is killed and
+            its unfinished blocks are reported as a normal failure (resumable); blocks it
+            already completed are preserved. Ignored by the local runner; the ``slurm``
+            backend uses ``SlurmConfig.time`` (a slurm walltime string) instead.
     """
 
     poll_interval: float = 10.0
     tmp_root: Optional[str] = None
     python_executable: Optional[str] = None
     tasks_per_worker: int = 1
+    task_timeout: Optional[float] = None
 
 
 @dataclass
