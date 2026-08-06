@@ -25,7 +25,9 @@ The package lives in `bioimage_py/`:
 - `sources/` — `Source` ABC + `SourceSpec` (`base.py`), `ArraySource` for numpy/zarr/z5py
   (`array_source.py`), the `as_source` / `from_spec` / `SourceLike` dispatch (`dispatch.py`),
   `FileSource` + `open_source` (`file_source.py`, the `kind="file"` spec over the `io/` layer),
-  `CloudVolumeSource` + `open_cloudvolume` (`cloudvolume_source.py`, writable, ZYX-over-XYZ), and
+  `CloudVolumeSource` + `open_cloudvolume` (`cloudvolume_source.py`, writable, ZYX-over-XYZ),
+  `TensorStorePrecomputedSource` + `open_tensorstore_precomputed` (`tensorstore_source.py`,
+  read/write, local-ZYX over absolute-XYZC with write chunks exposed as shards), and
   `WebKnossosSource` + `open_webknossos` (`webknossos_source.py`, read-only, remote).
 - `io/` — native file-format IO layer (mirrors `elf.io`): `open_file` + a guarded extension→format
   registry (`files.py`, `registry.py`), array-like wrappers for mrc / nifti / knossos / image-stack
@@ -113,8 +115,9 @@ Conventions (follow these):
   spaces — the case it is most often used to compact). `bioimage_cpp` has no dense-array `take`.
 - numpy arrays are local-only (their `to_spec()` raises); distributed backends need a reopenable source.
 - A `Source` exposes a `writable` property (default `True`; `False` for wrappers, read-only `FileSource`s,
-  and `WebKnossosSource`). The distributed runner rejects non-writable outputs, and rejects HDF5 as an
-  output (concurrent multi-process writes corrupt it). Read-only formats (mrc/nifti/knossos/...) and
+  read-only `TensorStorePrecomputedSource`s, and `WebKnossosSource`). The distributed runner rejects
+  non-writable outputs, and rejects HDF5 as an output (concurrent multi-process writes corrupt it).
+  Read-only formats (mrc/nifti/knossos/...) and
   HDF5 are valid distributed *inputs* (concurrent readers are safe); distributed *outputs* stay zarr/n5.
 
 # Installation

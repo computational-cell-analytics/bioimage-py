@@ -36,7 +36,7 @@ jobs:
       # Pure pip install: every dependency (including bioimage-cpp and z5py) is pulled from PyPI.
       # The 'io' extra adds zarr>=3 + z5py, so the n5 path is exercised here too.
       - name: Install package
-        run: pip install -e ".[test,io,hdf5,mrc,nifti,imagestack]"
+        run: pip install -e ".[test,io,hdf5,mrc,nifti,imagestack,tensorstore]"
 
       # cloud-volume is only reliably installable on Linux; install it there so the CloudVolume
       # tests run on the Ubuntu job (they skip elsewhere via importorskip).

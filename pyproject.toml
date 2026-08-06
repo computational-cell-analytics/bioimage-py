@@ -30,10 +30,11 @@ nifti = ["nibabel"]
 imagestack = ["imageio", "tifffile"]
 msr = ["msr-reader"]
 cloudvolume = ["cloud-volume"]
+tensorstore = ["tensorstore"]
 webknossos = ["webknossos"]
 io-all = [
     "zarr>=3", "z5py", "h5py", "mrcfile", "nibabel", "imageio", "tifffile",
-    "cloud-volume", "webknossos",
+    "cloud-volume", "tensorstore", "webknossos",
 ]
 test = ["pytest", "zarr>=3", "scikit-image", "scipy", "openpyxl"]
 dev = ["flake8", "pyflakes"]
