@@ -32,6 +32,7 @@ the ones you need, e.g. `python -m pip install -e ".[io]"` or combine several
 | `imagestack` | `imageio`, `tifffile` | TIFF files and folders of image slices. |
 | `msr` | `msr-reader` | MSR / OBF microscopy files (read-only). |
 | `cloudvolume` | `cloud-volume` | `CloudVolume` (precomputed) layers — writable, Linux only. |
+| `tensorstore` | `tensorstore` | TensorStore neuroglancer-precomputed layers — local ZYX reads and shard-safe writes. |
 | `webknossos` | `webknossos` | WebKnossos layers — read-only, remote or local. |
 | `io-all` | all of the above | Every supported I/O backend in one go. |
 | `test` | `pytest`, `zarr>=3`, `scikit-image`, `scipy`, `openpyxl` | Running the test suite. |

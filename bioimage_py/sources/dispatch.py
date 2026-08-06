@@ -69,6 +69,10 @@ def from_spec(spec: SourceSpec) -> Source:
         from .cloudvolume_source import CloudVolumeSource
 
         return CloudVolumeSource.reopen(spec)
+    if spec.kind == "tensorstore_precomputed":
+        from .tensorstore_source import TensorStorePrecomputedSource
+
+        return TensorStorePrecomputedSource.reopen(spec)
     if spec.kind == "webknossos":
         from .webknossos_source import WebKnossosSource
 

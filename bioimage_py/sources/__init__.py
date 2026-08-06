@@ -4,6 +4,7 @@ from .base import Source, SourceSpec
 from .cloudvolume_source import CloudVolumeSource, open_cloudvolume
 from .dispatch import SourceLike, as_source, from_spec, register_source
 from .file_source import FileSource, open_source
+from .tensorstore_source import TensorStorePrecomputedSource, open_tensorstore_precomputed
 from .webknossos_source import WebKnossosSource, open_webknossos
 
 __all__ = [
@@ -18,6 +19,8 @@ __all__ = [
     "open_source",
     "CloudVolumeSource",
     "open_cloudvolume",
+    "TensorStorePrecomputedSource",
+    "open_tensorstore_precomputed",
     "WebKnossosSource",
     "open_webknossos",
 ]

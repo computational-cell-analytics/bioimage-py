@@ -12,7 +12,8 @@ from . import evaluation, filters, io, morphology, operations, segmentation, sta
 from .copy import copy
 from .downsample import downsample
 from .runner import SlurmConfig, config_file_path, get_runner, write_slurm_config
-from .sources import as_source, open_cloudvolume, open_source, open_webknossos
+from .sources import (TensorStorePrecomputedSource, as_source, open_cloudvolume, open_source,
+                      open_tensorstore_precomputed, open_webknossos)
 from .util import to_roi
 from .__version__ import __version__
 
@@ -34,6 +35,8 @@ __all__ = [
     "as_source",
     "open_source",
     "open_cloudvolume",
+    "TensorStorePrecomputedSource",
+    "open_tensorstore_precomputed",
     "open_webknossos",
     "to_roi",
 ]
