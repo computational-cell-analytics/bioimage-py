@@ -72,7 +72,20 @@ try:
 except RunnerError as e:
     print(e.failed_block_ids)  # e.g. [128, 129, 511]
     print(e.tmp_folder)        # /shared/tmp/bioimage_py_xxxx  (preserved for resume/debug)
+    for failure in e.task_failures:
+        print(failure.task_id, failure.scheduler_state, failure.exit_code)
+        print(failure.stderr_path, failure.traceback_path)
 ```
+
+`task_failures` contains one immutable `TaskFailure` record for each failed distributed task.
+Subprocess records include the exit code or terminating signal, elapsed time, and log paths. Slurm
+records also include the scheduler task ID, scheduler state, peak resident memory, and failed node
+when the cluster provides these values. An unavailable value is `None`.
+
+The preserved folder contains a versioned `manifest.json`. Its `attempts` list keeps each launch,
+resume, and Slurm submission failure. Attempt-specific directories keep logs, tracebacks, outcomes,
+timings, and Slurm accounting observations. Successful runs still remove the folder after the
+optional `pre_cleanup` callback runs.
 
 **Recommended — `resume_from`** (distributed only). Re-issue the *same* call pointing at the
 preserved temp folder: only the incomplete blocks are re-run, and the result is merged with the

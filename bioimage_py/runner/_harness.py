@@ -1,6 +1,6 @@
 """Worker entry point for distributed tasks.
 
-Invoked as ``python -m bioimage_py.runner._harness <tempdir> <task_id>``. Loads the
+Invoked as ``python -m bioimage_py.runner._harness <tempdir> <task_id> <attempt>``. Loads the
 cloudpickled payload, reopens the sources from their specs, and runs the assigned blocks via
 the shared :func:`bioimage_py.runner.base.run_block`.
 
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import struct
 import sys
@@ -33,7 +34,7 @@ from .base import run_block
 from .distributed import _check_versions
 
 
-def _run_task(tmp: str, task_id: int) -> None:
+def _run_task(tmp: str, task_id: int, attempt_number: int = 1) -> None:
     with open(os.path.join(tmp, "payload.pkl"), "rb") as f:
         payload = cloudpickle.load(f)
 
@@ -115,8 +116,12 @@ def _run_task(tmp: str, task_id: int) -> None:
         "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
         "slurm_nodename": os.environ.get("SLURMD_NODENAME"),
     }
-    with open(os.path.join(tmp, "timings", f"{task_id}.json"), "w") as f:
+    attempt_timing_dir = os.path.join(tmp, "attempts", f"{attempt_number:04d}", "timings")
+    os.makedirs(attempt_timing_dir, exist_ok=True)
+    attempt_timing_path = os.path.join(attempt_timing_dir, f"{task_id}.json")
+    with open(attempt_timing_path, "w") as f:
         json.dump(timing, f)
+    shutil.copyfile(attempt_timing_path, os.path.join(tmp, "timings", f"{task_id}.json"))
 
     # Sentinel written last: its existence is the ground truth for a fully-completed task.
     open(os.path.join(tmp, "success", f"{task_id}.success"), "w").close()
@@ -125,11 +130,18 @@ def _run_task(tmp: str, task_id: int) -> None:
 def main() -> None:
     tmp = sys.argv[1]
     task_id = int(sys.argv[2])
+    attempt_number = int(sys.argv[3]) if len(sys.argv) > 3 else 1
     try:
-        _run_task(tmp, task_id)
+        _run_task(tmp, task_id, attempt_number)
     except Exception:
+        error_text = traceback.format_exc()
+        attempt_error_dir = os.path.join(tmp, "attempts", f"{attempt_number:04d}", "errors")
+        os.makedirs(attempt_error_dir, exist_ok=True)
+        attempt_error_path = os.path.join(attempt_error_dir, f"{task_id}.txt")
+        with open(attempt_error_path, "w") as f:
+            f.write(error_text)
         with open(os.path.join(tmp, "error", f"{task_id}.txt"), "w") as f:
-            f.write(traceback.format_exc())
+            f.write(error_text)
         sys.exit(1)
 
 

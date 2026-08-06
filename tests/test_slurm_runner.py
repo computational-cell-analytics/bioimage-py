@@ -110,6 +110,13 @@ def test_slurm_failure_then_rerun(shared_zarr_factory, rng, shared_tmp_path):
     err = excinfo.value
     assert 0 in err.failed_block_ids  # the corner block is block id 0
     assert err.tmp_folder is not None and os.path.isdir(err.tmp_folder)
+    assert err.task_failures
+    failure = err.task_failures[0]
+    assert failure.backend == "slurm"
+    assert failure.scheduler_task_id is not None
+    assert failure.stderr_path is not None
+    if failure.scheduler_state is not None:
+        assert failure.scheduler_state in {"FAILED", "OUT_OF_MEMORY", "TIMEOUT", "NODE_FAIL"}
 
     # Re-running the reported failed blocks with a non-failing fn now succeeds.
     results = runner.run(_fail_on_corner(False), [z], block_shape=(16, 16), num_workers=4,

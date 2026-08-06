@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -30,7 +31,11 @@ from tqdm import tqdm
 
 from ..sources.base import Source
 from ..util import ComputeFn, group_blocks_by_shard, maybe_warn_imbalance
-from .base import Runner, RunnerError
+from ._diagnostics import (append_attempt, atomic_write_json, attempt_folder, create_manifest,
+                           latest_task_outcome, load_manifest, outcome_to_failure,
+                           read_task_outcome, relative_path, update_attempt, utc_now,
+                           write_task_outcome)
+from .base import Runner, RunnerError, TaskFailure
 from .config import RunnerConfig, SlurmConfig
 
 
@@ -191,6 +196,8 @@ def _total_blocks(tmp: str, n_tasks: int) -> int:
 
 class _DistributedRunner(Runner):
     """Base for runners that ship the computation to separate worker processes."""
+
+    backend_name = "distributed"
 
     @staticmethod
     def _require_reopenable(inputs: Sequence[Source], outputs: Sequence[Source],
@@ -379,6 +386,14 @@ class _DistributedRunner(Runner):
             with open(os.path.join(tmp, "blocks", f"{task_id}.json"), "w") as f:
                 json.dump([int(b) for b in task_ids], f)
 
+        create_manifest(
+            tmp,
+            backend=self.backend_name,
+            name=name,
+            n_tasks=n_tasks,
+            python_executable=self.config.python_executable or sys.executable,
+        )
+
         self._launch_and_wait(tmp, n_tasks, num_workers, name)
         return self._finalize(tmp, n_tasks, tasks, ids, has_return_val, name,
                               pre_cleanup=pre_cleanup)
@@ -415,8 +430,8 @@ class _DistributedRunner(Runner):
             a list of ``None`` of the same length.
 
         Raises:
-            RunnerError: If any task is missing its success sentinel; the preserved temp
-                folder and the failed block ids are attached.
+            RunnerError: If any block is incomplete. The error contains the preserved temp
+                folder, failed block ids, and task diagnostics.
         """
         # Per-block done-logs are the authority for what completed, so failure reporting is
         # precise: only blocks not in any done-log are failed (not the whole task). A task that
@@ -426,10 +441,13 @@ class _DistributedRunner(Runner):
         if failed_block_ids:
             failed_tasks = [t for t in range(n_tasks)
                             if not os.path.exists(os.path.join(tmp, "success", f"{t}.success"))]
-            raise RunnerError(self._failure_message(tmp, failed_tasks, name),
-                              failed_block_ids=failed_block_ids, tmp_folder=tmp)
+            task_failures = self._task_failures(tmp, failed_tasks)
+            raise RunnerError(self._failure_message(tmp, task_failures, name),
+                              failed_block_ids=failed_block_ids, tmp_folder=tmp,
+                              task_failures=task_failures)
 
-        results = self._collect(tmp, n_tasks, block_ids) if has_return_val else [None] * len(block_ids)
+        results = (self._collect(tmp, n_tasks, tasks, block_ids)
+                   if has_return_val else [None] * len(block_ids))
         if pre_cleanup is not None:
             try:
                 pre_cleanup(tmp)
@@ -438,8 +456,8 @@ class _DistributedRunner(Runner):
         shutil.rmtree(tmp, ignore_errors=True)
         return results
 
-    @staticmethod
-    def _collect(tmp: str, n_tasks: int, block_ids: Sequence[int]) -> List[Any]:
+    def _collect(self, tmp: str, n_tasks: int, tasks: Sequence[Sequence[int]],
+                 block_ids: Sequence[int]) -> List[Any]:
         """Load and order per-task results, reading length-framed per-block records.
 
         Each ``results/<task_id>`` file is a sequence of ``<8-byte little-endian length>
@@ -466,23 +484,56 @@ class _DistributedRunner(Runner):
                     result_by_block[int(bid)] = res
         missing = [int(b) for b in block_ids if int(b) not in result_by_block]
         if missing:
+            missing_set = set(missing)
+            failed_tasks = [task_id for task_id, task in enumerate(tasks)
+                            if missing_set.intersection(int(value) for value in task)]
+            task_failures = self._task_failures(tmp, failed_tasks)
             raise RunnerError(
                 f"Result records missing for {len(missing)} block(s) after a successful run "
                 f"(first: {missing[:5]}). Temp folder: {tmp}.",
-                failed_block_ids=missing, tmp_folder=tmp)
+                failed_block_ids=missing, tmp_folder=tmp, task_failures=task_failures)
         return [result_by_block[int(b)] for b in block_ids]
 
+    def _task_failures(self, tmp: str, failed_tasks: Sequence[int]) -> List[TaskFailure]:
+        """Load the newest persisted failure record for each unresolved task."""
+        manifest = load_manifest(tmp, expected_backend=self.backend_name)
+        attempts = manifest["attempts"]
+        fallback_attempt = int(attempts[-1]["attempt_number"]) if attempts else 1
+        failures: List[TaskFailure] = []
+        for task_id in failed_tasks:
+            outcome = latest_task_outcome(tmp, int(task_id))
+            if outcome is None:
+                traceback_path = os.path.join(tmp, "error", f"{int(task_id)}.txt")
+                failures.append(TaskFailure(
+                    task_id=int(task_id), backend=self.backend_name,
+                    attempt_number=fallback_attempt,
+                    traceback_path=traceback_path if os.path.exists(traceback_path) else None,
+                ))
+            else:
+                failures.append(outcome_to_failure(tmp, outcome))
+        return failures
+
     @staticmethod
-    def _failure_message(tmp: str, failed_tasks: Sequence[int], name: str) -> str:
-        """Build an error message naming the preserved temp folder and first error."""
+    def _failure_message(tmp: str, task_failures: Sequence[TaskFailure], name: str) -> str:
+        """Build an error message from persisted task diagnostics."""
         first = None
-        err_files = [os.path.join(tmp, "error", f"{t}.txt") for t in failed_tasks]
-        err_files = [p for p in err_files if os.path.exists(p)]
+        err_files = [failure.traceback_path for failure in task_failures]
+        err_files = [p for p in err_files if p is not None and os.path.exists(p)]
         if err_files:
             with open(err_files[0]) as f:
                 lines = f.read().strip().splitlines()
             first = lines[-1] if lines else None
-        n = len(failed_tasks) if failed_tasks else "some"
+        if first is None and task_failures:
+            failure = task_failures[0]
+            details = []
+            if failure.scheduler_state is not None:
+                details.append(f"state={failure.scheduler_state}")
+            if failure.exit_code is not None:
+                details.append(f"exit_code={failure.exit_code}")
+            if failure.signal is not None:
+                details.append(f"signal={failure.signal}")
+            first = ", ".join(details) or None
+        n = len(task_failures) if task_failures else "some"
         return (
             f"{n} task(s) failed in '{name or 'run'}'. "
             f"Temp folder preserved for debugging: {tmp}. First error: {first!r}"
@@ -520,6 +571,7 @@ class _DistributedRunner(Runner):
         Returns:
             The per-block return values (if the run collected any), else ``None``.
         """
+        manifest = load_manifest(tmp_folder, expected_backend=self.backend_name)
         with open(os.path.join(tmp_folder, "payload.pkl"), "rb") as f:
             payload = cloudpickle.load(f)
         has_return_val = bool(payload["has_return_val"])
@@ -534,6 +586,11 @@ class _DistributedRunner(Runner):
                 tasks.append([int(b) for b in json.load(f)])
             task_id += 1
         n_tasks = len(tasks)
+        if n_tasks != int(manifest["n_tasks"]):
+            raise ValueError(
+                f"Run folder {tmp_folder!r} has {n_tasks} task files, but its manifest records "
+                f"{manifest['n_tasks']}."
+            )
         block_ids = [b for task in tasks for b in task]
 
         incomplete = [t for t, task_blocks in enumerate(tasks)
@@ -551,6 +608,8 @@ class SubprocessRunner(_DistributedRunner):
     result/sentinel files, ``block_ids`` re-run) without a scheduler.
     """
 
+    backend_name = "subprocess"
+
     def _launch_and_wait(self, tmp: str, n_tasks: int, num_workers: int, name: str,
                          task_ids: Optional[Sequence[int]] = None) -> None:
         """Run each task as a local subprocess, up to ``num_workers`` concurrently.
@@ -561,46 +620,83 @@ class SubprocessRunner(_DistributedRunner):
         """
         ids = list(range(n_tasks)) if task_ids is None else list(task_ids)
         python = self.config.python_executable or sys.executable
+        attempt = append_attempt(tmp, task_ids=ids, concurrency=num_workers)
+        attempt_number = int(attempt["attempt_number"])
+        attempt_root = attempt_folder(tmp, attempt_number)
         cmd_base = [python, "-m", "bioimage_py.runner._harness", tmp]
+        update_attempt(tmp, attempt_number, status="running")
 
-        def _write_error(task_id: int, summary: str, stdout: Optional[str] = None,
-                         stderr: Optional[str] = None) -> None:
-            # Synthesize error/<id>.txt for a failure the harness could not report itself. The
-            # human summary is written *last* so it is the line _failure_message surfaces
-            # (it reads lines[-1]). Never clobber an error file the harness already wrote.
-            err_path = os.path.join(tmp, "error", f"{task_id}.txt")
-            if os.path.exists(err_path):
-                return
-            with open(err_path, "w") as f:
-                if stdout:
-                    f.write(f"--- stdout ---\n{stdout}\n")
-                if stderr:
-                    f.write(f"--- stderr ---\n{stderr}\n")
-                f.write(summary + "\n")
+        def _write_error(task_id: int, summary: str) -> None:
+            """Write a traceback substitute when the harness cannot write one."""
+            err_path = os.path.join(attempt_root, "errors", f"{task_id}.txt")
+            if not os.path.exists(err_path):
+                with open(err_path, "w") as f:
+                    f.write(summary + "\n")
+            shutil.copyfile(err_path, os.path.join(tmp, "error", f"{task_id}.txt"))
 
         def _run_task(task_id: int):
-            # A timeout kill or a launch failure raises here; both are turned into an error
-            # file + a normal return so _launch_and_wait always returns and _finalize can raise
-            # the standard RunnerError (with failed_block_ids + preserved tmp) instead of an
-            # escaping exception. Blocks completed before a timeout kill are already in the
-            # done-log, so _finalize reports only the un-done ones and resume skips the rest.
-            try:
-                proc = subprocess.run(cmd_base + [str(task_id)], capture_output=True, text=True,
-                                      timeout=self.config.task_timeout)
-            except subprocess.TimeoutExpired as err:
-                _write_error(task_id, f"TimeoutError: worker for task {task_id} exceeded "
-                             f"{self.config.task_timeout}s and was killed.", err.stdout, err.stderr)
-                return None
-            except OSError as err:
-                _write_error(task_id, f"OSError: failed to launch worker for task {task_id}: {err!r}")
-                return None
-            # The harness writes its own error/<id>.txt on a caught exception. But a failure
-            # *before* that try (e.g. an import error launching the module) would otherwise be
-            # silent, so capture the subprocess output as a fallback error file.
-            if proc.returncode != 0:
-                _write_error(task_id, f"Worker for task {task_id} exited with code {proc.returncode}.",
-                             proc.stdout, proc.stderr)
-            return proc
+            # Persist launch failures and timeouts before finalization builds RunnerError.
+            # The done-log keeps blocks that finished before a timeout.
+            started = time.monotonic()
+            stdout_path = os.path.join(attempt_root, "logs", f"{task_id}.out")
+            stderr_path = os.path.join(attempt_root, "logs", f"{task_id}.err")
+            exit_code: Optional[int] = None
+            terminating_signal: Optional[int] = None
+            succeeded = False
+            summary: Optional[str] = None
+            with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
+                try:
+                    proc = subprocess.run(
+                        cmd_base + [str(task_id), str(attempt_number)],
+                        stdout=stdout_file,
+                        stderr=stderr_file,
+                        text=True,
+                        timeout=self.config.task_timeout,
+                    )
+                except subprocess.TimeoutExpired:
+                    terminating_signal = int(signal.SIGKILL)
+                    summary = (f"TimeoutError: worker for task {task_id} exceeded "
+                               f"{self.config.task_timeout}s and was killed.")
+                    _write_error(task_id, summary)
+                except OSError as err:
+                    summary = f"OSError: failed to launch worker for task {task_id}: {err!r}"
+                    _write_error(task_id, summary)
+                else:
+                    if proc.returncode < 0:
+                        terminating_signal = -int(proc.returncode)
+                    else:
+                        exit_code = int(proc.returncode)
+                    succeeded = (proc.returncode == 0 and os.path.exists(
+                        os.path.join(tmp, "success", f"{task_id}.success")
+                    ))
+                    if not succeeded:
+                        summary = f"Worker for task {task_id} exited with code {proc.returncode}."
+                        _write_error(task_id, summary)
+
+            traceback_path = os.path.join(attempt_root, "errors", f"{task_id}.txt")
+            write_task_outcome(
+                tmp,
+                attempt_number,
+                {
+                    "task_id": int(task_id),
+                    "backend": self.backend_name,
+                    "attempt_number": attempt_number,
+                    "scheduler_task_id": None,
+                    "scheduler_state": None,
+                    "exit_code": exit_code,
+                    "signal": terminating_signal,
+                    "elapsed_seconds": time.monotonic() - started,
+                    "peak_rss_bytes": None,
+                    "failed_node": None,
+                    "stdout_path": relative_path(tmp, stdout_path),
+                    "stderr_path": relative_path(tmp, stderr_path),
+                    "traceback_path": (relative_path(tmp, traceback_path)
+                                       if os.path.exists(traceback_path) else None),
+                    "succeeded": succeeded,
+                    "summary": summary,
+                },
+            )
+            return succeeded
 
         # Drive a block-counting progress bar from the done-logs (single source of truth, so no
         # double-counting); clamp to the total in case a resume re-reads prior lines.
@@ -620,7 +716,13 @@ class SubprocessRunner(_DistributedRunner):
             bar_thread.start()
         try:
             with futures.ThreadPoolExecutor(max(1, int(num_workers))) as tp:
-                list(tp.map(_run_task, ids))
+                succeeded = list(tp.map(_run_task, ids))
+        except BaseException:
+            update_attempt(tmp, attempt_number, status="interrupted", finished_at=utc_now())
+            raise
+        else:
+            status = "succeeded" if all(succeeded) else "failed"
+            update_attempt(tmp, attempt_number, status=status, finished_at=utc_now())
         finally:
             stop.set()
             if bar_thread is not None:
@@ -643,11 +745,12 @@ class SlurmRunner(_DistributedRunner):
 
     Reuses the full distributed protocol from :class:`_DistributedRunner` (cloudpickle
     payload, generated work-lists, per-task result + ``.success`` sentinel files, failure
-    reporting and ``block_ids`` re-run) and overrides only how tasks are launched and
-    awaited. The per-task sentinel file remains the ground truth for success; ``sacct`` is
-    queried only to detect tasks that died without writing a sentinel. A manifest is written
-    at submission time so an interrupted run can be picked back up with :meth:`reattach`.
+    reporting and ``block_ids`` re-run) and overrides how tasks are launched and awaited.
+    The per-task sentinel remains the source of truth for success. Lightweight ``sacct``
+    queries detect dead tasks. A separate final query persists accounting diagnostics.
     """
+
+    backend_name = "slurm"
 
     def __init__(self, config: Optional[RunnerConfig] = None):
         """Create the runner, requiring a :class:`SlurmConfig`.
@@ -720,11 +823,15 @@ class SlurmRunner(_DistributedRunner):
                 f"{max_array}. Lower num_workers/tasks_per_worker or use a larger block_shape."
             )
 
-        os.makedirs(os.path.join(tmp, "logs"), exist_ok=True)
         throttle = max(1, min(int(num_workers), len(launch_ids)))
-        script_path = os.path.join(tmp, "submit.sh")
+        attempt = append_attempt(tmp, task_ids=launch_ids, concurrency=throttle)
+        attempt_number = int(attempt["attempt_number"])
+        attempt_root = attempt_folder(tmp, attempt_number)
+        script_path = os.path.join(attempt_root, "submit.sh")
         with open(script_path, "w") as f:
-            f.write(self._build_script(tmp, launch_ids, throttle, name))
+            f.write(self._build_script(tmp, launch_ids, throttle, name, attempt_number))
+        shutil.copyfile(script_path, os.path.join(tmp, "submit.sh"))
+        update_attempt(tmp, attempt_number, script_path=relative_path(tmp, script_path))
 
         # Unlike the tmp_root / max_array guards above, a submission failure deliberately does NOT
         # remove the temp folder: the generated submit.sh, payload, and per-task block lists are
@@ -733,29 +840,45 @@ class SlurmRunner(_DistributedRunner):
         try:
             job_id = self._submit(script_path)
         except RuntimeError as err:
+            update_attempt(
+                tmp,
+                attempt_number,
+                status="submission_failed",
+                finished_at=utc_now(),
+                submission_error=str(err),
+            )
             raise RuntimeError(f"{err} Temp folder preserved for debugging: {tmp}.") from err
-        manifest = {
-            "job_id": job_id,
-            "n_tasks": n_tasks,
-            "launch_ids": launch_ids,
-            "throttle": throttle,
-            "name": name,
-            "tmp": tmp,
-            "script": script_path,
-            "python_executable": self.config.python_executable or sys.executable,
-            "submit_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        manifest_path = os.path.join(tmp, "manifest.json")
-        if is_resume and os.path.exists(manifest_path):  # keep the prior job id for forensics
-            try:
-                with open(manifest_path) as f:
-                    manifest["resumed_from_job_id"] = json.load(f).get("job_id")
-            except (OSError, ValueError):
-                pass
-        with open(manifest_path, "w") as f:
-            json.dump(manifest, f, indent=2)
+        update_attempt(tmp, attempt_number, status="running", job_id=job_id)
 
-        self._poll(job_id, n_tasks, tmp, name, task_ids=launch_ids)
+        poll_states: Dict[int, str] = {}
+        try:
+            poll_states = self._poll(job_id, n_tasks, tmp, name, task_ids=launch_ids)
+        except BaseException as error:
+            accounting_path = self._persist_slurm_outcomes(
+                tmp, attempt_number, job_id, launch_ids, poll_states
+            )
+            status = "interrupted" if isinstance(error, KeyboardInterrupt) else "orchestrator_error"
+            update_attempt(
+                tmp,
+                attempt_number,
+                status=status,
+                finished_at=utc_now(),
+                accounting_path=relative_path(tmp, accounting_path),
+            )
+            raise
+        else:
+            accounting_path = self._persist_slurm_outcomes(
+                tmp, attempt_number, job_id, launch_ids, poll_states
+            )
+            succeeded = all(os.path.exists(os.path.join(tmp, "success", f"{task_id}.success"))
+                            for task_id in launch_ids)
+            update_attempt(
+                tmp,
+                attempt_number,
+                status="succeeded" if succeeded else "failed",
+                finished_at=utc_now(),
+                accounting_path=relative_path(tmp, accounting_path),
+            )
 
     @staticmethod
     def _format_array_indices(task_ids: Sequence[int], throttle: int) -> str:
@@ -771,9 +894,11 @@ class SlurmRunner(_DistributedRunner):
             i = j + 1
         return ",".join(parts) + f"%{throttle}"
 
-    def _build_script(self, tmp: str, task_ids: Sequence[int], throttle: int, name: str) -> str:
+    def _build_script(self, tmp: str, task_ids: Sequence[int], throttle: int, name: str,
+                      attempt_number: int) -> str:
         """Render the sbatch array script for the given task indices."""
         cfg = self.config
+        logs = os.path.join(attempt_folder(tmp, attempt_number), "logs")
         shebang, preamble = "#!/bin/bash", ""
         if cfg.shebang:
             lines = cfg.shebang.splitlines()
@@ -788,8 +913,8 @@ class SlurmRunner(_DistributedRunner):
             f"--job-name={job_name}",
             f"--array={self._format_array_indices(task_ids, throttle)}",
             f"--cpus-per-task={int(cfg.cpus_per_task)}",
-            f"--output={os.path.join(tmp, 'logs', 'slurm-%A_%a.out')}",
-            f"--error={os.path.join(tmp, 'logs', 'slurm-%A_%a.err')}",
+            f"--output={os.path.join(logs, 'slurm-%A_%a.out')}",
+            f"--error={os.path.join(logs, 'slurm-%A_%a.err')}",
         ]
         if cfg.partition is not None:
             directives.append(f"--partition={cfg.partition}")
@@ -807,7 +932,8 @@ class SlurmRunner(_DistributedRunner):
             directives.append(f"--constraint={cfg.constraint}")
 
         python = shlex.quote(cfg.python_executable or sys.executable)
-        command = f'{python} -m bioimage_py.runner._harness {shlex.quote(tmp)} "${{SLURM_ARRAY_TASK_ID}}"'
+        command = (f'{python} -m bioimage_py.runner._harness {shlex.quote(tmp)} '
+                   f'"${{SLURM_ARRAY_TASK_ID}}" {int(attempt_number)}')
         lines = [shebang]
         lines += [f"#SBATCH {d}" for d in directives]
         if preamble:
@@ -821,8 +947,11 @@ class SlurmRunner(_DistributedRunner):
         sbatch = shutil.which("sbatch")
         if sbatch is None:
             raise RuntimeError("sbatch not found on PATH; the slurm CLI must be available.")
-        proc = subprocess.run([sbatch, "--parsable", script_path],
-                              capture_output=True, text=True)
+        try:
+            proc = subprocess.run([sbatch, "--parsable", script_path],
+                                  capture_output=True, text=True)
+        except OSError as error:
+            raise RuntimeError(f"Could not launch sbatch: {error!r}") from error
         if proc.returncode != 0:
             raise RuntimeError(f"sbatch submission failed (exit {proc.returncode}): "
                                f"{proc.stderr.strip() or proc.stdout.strip()}")
@@ -890,8 +1019,7 @@ class SlurmRunner(_DistributedRunner):
             if "." in jid or "_" not in jid:  # step rows (defensive; -X already excludes them)
                 continue
             # Take the first token: normalises e.g. "CANCELLED by 12345" -> "CANCELLED".
-            tokens = raw_state.split()
-            state = tokens[0].upper() if tokens else ""
+            state = self._normalise_slurm_state(raw_state) or ""
             suffix = jid.split("_", 1)[1]
             if suffix.startswith("["):
                 for idx in self._parse_array_range(suffix):
@@ -902,6 +1030,174 @@ class SlurmRunner(_DistributedRunner):
                 except ValueError:
                     continue
         return states
+
+    @staticmethod
+    def _normalise_slurm_state(value: Optional[str]) -> Optional[str]:
+        """Return the canonical first token of a Slurm state."""
+        if value is None:
+            return None
+        tokens = value.strip().split()
+        return tokens[0].upper().rstrip("+") if tokens else None
+
+    @staticmethod
+    def _parse_slurm_exit_code(value: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
+        """Parse Slurm's ``exit:signal`` accounting value."""
+        if value is None or not value.strip():
+            return None, None
+        code_text, _, signal_text = value.strip().partition(":")
+        try:
+            exit_code = int(code_text)
+        except ValueError:
+            exit_code = None
+        try:
+            terminating_signal = int(signal_text) if signal_text else None
+        except ValueError:
+            terminating_signal = None
+        if terminating_signal == 0:
+            terminating_signal = None
+        return exit_code, terminating_signal
+
+    @staticmethod
+    def _parse_slurm_rss(value: Optional[str]) -> Optional[int]:
+        """Parse a Slurm MaxRSS value requested with ``--units=K`` into bytes."""
+        if value is None:
+            return None
+        text = value.strip().upper()
+        if not text or text in {"N/A", "UNKNOWN"}:
+            return None
+        units = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3,
+                 "T": 1024 ** 4, "P": 1024 ** 5}
+        suffix = text[-1]
+        multiplier = units.get(suffix, 1024)
+        number = text[:-1] if suffix in units else text
+        try:
+            return int(float(number) * multiplier)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_accounting_rows(stdout: str, fields: Sequence[str]) -> List[Dict[str, str]]:
+        """Parse pipe-delimited sacct output."""
+        rows: List[Dict[str, str]] = []
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            values = [value.strip() for value in line.rstrip("\n").split("|")]
+            if len(values) != len(fields):
+                continue
+            rows.append(dict(zip(fields, values)))
+        return rows
+
+    def _query_slurm_accounting(self, job_id: str) -> Dict[str, Any]:
+        """Run the final detailed accounting query with a core-field fallback."""
+        rich_fields = [
+            "JobID", "State", "ExitCode", "ElapsedRaw", "MaxRSS", "MaxRSSNode",
+            "NodeList", "FailedNode", "StdOut", "StdErr",
+        ]
+        core_fields = ["JobID", "State", "ExitCode", "ElapsedRaw", "NodeList"]
+        observation: Dict[str, Any] = {"queried_at": utc_now(), "queries": [], "rows": []}
+        sacct = shutil.which("sacct")
+        if sacct is None:
+            observation["queries"].append({"error": "sacct not found on PATH"})
+            return observation
+
+        for fields in (rich_fields, core_fields):
+            command = [
+                sacct, "--array", "-n", "-P", "--units=K",
+                f"--format={','.join(fields)}", "-j", str(job_id),
+            ]
+            try:
+                proc = subprocess.run(command, capture_output=True, text=True)
+            except OSError as error:
+                observation["queries"].append({
+                    "command": command,
+                    "error": repr(error),
+                })
+                continue
+            query = {
+                "command": command,
+                "returncode": int(proc.returncode),
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+            }
+            observation["queries"].append(query)
+            if proc.returncode == 0:
+                observation["fields"] = fields
+                observation["rows"] = self._parse_accounting_rows(proc.stdout, fields)
+                break
+        return observation
+
+    def _persist_slurm_outcomes(self, tmp: str, attempt_number: int, job_id: str,
+                                task_ids: Sequence[int],
+                                poll_states: Mapping[int, str]) -> str:
+        """Persist raw Slurm accounting and normalized task outcomes."""
+        observation = self._query_slurm_accounting(job_id)
+        observation["job_id"] = str(job_id)
+        observation["last_poll_states"] = {
+            str(task_id): state for task_id, state in poll_states.items()
+        }
+        accounting_path = os.path.join(attempt_folder(tmp, attempt_number),
+                                       "slurm-accounting.json")
+        atomic_write_json(accounting_path, observation)
+
+        task_rows: Dict[int, Dict[str, Dict[str, str]]] = {}
+        pattern = re.compile(rf"^{re.escape(str(job_id))}_(\d+)(?:\.([^|]+))?$")
+        for row in observation.get("rows", []):
+            match = pattern.match(row.get("JobID", ""))
+            if match is None:
+                continue
+            task_id = int(match.group(1))
+            step = match.group(2) or "allocation"
+            task_rows.setdefault(task_id, {})[step] = row
+
+        attempt_root = attempt_folder(tmp, attempt_number)
+        for task_id in task_ids:
+            rows = task_rows.get(int(task_id), {})
+            allocation = rows.get("allocation", {})
+            batch = rows.get("batch", {})
+            state = self._normalise_slurm_state(
+                allocation.get("State") or batch.get("State") or poll_states.get(int(task_id))
+            )
+            exit_code, terminating_signal = self._parse_slurm_exit_code(
+                allocation.get("ExitCode") or batch.get("ExitCode")
+            )
+            elapsed_text = allocation.get("ElapsedRaw") or batch.get("ElapsedRaw")
+            try:
+                elapsed_seconds = float(elapsed_text) if elapsed_text else None
+            except ValueError:
+                elapsed_seconds = None
+            peak_rss_bytes = self._parse_slurm_rss(
+                batch.get("MaxRSS") or allocation.get("MaxRSS")
+            )
+            failed_node = allocation.get("FailedNode") or batch.get("FailedNode") or None
+            stdout_path = os.path.join(attempt_root, "logs", f"slurm-{job_id}_{task_id}.out")
+            stderr_path = os.path.join(attempt_root, "logs", f"slurm-{job_id}_{task_id}.err")
+            traceback_path = os.path.join(attempt_root, "errors", f"{task_id}.txt")
+            succeeded = os.path.exists(os.path.join(tmp, "success", f"{task_id}.success"))
+            write_task_outcome(
+                tmp,
+                attempt_number,
+                {
+                    "task_id": int(task_id),
+                    "backend": self.backend_name,
+                    "attempt_number": int(attempt_number),
+                    "scheduler_task_id": f"{job_id}_{task_id}",
+                    "scheduler_state": state,
+                    "exit_code": exit_code,
+                    "signal": terminating_signal,
+                    "elapsed_seconds": elapsed_seconds,
+                    "peak_rss_bytes": peak_rss_bytes,
+                    "failed_node": failed_node,
+                    "stdout_path": relative_path(tmp, stdout_path),
+                    "stderr_path": relative_path(tmp, stderr_path),
+                    # NFS visibility can lag the scheduler state. Keep the deterministic path
+                    # even when the traceback is not visible to the orchestrator yet.
+                    "traceback_path": relative_path(tmp, traceback_path),
+                    "succeeded": succeeded,
+                    "summary": None,
+                },
+            )
+        return accounting_path
 
     def _job_known(self, job_id: str, attempts: int = 3) -> bool:
         """Whether the job is known to ``sacct``, retrying to tolerate post-submit lag.
@@ -917,8 +1213,21 @@ class SlurmRunner(_DistributedRunner):
                 time.sleep(self.config.poll_interval)
         return False
 
+    @staticmethod
+    def _attempt_outcomes_are_terminal(tmp: str, attempt: Mapping[str, Any]) -> bool:
+        """Return whether persisted outcomes resolve every task in an attempt."""
+        attempt_number = int(attempt["attempt_number"])
+        for task_id in attempt.get("task_ids", []):
+            outcome = read_task_outcome(tmp, attempt_number, int(task_id))
+            if outcome is None:
+                return False
+            state = outcome.get("scheduler_state")
+            if not outcome.get("succeeded") and state not in _TERMINAL_STATES:
+                return False
+        return True
+
     def _poll(self, job_id: str, n_tasks: int, tmp: str, name: str,
-              task_ids: Optional[Sequence[int]] = None) -> None:
+              task_ids: Optional[Sequence[int]] = None) -> Dict[int, str]:
         """Poll ``sacct`` until every task has a visible sentinel or is confirmed dead.
 
         The scheduler ``State`` is not subject to NFS lag, but the ``.success`` sentinels the
@@ -949,6 +1258,7 @@ class SlurmRunner(_DistributedRunner):
         # The bar counts processed blocks across ALL tasks (a resume credits prior progress).
         n_blocks = _total_blocks(tmp, n_tasks)
         counter = _DoneLogCounter(tmp, n_tasks)
+        states: Dict[int, str] = {}
         with tqdm(total=n_blocks, desc=name or None, disable=not name, unit="block") as pbar:
             while len(resolved) < len(poll_ids):
                 states = self._sacct_states(job_id)
@@ -992,6 +1302,7 @@ class SlurmRunner(_DistributedRunner):
                     print(f"\nInterrupted while waiting on slurm job {job_id}. The job was left "
                           f"running; reattach with SlurmRunner(...).reattach({tmp!r}).")
                     raise
+        return states
 
     def reattach(self, tmp_folder: str, name: str = "reattach",
                  pre_cleanup: Optional[Callable[[str], None]] = None) -> Optional[list]:
@@ -1015,9 +1326,15 @@ class SlurmRunner(_DistributedRunner):
             RuntimeError: If the manifest's job is unknown to slurm and the run did not
                 already complete.
         """
-        with open(os.path.join(tmp_folder, "manifest.json")) as f:
-            manifest = json.load(f)
-        job_id, n_tasks = str(manifest["job_id"]), int(manifest["n_tasks"])
+        manifest = load_manifest(tmp_folder, expected_backend=self.backend_name)
+        n_tasks = int(manifest["n_tasks"])
+        attempts = [attempt for attempt in manifest["attempts"] if attempt.get("job_id")]
+        if not attempts:
+            raise RuntimeError(f"Run folder {tmp_folder!r} has no submitted Slurm attempt.")
+        attempt = attempts[-1]
+        attempt_number = int(attempt["attempt_number"])
+        job_id = str(attempt["job_id"])
+        launch_ids = [int(task_id) for task_id in attempt.get("task_ids", [])]
         with open(os.path.join(tmp_folder, "payload.pkl"), "rb") as f:
             payload = cloudpickle.load(f)
         # A reattaching orchestrator unpickles/reduces the per-block results locally, so guard
@@ -1035,14 +1352,27 @@ class SlurmRunner(_DistributedRunner):
         all_done = all(os.path.exists(os.path.join(tmp_folder, "success", f"{t}.success"))
                        for t in range(n_tasks))
         if not all_done:
-            # Only a job that stays unknown to sacct across retries (not registration lag
-            # right after submit, nor a transient error) is treated as unrecoverable.
-            if not self._job_known(job_id):
-                raise RuntimeError(
-                    f"Slurm job {job_id} is not known to the scheduler and the run did not "
-                    f"complete. Inspect {tmp_folder} or resubmit."
+            if not self._attempt_outcomes_are_terminal(tmp_folder, attempt):
+                # Only a job that stays unknown to sacct across retries is unrecoverable.
+                if not self._job_known(job_id):
+                    raise RuntimeError(
+                        f"Slurm job {job_id} is not known to the scheduler and the run did not "
+                        f"complete. Inspect {tmp_folder} or resume it."
+                    )
+                poll_states = self._poll(job_id, n_tasks, tmp_folder, name, task_ids=launch_ids)
+                accounting_path = self._persist_slurm_outcomes(
+                    tmp_folder, attempt_number, job_id, launch_ids, poll_states
                 )
-            self._poll(job_id, n_tasks, tmp_folder, name)
+                succeeded = all(os.path.exists(
+                    os.path.join(tmp_folder, "success", f"{task_id}.success")
+                ) for task_id in launch_ids)
+                update_attempt(
+                    tmp_folder,
+                    attempt_number,
+                    status="succeeded" if succeeded else "failed",
+                    finished_at=utc_now(),
+                    accounting_path=relative_path(tmp_folder, accounting_path),
+                )
 
         results = self._finalize(tmp_folder, n_tasks, tasks, block_ids, has_return_val, name,
                                  pre_cleanup=pre_cleanup)

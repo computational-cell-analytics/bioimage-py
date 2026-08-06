@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from concurrent import futures
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from bioimage_cpp.utils import Blocking
@@ -25,19 +26,45 @@ from .config import RunnerConfig
 _TP_CONTROLLER = ThreadpoolController()
 
 
+@dataclass(frozen=True)
+class TaskFailure:
+    """Diagnostic information for one failed distributed task.
+
+    Backend-specific values are ``None`` when the backend does not provide them. Paths refer to
+    files in the preserved run folder.
+    """
+
+    task_id: int
+    backend: str
+    attempt_number: int
+    scheduler_task_id: Optional[str] = None
+    scheduler_state: Optional[str] = None
+    exit_code: Optional[int] = None
+    signal: Optional[int] = None
+    elapsed_seconds: Optional[float] = None
+    peak_rss_bytes: Optional[int] = None
+    failed_node: Optional[str] = None
+    stdout_path: Optional[str] = None
+    stderr_path: Optional[str] = None
+    traceback_path: Optional[str] = None
+
+
 class RunnerError(RuntimeError):
     """Raised when one or more blocks fail.
 
     Attributes:
         failed_block_ids: The ids of the blocks that failed (re-run with these).
         tmp_folder: The preserved temp folder for distributed jobs (``None`` for local).
+        task_failures: Structured diagnostics for failed distributed tasks.
     """
 
     def __init__(self, message: str, failed_block_ids: Optional[Sequence[int]] = None,
-                 tmp_folder: Optional[str] = None):
+                 tmp_folder: Optional[str] = None, *,
+                 task_failures: Optional[Sequence[TaskFailure]] = None):
         super().__init__(message)
         self.failed_block_ids: List[int] = [int(b) for b in (failed_block_ids or [])]
         self.tmp_folder = tmp_folder
+        self.task_failures: List[TaskFailure] = list(task_failures or [])
 
 
 def run_block(function: ComputeFn, blocking: Blocking, block_id: int,
