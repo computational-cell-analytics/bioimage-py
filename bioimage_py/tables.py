@@ -9,7 +9,7 @@ import math
 import os
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .runner._work import Batch, BatchPlan, BoundaryBatchPlan, RegularBatchPlan
@@ -159,6 +159,7 @@ class TablePartMetadata:
     file_size: int
     schema_fingerprint: str
     checksum: str
+    partition_metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -447,7 +448,11 @@ class TableDataset:
             raise ValueError(f"Table manifest for {self._path!r} has the wrong row count.")
         return record
 
-    def _bind_batches(self, batches: BatchPlan) -> None:
+    def _bind_batches(
+        self,
+        batches: BatchPlan,
+        partition_metadata: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> None:
         if isinstance(batches, RegularBatchPlan):
             work_plan = {
                 "kind": "regular_batches",
@@ -461,6 +466,25 @@ class TableDataset:
                 "boundaries": [int(value) for value in batches.boundaries],
                 "length": len(batches),
             }
+        if partition_metadata is not None:
+            if len(partition_metadata) != len(batches):
+                raise ValueError(
+                    "partition_metadata must contain one record per table batch."
+                )
+            normalized = _normalize_json(
+                list(partition_metadata), "partition_metadata",
+            )
+            for index, record in enumerate(normalized):
+                if not isinstance(record, dict):
+                    raise TypeError(
+                        f"partition_metadata[{index}] must be a mapping."
+                    )
+                overlap = {"start", "stop"}.intersection(record)
+                if overlap:
+                    raise ValueError(
+                        "partition_metadata must not redefine start or stop."
+                    )
+            work_plan["partition_metadata"] = normalized
         path = os.path.join(self._path, _DATASET_FILE)
         record = self._dataset_record()
         if record.get("work_plan") is None:
@@ -471,10 +495,17 @@ class TableDataset:
             })
             _atomic_write_json(path, record)
             record = self._dataset_record()
-        elif record.get("work_plan") != work_plan:
-            raise ValueError(
-                f"Existing table dataset {self._path!r} uses a different batch work plan."
-            )
+        else:
+            existing = record.get("work_plan")
+            if partition_metadata is None and isinstance(existing, dict):
+                existing = {
+                    key: value for key, value in existing.items()
+                    if key != "partition_metadata"
+                }
+            if existing != work_plan:
+                raise ValueError(
+                    f"Existing table dataset {self._path!r} uses a different batch work plan."
+                )
         self._expected_identity = str(record["identity"])
 
     def _descriptor(self) -> Dict[str, str]:
@@ -525,11 +556,17 @@ class TableDataset:
     def _make_part_record(self, batch: Batch, *, row_count: int, file_size: int,
                           checksum: str) -> Dict[str, Any]:
         dataset = self._dataset_record()
+        partition = {"start": int(batch.start), "stop": int(batch.stop)}
+        work_plan = dataset.get("work_plan")
+        if isinstance(work_plan, dict):
+            metadata = work_plan.get("partition_metadata")
+            if metadata is not None:
+                partition.update(metadata[int(batch.batch_id)])
         return {
             "format_version": DATASET_FORMAT_VERSION,
             "dataset_identity": dataset["identity"],
             "batch_id": int(batch.batch_id),
-            "partition": {"start": int(batch.start), "stop": int(batch.stop)},
+            "partition": partition,
             "path": os.path.join(_PARTS_FOLDER, f"{_part_stem(batch.batch_id)}.parquet"),
             "row_count": int(row_count),
             "file_size": int(file_size),
@@ -586,6 +623,10 @@ class TableDataset:
                 batch_id=int(batch.batch_id), start=int(batch.start), stop=int(batch.stop),
                 path=part_path, row_count=row_count, file_size=file_size,
                 schema_fingerprint=str(expected["schema_fingerprint"]), checksum=checksum,
+                partition_metadata={
+                    key: value for key, value in expected["partition"].items()
+                    if key not in ("start", "stop")
+                },
             )
 
         pending_exists = os.path.exists(pending_path)
@@ -607,6 +648,10 @@ class TableDataset:
             batch_id=int(batch.batch_id), start=int(batch.start), stop=int(batch.stop),
             path=part_path, row_count=row_count, file_size=file_size,
             schema_fingerprint=str(expected["schema_fingerprint"]), checksum=checksum,
+            partition_metadata={
+                key: value for key, value in expected["partition"].items()
+                if key not in ("start", "stop")
+            },
         )
 
     def _run_batch(self, function: Any, batch: Batch) -> None:
@@ -681,6 +726,10 @@ class TableDataset:
                 file_size=int(record["file_size"]),
                 schema_fingerprint=str(record["schema_fingerprint"]),
                 checksum=str(record["checksum"]["value"]),
+                partition_metadata={
+                    key: value for key, value in partition.items()
+                    if key not in ("start", "stop")
+                },
             )
 
     def validate(self) -> "TableDataset":

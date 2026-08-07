@@ -28,6 +28,7 @@ def _expected_in_input_order(seg, base, *, resolution, compute_surface):
     expected = expected.loc[base["label"].tolist()].reset_index()
     expected["label"] = expected["label"].astype("uint64")
     expected["n_voxels"] = expected["n_voxels"].astype("uint64")
+    expected["regionprops_excluded"] = False
     return expected
 
 
@@ -89,6 +90,46 @@ def test_file_backed_regionprops_matches_dataframe_and_preserves_order(
     assert result.schema.field("n_voxels").type == pa.uint64()
     assert all(not field.nullable for field in result.schema)
     assert ("surface_area" in result.schema.names) is compute_surface
+    assert result.schema.field("regionprops_excluded").type == pa.bool_()
+
+
+def test_file_backed_regionprops_retains_fallback_rows_above_cutoff(
+    tmp_path, zarr_factory,
+):
+    seg = _segmentation()
+    source = zarr_factory(seg, chunks=(12, 14, 16))
+    base = bp.morphology.morphology(seg)
+    base_path = tmp_path / "base.parquet"
+    base.to_parquet(base_path, index=False)
+    costs = np.prod(np.column_stack([
+        base[f"bb_max_{axis}"] - base[f"bb_min_{axis}"]
+        for axis in ("z", "y", "x")
+    ]), axis=1)
+    cutoff = int(np.sort(costs)[-2])
+
+    result = bp.morphology.regionprops(
+        source,
+        base_path,
+        resolution=(2.0, 1.0, 1.5),
+        compute_surface=True,
+        output_table=tmp_path / "result.parquet",
+        rows_per_batch=2,
+        max_bbox_voxels=cutoff,
+        provenance={"policy": "test"},
+    )
+    actual = result.to_pandas()
+    excluded = actual["regionprops_excluded"]
+    assert excluded.tolist() == (costs > cutoff).tolist()
+    assert int(excluded.sum()) == 1
+    row_index = int(np.flatnonzero(excluded)[0])
+    base_row = base.iloc[row_index]
+    row = actual.iloc[row_index]
+    assert int(row["n_voxels"]) == int(base_row["size"])
+    assert row["area"] == int(base_row["size"]) * 3.0
+    assert np.isnan(row["axis_major_length"])
+    assert np.isnan(row["centroid_z"])
+    assert np.isnan(row["surface_area"])
+    assert result._dataset_record()["parameters"]["provenance"] == {"policy": "test"}
 
 
 def test_raw_parquet_directory_uses_lexical_file_order_and_bounded_ranges(tmp_path):

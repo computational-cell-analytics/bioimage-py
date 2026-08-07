@@ -191,6 +191,7 @@ def test_slurm_file_backed_regionprops(shared_zarr_factory, shared_tmp_path):
     expected = expected.set_index("label").loc[base["label"].tolist()].reset_index()
     expected["label"] = expected["label"].astype("uint64")
     expected["n_voxels"] = expected["n_voxels"].astype("uint64")
+    expected["regionprops_excluded"] = False
 
     result = bp.morphology.regionprops(
         source,
@@ -203,6 +204,29 @@ def test_slurm_file_backed_regionprops(shared_zarr_factory, shared_tmp_path):
     )
 
     pd.testing.assert_frame_equal(result.to_pandas(), expected)
+
+
+def test_slurm_file_backed_morphology(shared_zarr_factory, shared_tmp_path):
+    seg = np.zeros((24, 28, 32), dtype="uint64")
+    seg[2:8, 3:12, 4:14] = 17
+    seg[10:19, 15:25, 18:29] = 2
+    source = shared_zarr_factory(seg, chunks=(12, 14, 16))
+    output_path = os.path.join(shared_tmp_path, "morphology-result.parquet")
+
+    result = bp.morphology.morphology(
+        source,
+        output_table=output_path,
+        block_shape=(12, 14, 16),
+        blocks_per_batch=2,
+        label_partition_size=10,
+        num_workers=2,
+        job_type="slurm",
+        job_config=_cfg(shared_tmp_path),
+    )
+
+    pd.testing.assert_frame_equal(
+        result.to_pandas(), bp.morphology.morphology(seg),
+    )
 
 
 def _make_shared_flaky(marker_path):

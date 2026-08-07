@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 from bioimage_py.runner import RunnerConfig, RunnerError, get_runner
+from bioimage_py.runner._work import RegularBatchPlan
 from bioimage_py.tables import TableDataset
 
 
@@ -81,6 +82,36 @@ def test_table_sink_accepts_and_persists_explicit_boundaries(tmp_path):
             batch_boundaries=[0, 2, 5, 7],
             result_sink=_dataset(path),
         )
+
+
+def test_table_sink_persists_partition_metadata_and_recovers_sidecar(tmp_path):
+    path = tmp_path / "partitioned.parquet"
+    dataset = _dataset(path)
+    batches = RegularBatchPlan(4, 2)
+    dataset._bind_batches(batches, partition_metadata=[
+        {"label_start": 0, "label_stop": 10},
+        {"label_start": 20, "label_stop": 30},
+    ])
+    result = get_runner("local").map_batches(
+        _write_values, 4, batch_size=2, result_sink=dataset,
+    )
+
+    parts = list(result.iter_parts())
+    assert [part.partition_metadata for part in parts] == [
+        {"label_start": 0, "label_stop": 10},
+        {"label_start": 20, "label_stop": 30},
+    ]
+    sidecar = path / "completions" / "part-000000000000.json"
+    sidecar.unlink()
+    recovered = get_runner("local").map_batches(
+        lambda batch, writer: (_ for _ in ()).throw(AssertionError("must reuse")),
+        4,
+        batch_size=2,
+        result_sink=_dataset(path),
+    )
+    assert next(recovered.iter_parts()).partition_metadata == {
+        "label_start": 0, "label_stop": 10,
+    }
 
 
 def test_empty_table_dataset_and_column_selection(tmp_path):

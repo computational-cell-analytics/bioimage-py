@@ -117,9 +117,10 @@ bp.copy(src, out, block_shape=(64, 64, 64), num_workers=8, job_type="slurm",
 
 `resume_from` and `block_ids` are mutually exclusive. Two ops differ: `segmentation.label` has a
 global cross-block merge, so a failed `label` is re-run **whole** (it accepts neither argument);
-`morphology.regionprops` re-runs per object via `item_ids` / `resume_from`. A `local` run keeps no
-temp folder, so re-run it (optionally with `block_ids=e.failed_block_ids`); `resume_from` is rejected
-for `job_type="local"`.
+the DataFrame `morphology.regionprops` path re-runs per object via `item_ids` / `resume_from`. The
+file-backed morphology paths resume durable table batches instead. A `local` run keeps no temp
+folder, so re-run it (optionally with `block_ids=e.failed_block_ids`); `resume_from` is rejected for
+`job_type="local"`.
 
 ## Batch mapping
 
@@ -198,6 +199,40 @@ The runner returns a lightweight `TableDataset`. Use `result.iter_parts()` for p
 `result.to_pandas()` only when you explicitly want to materialize the complete table. Runner cleanup
 never removes the table dataset.
 
+### File-backed base morphology
+
+Set `output_table` to compute base morphology without returning all block tables to the
+orchestrator. The segmentation and optional mask must be reopenable sources.
+
+```python
+base = bp.morphology.morphology(
+    segmentation,
+    output_table="morphology-base.parquet",
+    block_shape=(64, 256, 256),
+    blocks_per_batch=1_000,
+    label_partition_size=1_000_000,
+    num_workers=64,
+    job_type="slurm",
+    job_config=cfg,
+    provenance={"block_mask_fingerprint": mask_fingerprint},
+)
+```
+
+The first stage writes exact, sorted sufficient statistics for bounded batches of image blocks.
+The second stage reduces each populated label range independently. Labels and internal sums remain
+`uint64`; the final table uses `int64` for sizes and bounding boxes and `float64` for centers of
+mass. Sparse and high-valued labels do not pass through floating-point values.
+
+`blocks_per_batch` sets the durable retry unit for the first stage. `label_partition_size` bounds
+the label arrays allocated by each reducer. Final parts include `label_start` and `label_stop`
+partition metadata. A compatible call reuses completed parts. Use `resume_from` with the preserved
+distributed runner folder to resume the failed stage.
+
+The function retains `<output_table>.morphology-work` after a failure. This directory contains the
+partial table and disk-backed label index. It removes the directory only after the final dataset
+passes validation. The returned `TableDataset` has the same columns and bounding-box conventions as
+the DataFrame path.
+
 ### File-backed `regionprops`
 
 Set `output_table` to process a large base morphology table in bounded row batches. This path
@@ -213,9 +248,11 @@ features = bp.morphology.regionprops(
     output_table="regionprops.parquet",
     rows_per_batch=100_000,
     target_batch_cost=2_000_000_000,
+    max_bbox_voxels=2_000_000_000,
     num_workers=64,
     job_type="slurm",
     job_config=cfg,
+    provenance={"segmentation_revision": "final-v1"},
 )
 ```
 
@@ -229,9 +266,17 @@ row limit. An object whose bounding box exceeds the target gets a one-row batch.
 the bounding-box columns in bounded chunks. Compatible reruns and resumes reuse the stored
 boundaries without rescanning the input table.
 
+`max_bbox_voxels` is optional. An object above this inclusive limit remains in the output, but the
+worker does not read its segmentation crop. The fallback row derives `n_voxels`, `area`, `extent`,
+`equivalent_diameter_area`, and the bounding box from the base table. It stores `NaN` for axis
+lengths, centroid coordinates, and surface area. The non-null `regionprops_excluded` column is
+`True` for these rows and `False` for processed rows. The base table must include `size` when this
+limit is set.
+
 The file-backed schema uses `uint64` for `label` and `n_voxels`, `int64` for bounding boxes, and
-`float64` for measurements. It adds `surface_area` only for a 3D input when `compute_surface=True`.
-Use `features.to_pandas()` only when the complete result fits in memory.
+`float64` for measurements. It always includes `regionprops_excluded`. It adds `surface_area` only
+for a 3D input when `compute_surface=True`. Use `features.to_pandas()` only when the complete result
+fits in memory.
 
 A compatible fresh call validates and skips completed parts. Use `resume_from` to resume a failed
 distributed run with its original task assignments. The file-backed path does not accept
