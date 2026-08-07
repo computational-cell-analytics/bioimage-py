@@ -17,9 +17,12 @@ from ..sources.dispatch import SourceLike, as_source
 from ..util import (ComputeFn, derive_block_shape, get_blocking, group_blocks_by_shard,
                     maybe_warn_imbalance, normalize_halo)
 from ._work import (Batch, BatchPlan, BoundaryBatchPlan, ExplicitIdsSpec, RangeSpec,
-                    RegularBatchPlan, ShardRoutingPlan, WorkSpec, assignment_length,
-                    is_batch_plan, iter_assignment, logical_size, make_shard_routing)
+                    ReductionBatchPlan, RegularBatchPlan, ShardRoutingPlan, WorkSpec,
+                    assignment_length, is_batch_plan, iter_assignment, logical_size,
+                    make_shard_routing)
 from .config import RunnerConfig
+from ._reduction import reduce_batch
+from .reducer import Reducer, _normalize_reduction_batch_size
 
 if TYPE_CHECKING:
     from ..tables import TableDataset
@@ -71,7 +74,7 @@ class RunnerError(RuntimeError):
     Attributes:
         failed_block_ids: The failed IDs as a list. Access materializes compact ranges.
         failed_block_count: The number of failed IDs.
-        failed_batches: The failed batches for :meth:`Runner.map_batches`.
+        failed_batches: The failed durable batches for batch and reducer runs.
         tmp_folder: The preserved temp folder for distributed jobs (``None`` for local).
         task_failures: Structured diagnostics for failed distributed tasks.
     """
@@ -160,7 +163,9 @@ class Runner(ABC):
         roi: Optional[Tuple[slice, ...]] = None,
         pre_cleanup: Optional[Callable[[str], None]] = None,
         resume_from: Optional[str] = None,
-    ) -> Optional[list]:
+        reducer: Optional[Reducer[Any, Any, Any]] = None,
+        reduction_batch_size: Optional[int] = None,
+    ) -> Any:
         """Run ``function`` block-wise over the inputs/outputs.
 
         Args:
@@ -188,10 +193,14 @@ class Runner(ABC):
                 ``function``/``inputs``/``outputs``/``block_shape``/... from this call are
                 **ignored** -- pass ``resume_from`` to *finish the same call*, not to start a
                 new one. Mutually exclusive with ``block_ids``.
+            reducer: Optional associative reducer for bounded result collection. This mode
+                requires ``has_return_val=True`` and does not support output arrays.
+            reduction_batch_size: Logical results per durable reducer batch. The default is
+                1,000 when ``reducer`` is set.
 
         Returns:
-            The list of per-block return values (in ``block_ids`` order) if
-            ``has_return_val``, else ``None``.
+            The reducer result when ``reducer`` is set. Otherwise, returns the ordered
+            per-block values when ``has_return_val`` is true, or ``None``.
         """
         if resume_from is not None:
             if block_ids is not None:
@@ -202,6 +211,14 @@ class Runner(ABC):
         inputs = [as_source(i) for i in inputs]
         outputs = [as_source(o) for o in outputs]
         mask_source = as_source(mask) if mask is not None else None
+        if reducer is not None:
+            if not has_return_val:
+                raise ValueError("reducer requires has_return_val=True.")
+            if outputs:
+                raise ValueError("reducer mode does not support output arrays.")
+            reduction_batch_size = _normalize_reduction_batch_size(reduction_batch_size)
+        elif reduction_batch_size is not None:
+            raise ValueError("reduction_batch_size requires reducer.")
 
         domain = inputs[0] if inputs else (outputs[0] if outputs else None)
         if domain is None:
@@ -234,13 +251,15 @@ class Runner(ABC):
             work: WorkSpec = RangeSpec(0, int(blocking.number_of_blocks))
         else:
             work = ExplicitIdsSpec(block_ids)
+        if reducer is not None:
+            work = ReductionBatchPlan(work, reduction_batch_size)
 
         results = self._execute(
             function=function, inputs=inputs, outputs=outputs, mask=mask_source,
             blocking=blocking, block_ids=work, halo=halo_n,
             has_return_val=has_return_val, num_workers=num_workers, name=name,
             shape=tuple(domain.shape), block_shape=block_shape, roi=roi,
-            pre_cleanup=pre_cleanup,
+            pre_cleanup=pre_cleanup, reducer=reducer,
         )
         return results if has_return_val else None
 
@@ -255,7 +274,9 @@ class Runner(ABC):
         name: str = "",
         pre_cleanup: Optional[Callable[[str], None]] = None,
         resume_from: Optional[str] = None,
-    ) -> Optional[list]:
+        reducer: Optional[Reducer[Any, Any, Any]] = None,
+        reduction_batch_size: Optional[int] = None,
+    ) -> Any:
         """Map ``function(index)`` over item indices in parallel, across any backend.
 
         Unlike :meth:`run`, this is not block-wise: there is no domain, blocking, sources or
@@ -278,10 +299,14 @@ class Runner(ABC):
             resume_from: Distributed backends only; the preserved temp folder of a failed run
                 (see :meth:`run`). Re-runs only the incomplete items and merges with those
                 already done. Mutually exclusive with ``item_ids``.
+            reducer: Optional associative reducer for bounded result collection. This mode
+                requires ``has_return_val=True``.
+            reduction_batch_size: Logical results per durable reducer batch. The default is
+                1,000 when ``reducer`` is set.
 
         Returns:
-            The list of per-item return values (in ``item_ids`` order) if ``has_return_val``,
-            else ``None``.
+            The reducer result when ``reducer`` is set. Otherwise, returns the ordered
+            per-item values when ``has_return_val`` is true, or ``None``.
 
         Raises:
             ValueError: If neither ``n_items`` nor ``item_ids`` is given.
@@ -300,10 +325,18 @@ class Runner(ABC):
             work: WorkSpec = RangeSpec(0, int(n_items))
         else:
             work = ExplicitIdsSpec(item_ids)
+        if reducer is not None:
+            if not has_return_val:
+                raise ValueError("reducer requires has_return_val=True.")
+            reduction_batch_size = _normalize_reduction_batch_size(reduction_batch_size)
+            work = ReductionBatchPlan(work, reduction_batch_size)
+        elif reduction_batch_size is not None:
+            raise ValueError("reduction_batch_size requires reducer.")
 
         results = self._execute_map(
             function=function, item_ids=work, has_return_val=has_return_val,
             num_workers=num_workers, name=name, pre_cleanup=pre_cleanup,
+            reducer=reducer,
         )
         return results if has_return_val else None
 
@@ -382,7 +415,7 @@ class Runner(ABC):
         return results if has_return_val or result_sink is not None else None
 
     def _resume_entry(self, tmp_folder: str, *, name: str,
-                      pre_cleanup: Optional[Callable[[str], None]]) -> Optional[list]:
+                      pre_cleanup: Optional[Callable[[str], None]]) -> Any:
         """Resume a failed run from its temp folder; overridden by distributed runners.
 
         The local runner keeps no temp folder, so resuming is not possible here.
@@ -442,8 +475,9 @@ class Runner(ABC):
         block_shape: Tuple[int, ...],
         roi: Optional[Tuple[slice, ...]],
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> Optional[List[Any]]:
-        """Execute the per-block function over ``block_ids`` and return ordered results."""
+        reducer: Optional[Reducer[Any, Any, Any]] = None,
+    ) -> Any:
+        """Execute the per-block function and return its collected result."""
         ...
 
     @abstractmethod
@@ -456,8 +490,9 @@ class Runner(ABC):
         num_workers: int,
         name: str,
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> Optional[List[Any]]:
-        """Execute ``function(index)`` over ``item_ids`` and return ordered results."""
+        reducer: Optional[Reducer[Any, Any, Any]] = None,
+    ) -> Any:
+        """Execute ``function(index)`` and return its collected result."""
         ...
 
     @abstractmethod
@@ -496,9 +531,17 @@ class LocalRunner(Runner):
         block_shape: Tuple[int, ...],
         roi: Optional[Tuple[slice, ...]],
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> Optional[List[Any]]:
+        reducer: Optional[Reducer[Any, Any, Any]] = None,
+    ) -> Any:
         def call_one(bid: int) -> Any:
             return run_block(function, blocking, bid, inputs, outputs, mask, halo)
+
+        if reducer is not None:
+            if not isinstance(block_ids, ReductionBatchPlan):
+                raise TypeError("Reducer execution requires a reduction batch plan.")
+            return self._run_reduction_pool(
+                block_ids, call_one, reducer, num_workers, name, unit="block",
+            )
 
         shard_shapes = [output.shards for output in outputs if output.shards is not None]
         if shard_shapes and isinstance(block_ids, RangeSpec) and block_ids == RangeSpec(
@@ -536,7 +579,15 @@ class LocalRunner(Runner):
         num_workers: int,
         name: str,
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> Optional[List[Any]]:
+        reducer: Optional[Reducer[Any, Any, Any]] = None,
+    ) -> Any:
+        if reducer is not None:
+            if not isinstance(item_ids, ReductionBatchPlan):
+                raise TypeError("Reducer execution requires a reduction batch plan.")
+            return self._run_reduction_pool(
+                item_ids, lambda item_id: function(int(item_id)), reducer,
+                num_workers, name, unit="item",
+            )
         return self._run_pool(
             item_ids, lambda item_id: function(int(item_id)), num_workers, name,
             has_return_val=has_return_val, unit="item",
@@ -580,6 +631,72 @@ class LocalRunner(Runner):
             batches, function, num_workers, name, has_return_val=has_return_val,
             unit="batch",
         )
+
+    @staticmethod
+    def _run_reduction_pool(
+        plan: ReductionBatchPlan,
+        call_one: Callable[[int], Any],
+        reducer: Reducer[Any, Any, Any],
+        num_workers: int,
+        name: str,
+        *,
+        unit: str,
+    ) -> Any:
+        """Reduce batches locally with deterministic, bounded collection."""
+        worker_count = max(1, int(num_workers))
+        pending_limit = 2 * worker_count
+        pending: dict[int, Tuple[Batch, futures.Future[Any]]] = {}
+        next_submit = 0
+        next_merge = 0
+        failed_batches: List[Batch] = []
+        first_error: Optional[BaseException] = None
+        stop_submitting = False
+        accumulator = reducer.initial()
+
+        def invoke(batch: Batch) -> Any:
+            with _TP_CONTROLLER.limit(limits=1):
+                return reduce_batch(batch, plan, call_one, reducer)
+
+        def submit(executor: futures.ThreadPoolExecutor) -> None:
+            nonlocal next_submit
+            while (not stop_submitting and len(pending) < pending_limit
+                   and next_submit < len(plan)):
+                batch = plan[next_submit]
+                pending[next_submit] = (batch, executor.submit(invoke, batch))
+                next_submit += 1
+
+        with futures.ThreadPoolExecutor(worker_count) as executor:
+            submit(executor)
+            with tqdm(total=plan.n_items, desc=name or None, disable=not name) as progress:
+                while pending:
+                    batch, future = pending.pop(next_merge)
+                    try:
+                        batch_accumulator = future.result()
+                    except Exception as error:  # noqa: BLE001
+                        failed_batches.append(batch)
+                        stop_submitting = True
+                        if first_error is None:
+                            first_error = error
+                    else:
+                        if first_error is None:
+                            accumulator = reducer.merge(accumulator, batch_accumulator)
+                        progress.update(batch.size)
+                    next_merge += 1
+                    submit(executor)
+
+        if next_submit < len(plan):
+            failed_batches.extend(plan[index] for index in range(next_submit, len(plan)))
+        if failed_batches:
+            failed_specs = [plan.batch_items(batch) for batch in failed_batches]
+            failed_count = sum(len(spec) for spec in failed_specs)
+            raise RunnerError(
+                f"{failed_count} {unit}(s) in {len(failed_batches)} reduction batch(es) "
+                f"failed or were not started in '{name or 'run'}'. First error: "
+                f"{first_error!r}",
+                failed_id_specs=failed_specs,
+                failed_batches=failed_batches,
+            )
+        return reducer.finalize(accumulator)
 
     @staticmethod
     def _run_pool(work: WorkSpec, call_one: Callable[[Any], Any], num_workers: int,

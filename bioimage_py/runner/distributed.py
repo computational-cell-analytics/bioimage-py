@@ -29,12 +29,14 @@ from ._diagnostics import (append_attempt, atomic_write_json, attempt_folder, cr
                            latest_task_outcome, load_manifest, outcome_to_failure,
                            read_task_outcome, relative_path, update_attempt, utc_now,
                            write_task_outcome)
-from ._work import (AssignmentValues, Batch, BatchPlan, ExplicitIdsSpec, WorkSpec,
-                    assignment_length, is_batch_plan, iter_assignment, load_work_spec,
-                    logical_size, make_shard_routing, partition_slices,
-                    persist_routed_positions, persist_work_spec)
+from ._reduction import read_accumulator
+from ._work import (AssignmentValues, Batch, BatchPlan, ExplicitIdsSpec,
+                    ReductionBatchPlan, WorkSpec, assignment_length, is_batch_plan,
+                    iter_assignment, load_work_spec, logical_size, make_shard_routing,
+                    partition_slices, persist_routed_positions, persist_work_spec)
 from .base import Runner, RunnerError, TaskFailure
 from .config import RunnerConfig, SlurmConfig
+from .reducer import Reducer
 
 if TYPE_CHECKING:
     from ..tables import TableDataset
@@ -241,7 +243,8 @@ class _DistributedRunner(Runner):
         block_shape: Tuple[int, ...],
         roi: Optional[Tuple[slice, ...]],
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> Optional[List[Any]]:
+        reducer: Optional[Reducer[Any, Any, Any]] = None,
+    ) -> Any:
         # Validate up front that every source can be reopened on a worker (file-backed).
         # to_spec() raises here for numpy inputs, the actionable "numpy is local-only" failure.
         self._require_reopenable(inputs, outputs, mask)
@@ -261,7 +264,7 @@ class _DistributedRunner(Runner):
             routing = make_shard_routing(blocking, shard_shapes)
         return self._run_work(
             function, block_ids, payload_extra, has_return_val, num_workers, name,
-            pre_cleanup, routing=routing,
+            pre_cleanup, routing=routing, reducer=reducer,
         )
 
     def _execute_map(
@@ -273,9 +276,10 @@ class _DistributedRunner(Runner):
         num_workers: int,
         name: str,
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> Optional[List[Any]]:
+        reducer: Optional[Reducer[Any, Any, Any]] = None,
+    ) -> Any:
         return self._run_work(function, item_ids, {"mode": "map"}, has_return_val,
-                              num_workers, name, pre_cleanup)
+                              num_workers, name, pre_cleanup, reducer=reducer)
 
     def _execute_batches(
         self,
@@ -302,16 +306,20 @@ class _DistributedRunner(Runner):
         pre_cleanup: Optional[Callable[[str], None]],
         routing: Optional[Any] = None,
         result_sink: Optional["TableDataset"] = None,
+        reducer: Optional[Reducer[Any, Any, Any]] = None,
     ) -> Any:
         """Persist compact work, launch tasks, and finalize the run."""
         tmp = tempfile.mkdtemp(prefix="bioimage_py_", dir=self.config.tmp_root)
         for sub in ("results", "success", "error", "timings", "progress", "work"):
             os.makedirs(os.path.join(tmp, sub), exist_ok=True)
+        if reducer is not None:
+            os.makedirs(os.path.join(tmp, "accumulators"), exist_ok=True)
 
         versions = _env_versions()
         payload = {
             "function": function,
             "has_return_val": bool(has_return_val),
+            "reducer": reducer,
             "num_workers": int(num_workers),  # persisted so resume() can relaunch without it
             "versions": versions,
             "python": versions["python"],  # legacy alias; an older harness still finds it
@@ -356,9 +364,16 @@ class _DistributedRunner(Runner):
             assignments=assignments,
             logical_items=logical_items,
             result_sink=(result_sink._descriptor() if result_sink is not None else None),
+            result_mode=("reducer" if reducer is not None else
+                         "table" if result_sink is not None else
+                         "ordered" if has_return_val else "none"),
         )
 
-        if result_sink is None:
+        if reducer is not None:
+            if not isinstance(work, ReductionBatchPlan):
+                raise TypeError("Reducer execution requires a reduction batch plan.")
+            incomplete = self._reconcile_reduction_progress(tmp, work, assignments)
+        elif result_sink is None:
             incomplete = None
         else:
             incomplete = self._reconcile_table_progress(tmp, result_sink, work, assignments)
@@ -379,6 +394,17 @@ class _DistributedRunner(Runner):
         """Collect a complete run or raise with compact assignment suffixes."""
         manifest, work, assignments = _manifest_work(tmp)
         n_tasks = int(manifest["n_tasks"])
+        if manifest.get("result_mode") == "reducer":
+            if not isinstance(work, ReductionBatchPlan):
+                raise ValueError("A reducer run requires a reduction batch plan.")
+            with open(os.path.join(tmp, "payload.pkl"), "rb") as file:
+                payload = cloudpickle.load(file)
+            reducer = payload.get("reducer")
+            if reducer is None:
+                raise ValueError("A reducer run has no serialized reducer.")
+            return self._finalize_reduction(
+                tmp, work, assignments, reducer, name, pre_cleanup,
+            )
         sink_descriptor = manifest.get("result_sink")
         if sink_descriptor is not None:
             from ..tables import TableDataset, TablePartsError
@@ -438,6 +464,93 @@ class _DistributedRunner(Runner):
             except Exception as err:  # noqa: BLE001 - best-effort callback
                 print(f"pre_cleanup callback failed for {tmp}: {err!r}")
         shutil.rmtree(tmp, ignore_errors=True)
+
+    def _finalize_reduction(
+        self,
+        tmp: str,
+        work: ReductionBatchPlan,
+        assignments: Sequence[Mapping[str, Any]],
+        reducer: Reducer[Any, Any, Any],
+        name: str,
+        pre_cleanup: Optional[Callable[[str], None]],
+    ) -> Any:
+        """Validate and stream-merge durable batch accumulators."""
+        invalid_batches = []
+        accumulator = reducer.initial()
+        for batch in work:
+            valid, batch_accumulator = read_accumulator(tmp, batch)
+            if not valid:
+                invalid_batches.append(batch)
+                continue
+            accumulator = reducer.merge(accumulator, batch_accumulator)
+
+        if invalid_batches:
+            self._reconcile_reduction_progress(tmp, work, assignments)
+            invalid_ids = {batch.batch_id for batch in invalid_batches}
+            failed_tasks = []
+            for task_id, assignment in enumerate(assignments):
+                if any(isinstance(value, Batch) and value.batch_id in invalid_ids
+                       for _, value in iter_assignment(work, assignment)):
+                    failed_tasks.append(task_id)
+            task_failures = self._task_failures(tmp, failed_tasks)
+            failed_specs = [work.batch_items(batch) for batch in invalid_batches]
+            failed_count = sum(len(spec) for spec in failed_specs)
+            raise RunnerError(
+                f"{failed_count} logical item(s) in {len(invalid_batches)} reduction "
+                f"batch(es) have missing or invalid accumulators in '{name or 'run'}'. "
+                f"Temp folder preserved for debugging: {tmp}.",
+                tmp_folder=tmp,
+                task_failures=task_failures,
+                failed_id_specs=failed_specs,
+                failed_batches=invalid_batches,
+            )
+
+        result = reducer.finalize(accumulator)
+        self._cleanup_success(tmp, pre_cleanup)
+        return result
+
+    @staticmethod
+    def _reconcile_reduction_progress(
+        tmp: str,
+        work: ReductionBatchPlan,
+        assignments: Sequence[Mapping[str, Any]],
+    ) -> List[int]:
+        """Set each journal to the longest prefix with valid accumulators."""
+        incomplete = []
+        for task_id, assignment in enumerate(assignments):
+            completed_units = 0
+            completed_items = 0
+            for _, value in iter_assignment(work, assignment):
+                if not isinstance(value, Batch):
+                    raise ValueError("A reducer assignment contains non-batch work.")
+                valid, _ = read_accumulator(tmp, value)
+                if not valid:
+                    break
+                completed_units += 1
+                completed_items += logical_size(value)
+
+            journal_path = os.path.join(tmp, "progress", f"{task_id}.bin")
+            if completed_units:
+                with open(journal_path, "wb") as journal:
+                    journal.write(_COMPLETION_RECORD.pack(completed_units, completed_items))
+                    journal.flush()
+                    os.fsync(journal.fileno())
+            else:
+                try:
+                    os.unlink(journal_path)
+                except FileNotFoundError:
+                    pass
+
+            success_path = os.path.join(tmp, "success", f"{task_id}.success")
+            if completed_units == assignment_length(assignment):
+                open(success_path, "a").close()
+            else:
+                incomplete.append(task_id)
+                try:
+                    os.unlink(success_path)
+                except FileNotFoundError:
+                    pass
+        return incomplete
 
     @staticmethod
     def _reconcile_table_progress(
@@ -575,16 +688,16 @@ class _DistributedRunner(Runner):
         raise NotImplementedError
 
     def _resume_entry(self, tmp_folder: str, *, name: str,
-                      pre_cleanup: Optional[Callable[[str], None]]) -> Optional[list]:
+                      pre_cleanup: Optional[Callable[[str], None]]) -> Any:
         """Distributed override of :meth:`Runner._resume_entry`: resume from the temp folder."""
         return self.resume(tmp_folder, name=name or "resume", pre_cleanup=pre_cleanup)
 
     def resume(self, tmp_folder: str, *, name: str = "resume", num_workers: Optional[int] = None,
-               pre_cleanup: Optional[Callable[[str], None]] = None) -> Optional[list]:
+               pre_cleanup: Optional[Callable[[str], None]] = None) -> Any:
         """Resume a previously-failed run from its preserved temp folder.
 
-        The runner relaunches tasks with incomplete assignment prefixes. It then collects all
-        persisted results in the original work order.
+        The runner relaunches tasks with incomplete assignment prefixes. It then collects or
+        reduces the persisted results in the original work order.
 
         Args:
             tmp_folder: The preserved temp folder (``RunnerError.tmp_folder``).
@@ -593,7 +706,7 @@ class _DistributedRunner(Runner):
             pre_cleanup: Optional ``pre_cleanup(tmp)`` callback forwarded to :meth:`_finalize`.
 
         Returns:
-            The ordered work-unit results, or ``None`` for a no-return run.
+            The reducer result, ordered work-unit results, or ``None`` for a no-return run.
         """
         manifest = load_manifest(tmp_folder, expected_backend=self.backend_name)
         with open(os.path.join(tmp_folder, "payload.pkl"), "rb") as f:
@@ -605,7 +718,13 @@ class _DistributedRunner(Runner):
         _, work, assignments = _manifest_work(tmp_folder)
         n_tasks = int(manifest["n_tasks"])
         sink_descriptor = manifest.get("result_sink")
-        if sink_descriptor is None:
+        if manifest.get("result_mode") == "reducer":
+            if not isinstance(work, ReductionBatchPlan):
+                raise ValueError("A reducer run requires a reduction batch plan.")
+            incomplete = self._reconcile_reduction_progress(
+                tmp_folder, work, assignments,
+            )
+        elif sink_descriptor is None:
             incomplete = [
                 task_id for task_id, assignment in enumerate(assignments)
                 if _completion_counts(tmp_folder, task_id)[0] < assignment_length(assignment)
@@ -1324,7 +1443,7 @@ class SlurmRunner(_DistributedRunner):
         return states
 
     def reattach(self, tmp_folder: str, name: str = "reattach",
-                 pre_cleanup: Optional[Callable[[str], None]] = None) -> Optional[list]:
+                 pre_cleanup: Optional[Callable[[str], None]] = None) -> Any:
         """Reattach to a previously submitted run and finalize it.
 
         Picks a run back up from its manifest (e.g. after the orchestrating login-node
@@ -1338,7 +1457,7 @@ class SlurmRunner(_DistributedRunner):
                 folder is removed (forwarded to :meth:`_finalize`).
 
         Returns:
-            The ordered work-unit results, or ``None`` for a no-return run.
+            The reducer result, ordered work-unit results, or ``None`` for a no-return run.
 
         Raises:
             RunnerError: If any task failed (sentinel missing).

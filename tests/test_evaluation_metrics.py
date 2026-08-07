@@ -1,5 +1,6 @@
 """Correctness tests for the evaluation metrics, validated against skimage / elf references."""
 import numpy as np
+import pytest
 from skimage.metrics import variation_of_information as voi_ref
 
 import bioimage_py as bp
@@ -255,6 +256,14 @@ def test_dice_identical_and_disjoint():
     assert np.isclose(bp.evaluation.dice_score(a, b), 0.0)
 
 
+def test_dice_all_masked_returns_zero():
+    a = np.ones((8, 8), dtype="uint8")
+    mask = np.zeros_like(a)
+    assert bp.evaluation.dice_score(
+        a, a, block_shape=(4, 4), num_workers=2, mask=mask,
+    ) == 0.0
+
+
 def test_dice_against_reference(rng):
     a = rng.integers(0, 5, size=(40, 40))
     b = rng.integers(0, 5, size=(40, 40))
@@ -263,6 +272,22 @@ def test_dice_against_reference(rng):
     fa, fb = rng.random((40, 40)), rng.random((40, 40))
     assert np.isclose(bp.evaluation.dice_score(fa, fb, threshold_seg=None, threshold_gt=None),
                       _dice_ref(fa, fb, ts=None, tg=None))
+
+
+@pytest.mark.parametrize("batch_size", [1, 3, 1_000])
+def test_dice_reducer_batch_parity(zarr_factory, rng, batch_size):
+    a = rng.integers(0, 5, size=(40, 40))
+    b = rng.integers(0, 5, size=(40, 40))
+    za = zarr_factory(a, chunks=(8, 8))
+    zb = zarr_factory(b, chunks=(8, 8))
+    score = bp.evaluation.dice_score(
+        za,
+        zb,
+        block_shape=(8, 8),
+        num_workers=3,
+        reduction_batch_size=batch_size,
+    )
+    assert np.isclose(score, _dice_ref(a, b))
 
 
 # --- symmetric best dice --------------------------------------------------------------

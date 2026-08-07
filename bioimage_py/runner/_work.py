@@ -152,12 +152,57 @@ class BoundaryBatchPlan(Sequence[Batch]):
 
 
 BatchPlan = Union[RegularBatchPlan, BoundaryBatchPlan]
-WorkSpec = Union[RangeSpec, ExplicitIdsSpec, BatchPlan]
+ItemWorkSpec = Union[RangeSpec, ExplicitIdsSpec]
 
 
-def is_batch_plan(value: object) -> TypeGuard[BatchPlan]:
-    """Return whether ``value`` is a regular or boundary-based batch plan."""
-    return isinstance(value, (RegularBatchPlan, BoundaryBatchPlan))
+@dataclass(frozen=True)
+class ReductionBatchPlan(Sequence[Batch]):
+    """A compact batch plan over an ordered item work specification."""
+
+    items: ItemWorkSpec
+    batch_size: int
+
+    def __post_init__(self) -> None:
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+
+    @property
+    def n_items(self) -> int:
+        """Return the logical item count."""
+        return len(self.items)
+
+    def __len__(self) -> int:
+        return int(ceil(len(self.items) / self.batch_size)) if self.items else 0
+
+    def __iter__(self) -> Iterator[Batch]:
+        for batch_id in range(len(self)):
+            yield self[batch_id]
+
+    def __getitem__(self, index: Union[int, slice]) -> Union[Batch, Tuple[Batch, ...]]:
+        if isinstance(index, slice):
+            return tuple(self[i] for i in range(*index.indices(len(self))))
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        start = index * self.batch_size
+        return Batch(index, start, min(start + self.batch_size, len(self.items)))
+
+    def batch_items(self, batch: Batch) -> ItemWorkSpec:
+        """Return the ordered item specification for one batch."""
+        expected = self[batch.batch_id]
+        if expected != batch:
+            raise ValueError(f"Batch {batch!r} does not match reduction batch {expected!r}.")
+        return self.items[batch.start:batch.stop]  # type: ignore[return-value]
+
+
+BatchWorkSpec = Union[BatchPlan, ReductionBatchPlan]
+WorkSpec = Union[ItemWorkSpec, BatchWorkSpec]
+
+
+def is_batch_plan(value: object) -> TypeGuard[BatchWorkSpec]:
+    """Return whether ``value`` is a batch work specification."""
+    return isinstance(value, (RegularBatchPlan, BoundaryBatchPlan, ReductionBatchPlan))
 
 
 def logical_size(value: Union[int, Batch]) -> int:
@@ -195,6 +240,14 @@ def persist_work_spec(tmp: str, work: WorkSpec) -> Dict[str, Any]:
             "boundaries": [int(value) for value in work.boundaries],
             "length": len(work),
         }
+    if isinstance(work, ReductionBatchPlan):
+        return {
+            "kind": "reduction_batches",
+            "items": persist_work_spec(tmp, work.items),
+            "n_items": int(work.n_items),
+            "batch_size": int(work.batch_size),
+            "length": len(work),
+        }
 
     folder = os.path.join(tmp, "work")
     os.makedirs(folder, exist_ok=True)
@@ -227,6 +280,14 @@ def load_work_spec(tmp: str, descriptor: Mapping[str, Any]) -> WorkSpec:
         return RegularBatchPlan(int(descriptor["n_items"]), int(descriptor["batch_size"]))
     if kind == "boundary_batches":
         return BoundaryBatchPlan(tuple(int(value) for value in descriptor["boundaries"]))
+    if kind == "reduction_batches":
+        items = load_work_spec(tmp, descriptor["items"])
+        if not isinstance(items, (RangeSpec, ExplicitIdsSpec)):
+            raise ValueError("A reduction batch plan requires scalar item work.")
+        plan = ReductionBatchPlan(items, int(descriptor["batch_size"]))
+        if plan.n_items != int(descriptor["n_items"]):
+            raise ValueError("Reduction batch plan has an inconsistent item count.")
+        return plan
     if kind != "explicit_ids":
         raise ValueError(f"Unsupported work specification kind {kind!r}.")
     if descriptor.get("dtype") != "int64":

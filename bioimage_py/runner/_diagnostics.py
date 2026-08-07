@@ -45,7 +45,8 @@ def create_manifest(tmp: str, *, backend: str, name: str, n_tasks: int,
                     work_plan: Optional[Mapping[str, Any]] = None,
                     assignments: Optional[Sequence[Mapping[str, Any]]] = None,
                     logical_items: Optional[int] = None,
-                    result_sink: Optional[Mapping[str, Any]] = None) -> None:
+                    result_sink: Optional[Mapping[str, Any]] = None,
+                    result_mode: Optional[str] = None) -> None:
     """Create the versioned run manifest before the first launch attempt."""
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -61,6 +62,8 @@ def create_manifest(tmp: str, *, backend: str, name: str, n_tasks: int,
         "logical_items": logical_items,
         "attempts": [],
     }
+    if result_mode is not None:
+        manifest["result_mode"] = result_mode
     if result_sink is not None:
         manifest["result_sink"] = dict(result_sink)
     atomic_write_json(os.path.join(tmp, "manifest.json"), manifest)

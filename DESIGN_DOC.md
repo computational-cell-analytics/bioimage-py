@@ -66,7 +66,12 @@ A `Block` has no `roi`/slice member — it carries `begin`/`end` coordinate list
 
 There are two **orthogonal** output channels, and a given function may use either or both:
 - **Output sources** (`outputs`): large array results written in place to storage. These never travel back to the master.
-- **Return value** (`has_return_val=True`): a *small* value per block (e.g. a scalar or a tiny array) that the runner collects and the caller reduces locally. The local reduction must be associative and commutative, since block order is not guaranteed. *Limitation (deferred):* the master currently accumulates **all** per-block return values in memory (`_collect`) before reducing, so a run with very many blocks or large per-block returns is bounded by master RAM. An incremental/streaming reduction — folding each result into the accumulator as it arrives, rather than materializing the full list — is a future improvement; it relies only on the associativity/commutativity already required here.
+- **Return value** (`has_return_val=True`): a value per block. Without a reducer, the runner returns an ordered list and uses memory proportional to the block count. With a `Reducer`, each worker combines a durable batch into one small accumulator. The orchestrator merges these accumulators in batch order with bounded memory.
+
+Reducer mode supports read-only jobs. It does not support output sources. The reducer creates a new
+identity accumulator, adds one logical result, merges two accumulators, and converts the complete
+accumulator to the public result. Merge must be associative. The runner preserves logical order, so
+merge does not need to be commutative.
 
 ### Runner configuration
 
@@ -135,6 +140,24 @@ def _compute(block, inputs, outputs, mask):
     return np.max(input_[roi][block_mask])
 
 
+class _MaximumReducer:
+    def initial(self):
+        return None
+
+    def update(self, accumulator, value):
+        return self.merge(accumulator, value)
+
+    def merge(self, left, right):
+        if left is None:
+            return right
+        if right is None:
+            return left
+        return np.maximum(left, right)
+
+    def finalize(self, accumulator):
+        return accumulator
+
+
 def max(
     input: SourceLike,  # Any source-like object; numpy arrays restrict execution to local.
     num_workers: int = 1,  # Number of parallel workers.
@@ -169,10 +192,8 @@ def max(
     # outputs is derived from the arguments to run(), so there is no separate counts step.
     runner = get_runner(job_type, config=job_config)
 
-    # run() validates inputs/outputs, derives the block shape if None, builds the (cloudpickled) payload,
-    # provides each block's inputs/outputs/mask and the block descriptor to the function, records per-block
-    # success, updates progress, and returns the collected return values (here one per non-empty block).
-    results = runner.run(
+    # run() reduces block results in durable batches and returns the final maximum.
+    result = runner.run(
         function=_compute,
         inputs=[input],
         outputs=[],
@@ -182,13 +203,12 @@ def max(
         block_ids=block_ids,
         has_return_val=True,
         name="Compute max",
+        reducer=_MaximumReducer(),
     )
 
-    # Combine the per-block results locally, dropping empty blocks (None) from masking.
-    results = [res for res in results if res is not None]
-    if not results:  # Everything was masked out.
+    if result is None:  # Everything was masked out.
         raise ValueError("No values within the mask; cannot compute a maximum.")
-    return np.max(results)
+    return result
 ```
 
 The local runner uses `ThreadPoolExecutor` and `tqdm`. It keeps at most twice the worker count in
@@ -197,16 +217,18 @@ pending futures. A no-return run does not allocate a result container.
 The distributed runner adds persistent work and completion state:
 
 - The runner converts each input/output/mask to a `Source` and obtains its `to_spec()`. If a source is not reopenable (e.g. a numpy array), it fails early with a clear message.
-- It creates a temporary folder on a **shared filesystem** and submits one array job. The harness loads the cloudpickled payload and compact task assignment. It reopens source arrays and processes the assignment in order. Each task writes cumulative completion records to one binary journal. A record contains the completed unit count and logical item count. Return-value operations write a length-framed result before the matching completion record. The manifest stores the work plan, task assignments, and submission history. Resume starts at each task's completed prefix. Reattach uses the same stored assignments.
+- It creates a temporary folder on a **shared filesystem** and submits one array job. The harness loads the cloudpickled payload and compact task assignment. It reopens source arrays and processes the assignment in order. Each task writes cumulative completion records to one binary journal. A record contains the completed unit count and logical item count. Ordered return operations write a length-framed result before the matching completion record. Reducer operations write one atomic accumulator before the matching completion record. The manifest stores the work plan, task assignments, and submission history. Resume starts at each task's completed prefix. Reattach uses the same stored assignments.
 - The runner polls Slurm at the configured interval. The progress bar sums logical item counts from the binary journals. A `.success` sentinel shows that a task reached its end. The journal shows the completed assignment prefix. The runner uses `sacct` because `squeue` drops finished jobs.
-- `_finalize` converts each incomplete assignment suffix into compact failed work. It preserves the temp folder on failure. On success, it collects requested results and removes the folder.
+- `_finalize` converts each incomplete assignment suffix into compact failed work. It preserves the temp folder on failure. On success, it collects ordered results or streams reducer accumulators. It then removes the folder.
 
 
 ## Multi-stage workflows
 
 Some algorithms are not a single map + local reduce. Connected components (label per block → merge labels across block boundaries → relabel) and seeded watershed need information exchanged *between* blocks and are genuinely map → reduce → map.
 
-Statistics like mean and std are **not** in this category — they are single pass. A block returns a small tuple through the return-value channel (e.g. `sum + count` for the mean, or `sum + sum_of_squares + count` for the std), and these combine associatively and commutatively in the local reduction, exactly like `max`. No intermediate storage and no second map are needed.
+Statistics like mean and std are **not** in this category. They use one block pass and a bounded
+reducer. Workers write one accumulator per durable batch. The orchestrator streams the final fold.
+Mean and standard deviation use mergeable population moments.
 
 These are expressed simply as **multiple sequential `run()` calls**, with intermediate results persisted to a `Source` or another suitable format that lives in the job's temp folder (e.g. a temporary zarr/n5 array, or a small table for per-block summaries). Stage *N+1* reads what stage *N* wrote. This needs no task-graph machinery (in contrast to the Luigi-based cluster-tools), and does not clash with the current single-`run()` design — the high-level function just orchestrates the stages and owns the temp source's lifecycle (created before the first stage, cleaned up on overall success, preserved on failure for debugging). The same `block_ids` re-run mechanism applies per stage.
 
@@ -235,6 +257,7 @@ The **resolution/scale-adapting wrapper** is what makes a differently-sampled ma
 The first slice is implemented and tested: `stats.max/min/mean/std`, `filters.apply_filter` (+ the gaussian-family convenience functions), and `segmentation.label`, on the `local`, `subprocess` and `slurm` backends. Key decisions and insights from building it:
 
 - **One per-block code path for all backends.** `runner.run_block(...)` builds the `Block` / `BlockWithHalo` and calls the user function; both `LocalRunner` and the worker harness call it. This is what makes the `direct == local == subprocess` parity tests meaningful — there is no separate distributed code path to drift from.
+- **Associative reducers use durable batches.** A reducer run stores one atomic accumulator per batch. Resume validates these files and repairs completion journals before it launches incomplete tasks. Finalization reads one accumulator at a time in batch order.
 - **The `subprocess` backend is the slurm dress rehearsal.** It implements the complete distributed protocol. This includes compact work plans, task assignments, binary completion journals, result records, task sentinels, failure diagnostics, and resume. `_DistributedRunner` owns this protocol. `SubprocessRunner` only launches local worker processes. The worker entry point is `python -m bioimage_py.runner._harness <tmp> <task_id> <attempt>`.
 - **`output` is optional for local, required for distributed.** Array-output ops (`filters.*`, `segmentation.label`) allocate and return a fresh numpy array when `output` is omitted *and* the backend is local; distributed runs require a file-backed `output`. The runner enforces this up front via `_DistributedRunner._require_reopenable`, which calls `to_spec()` on every input/output/mask and raises a role-tagged, "file-backed (zarr/n5)" error for in-memory arrays. Always allocating a *fresh* array on omission (rather than filtering in place) also removes the halo-in-place hazard.
 - **Connected components: relabel only over labels that exist.** Stage 1 uses the cluster_tools offset scheme (`offset = block_id * prod(block_shape)`), which is *sparse*. Relabeling the whole union-find element space (size `max_label + 1`) yields a correct partition but non-compact ids (max ≫ component count). The fix: stage 1 returns each block's actual labels, and stage 3 relabels the union-find roots of only those labels → compact, consecutive output ids. This is validated with a partition-equality (not id-equality) check against whole-array `bioimage_cpp.segmentation.label`.
@@ -255,7 +278,7 @@ Two ignore mechanisms are kept, as in elf: VI/rand/cremi/object-VI take `ignore_
 - **Rand precision on enormous volumes.** `rand_scores` accumulates `Σ count²` in float64; once a single object exceeds ~2^53 voxels the square leaves the exact-integer range and the result loses precision. A guard or a higher-precision / pairwise-exact accumulation would be needed for extreme volumes.
 - **Orientation reuse.** The `*_scores` functions expect the table in `(segmentation, groundtruth)` orientation (matching needs the same), so a power user computing many metrics builds one table. A `ContingencyTable.transpose()` (swap A/B + marginals) would let a single table also serve any future gt-first consumer without a rebuild.
 - **Ignore-label ergonomics.** `matching`/`SBD` accept a single scalar `ignore_label`; an ignore *set* (like `drop_ignore`'s sequences) would be more general. The two ignore mechanisms (pixel-drop vs object-removal) are intentionally distinct but could be unified behind a clearer shared vocabulary.
-- **Metrics need a complete table.** The wrappers deliberately omit `block_ids`/`resume_from`, since a metric over a partial table is meaningless. The distributed-rerun path is explicit: build the table with `contingency_table(…, resume_from=…)`, then call the `*_scores` function. `dice_score` (its own three-scalar reduction) currently has no table layer, so it has no resume path — a possible future addition.
+- **Metrics need a complete table.** The table-based wrappers omit `block_ids`/`resume_from`, since a metric over a partial table is meaningless. The distributed-rerun path is explicit: build the table with `contingency_table(…, resume_from=…)`, then call the `*_scores` function. `dice_score` uses a bounded three-scalar reducer and supports `resume_from` directly.
 
 ## The slurm runner
 

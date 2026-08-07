@@ -1,9 +1,8 @@
 """Dice scores: foreground (binary) dice and the symmetric best dice for instance segmentations.
 
-``dice_score`` is a foreground overlap of two (optionally thresholded) images — a small additive
-reduction of three scalars (``|a & b|``, ``|a|``, ``|b|``), so it has its own block function rather
-than going through the contingency table. ``symmetric_best_dice_score`` is per-object and is a pure
-reduction of a :class:`ContingencyTable`.
+``dice_score`` is a foreground overlap of two optionally thresholded images. It uses a bounded
+reducer for three additive scalars: ``|a & b|``, ``|a|``, and ``|b|``.
+``symmetric_best_dice_score`` reduces a :class:`ContingencyTable`.
 """
 from __future__ import annotations
 
@@ -13,14 +12,43 @@ import numpy as np
 
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
+from ..runner.reducer import DEFAULT_REDUCTION_BATCH_SIZE, _normalize_reduction_batch_size
 from ..sources import Source, SourceLike, as_source
-from ..util import BlockDescriptor, check_direct, full_roi, to_roi
+from ..util import BlockDescriptor, check_direct, check_rerun_args, full_roi, to_roi
 from ._common import build_table
 from .contingency_table import ContingencyTable
 
 __all__ = ["dice_score", "best_dice_scores", "symmetric_best_dice_score"]
 
 _EPS = 1e-7
+
+
+class _DiceSumsReducer:
+    """Add optional Dice sufficient-statistics triples."""
+
+    def initial(self) -> Tuple[float, float, float]:
+        return 0.0, 0.0, 0.0
+
+    def update(
+        self,
+        accumulator: Tuple[float, float, float],
+        value: Optional[Tuple[float, float, float]],
+    ) -> Tuple[float, float, float]:
+        if value is None:
+            return accumulator
+        return self.merge(accumulator, value)
+
+    def merge(
+        self,
+        left: Tuple[float, float, float],
+        right: Tuple[float, float, float],
+    ) -> Tuple[float, float, float]:
+        return left[0] + right[0], left[1] + right[1], left[2] + right[2]
+
+    def finalize(
+        self, accumulator: Tuple[float, float, float],
+    ) -> Tuple[float, float, float]:
+        return accumulator
 
 
 # --- foreground dice -------------------------------------------------------------------
@@ -67,6 +95,8 @@ def dice_score(
     job_type: str = "local",
     job_config: Optional[RunnerConfig] = None,
     mask: Optional[SourceLike] = None,
+    resume_from: Optional[str] = None,
+    reduction_batch_size: int = DEFAULT_REDUCTION_BATCH_SIZE,
 ) -> float:
     """Compute the dice score between a (binarized) segmentation and groundtruth.
 
@@ -84,24 +114,27 @@ def dice_score(
         job_type: Execution backend: one of ``"local"``, ``"subprocess"`` or ``"slurm"``.
         job_config: Backend configuration (a `RunnerConfig` / `SlurmConfig`).
         mask: Optional binary mask; voxels outside the mask are excluded.
+        resume_from: Distributed only; the preserved temp folder of a failed run to resume.
+        reduction_batch_size: Block results per durable reducer batch.
 
     Returns:
         The dice score.
     """
+    check_rerun_args(job_type, resume_from, None)
+    reduction_batch_size = _normalize_reduction_batch_size(reduction_batch_size)
     if check_direct(job_type, num_workers, block_shape, mask, None):
         src_a, src_b = as_source(segmentation), as_source(groundtruth)
         intersection, sum_a, sum_b = _dice_sums(src_a[full_roi(src_a.ndim)], src_b[full_roi(src_b.ndim)],
                                                 threshold_seg, threshold_gt)
     else:
         runner = get_runner(job_type, job_config)
-        results = runner.run(_make_dice_compute(threshold_seg, threshold_gt),
-                             [segmentation, groundtruth], num_workers=num_workers,
-                             block_shape=block_shape, mask=mask, has_return_val=True,
-                             name="dice_score")
-        results = [r for r in results if r is not None]
-        if not results:
-            return 0.0
-        intersection, sum_a, sum_b = np.array(results, dtype="float64").sum(axis=0)
+        intersection, sum_a, sum_b = runner.run(
+            _make_dice_compute(threshold_seg, threshold_gt),
+            [segmentation, groundtruth], num_workers=num_workers,
+            block_shape=block_shape, mask=mask, resume_from=resume_from,
+            has_return_val=True, name="dice_score", reducer=_DiceSumsReducer(),
+            reduction_batch_size=reduction_batch_size,
+        )
     return float(2.0 * intersection) / float(sum_a + sum_b + _EPS)
 
 

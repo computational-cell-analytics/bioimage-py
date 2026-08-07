@@ -93,10 +93,10 @@ block ranges do not create one manifest entry per item. Explicit ID sequences us
 and a memory-mapped int64 file when large.
 
 **Recommended — `resume_from`** (distributed only). Re-issue the *same* call pointing at the
-preserved temp folder: only the incomplete blocks are re-run, and the result is merged with the
-blocks that already finished. This is correct for array-output ops (the missing blocks are written)
-*and* return-value ops (`stats.mean`, `morphology.morphology`, …), which reduce over the full merged
-set:
+preserved temp folder: only incomplete work is re-run, and the result is merged with completed
+work. This works for array-output operations, ordered return operations
+such as `morphology.morphology`, and bounded reducer operations such as `stats.mean`. Ordered
+returns merge the complete result list. Reducers reuse one durable accumulator per completed batch:
 
 ```python
 bp.filters.gaussian_smoothing(raw, 2.0, output=out, block_shape=(64, 64, 64),
@@ -156,6 +156,49 @@ so resume and reattach use the exact original plan.
 runner.map_batches(write_part, batch_boundaries=[0, 20_000, 75_000, 100_000],
                    num_workers=64, has_return_val=False)
 ```
+
+## Associative reductions
+
+Pass a `Reducer` to combine small logical results without collecting one result per item. A reducer
+defines `initial`, `update`, `merge`, and `finalize`. Merge must be associative. The runner preserves
+logical order, so merge does not need to be commutative. Keep reducer state in the accumulator. A
+local runner can call the same reducer object concurrently.
+
+```python
+from bioimage_py.runner import Reducer, get_runner
+
+class SumReducer:
+    def initial(self):
+        return 0
+
+    def update(self, accumulator, value):
+        return accumulator + value
+
+    def merge(self, left, right):
+        return left + right
+
+    def finalize(self, accumulator):
+        return accumulator
+
+reducer: Reducer[int, int, int] = SumReducer()
+total = get_runner("slurm", cfg).map(
+    compute_value,
+    n_items=10_000_000,
+    num_workers=64,
+    has_return_val=True,
+    reducer=reducer,
+    reduction_batch_size=1_000,
+)
+```
+
+Each distributed batch writes one atomic accumulator under the runner folder. The worker records
+completion only after the accumulator is durable. Resume validates the accumulator files and runs
+only incomplete batches. Finalization reads accumulators in batch order and keeps memory bounded by
+the accumulator size.
+
+`Runner.run` and `Runner.map` default to 1,000 logical results per reducer batch. Reducer mode is
+read-only and does not accept output arrays. Keep the ordered return path when an operation must
+write arrays or return every logical result.
 
 Use a `TableDataset` result sink for large typed tables. The batch function receives a
 `TablePartWriter`, writes one Arrow table, and returns `None`.

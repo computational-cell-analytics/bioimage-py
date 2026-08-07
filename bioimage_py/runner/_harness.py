@@ -16,8 +16,9 @@ import cloudpickle
 from ..sources.dispatch import from_spec
 from ..util import get_blocking
 from ._diagnostics import load_manifest
-from ._work import (assignment_length, iter_assignment, load_assignment, load_work_spec,
-                    logical_size)
+from ._reduction import reduce_batch
+from ._work import (ReductionBatchPlan, assignment_length, iter_assignment,
+                    load_assignment, load_work_spec, logical_size)
 from .base import run_block
 from .distributed import _COMPLETION_RECORD, _check_versions, _completion_counts
 
@@ -67,22 +68,25 @@ def _run_task(tmp: str, task_id: int, attempt_number: int = 1) -> None:
     function = payload["function"]
     has_return_val = payload["has_return_val"]
     mode = payload.get("mode", "block")
+    result_mode = manifest.get(
+        "result_mode", "ordered" if has_return_val else "none",
+    )
 
     # In "map" mode the function carries its own data in its closure (a SourceSpec it
     # reopens, a file path it reads); the runner reopens no sources and builds no blocking.
     if mode == "map":
-        def call_one(value):
+        def call_item(value):
             return function(int(value))
     elif mode == "batch":
         sink_descriptor = manifest.get("result_sink")
         if sink_descriptor is None:
-            call_one = function
+            call_batch = function
         else:
             from ..tables import TableDataset
 
             dataset = TableDataset._from_descriptor(sink_descriptor)
 
-            def call_one(value):
+            def call_batch(value):
                 return dataset._run_batch(function, value)
     else:
         inputs = [from_spec(s) for s in payload["input_specs"]]
@@ -91,8 +95,24 @@ def _run_task(tmp: str, task_id: int, attempt_number: int = 1) -> None:
         blocking = get_blocking(payload["shape"], payload["block_shape"], payload["roi"])
         halo = payload["halo"]
 
-        def call_one(value):
+        def call_item(value):
             return run_block(function, blocking, int(value), inputs, outputs, mask, halo)
+
+    if result_mode == "reducer":
+        if mode == "batch" or not isinstance(work, ReductionBatchPlan):
+            raise ValueError("Reducer execution requires block or map reduction work.")
+        reducer = payload.get("reducer")
+        if reducer is None:
+            raise ValueError("Reducer execution has no serialized reducer.")
+
+        def call_reduction_batch(value):
+            return reduce_batch(value, work, call_item, reducer, tmp=tmp)
+
+        call_one = call_reduction_batch
+    elif mode == "batch":
+        call_one = call_batch
+    elif mode != "batch":
+        call_one = call_item
 
     journal_path = os.path.join(tmp, "progress", f"{task_id}.bin")
     completed_units, completed_logical_items = _completion_counts(tmp, task_id)
@@ -104,14 +124,15 @@ def _run_task(tmp: str, task_id: int, attempt_number: int = 1) -> None:
     t0 = time.time()
     n_processed = 0
     result_path = os.path.join(tmp, "results", f"{task_id}")
-    if has_return_val:
+    writes_results = result_mode == "ordered"
+    if writes_results:
         _truncate_torn_results(result_path)
-    res_f = open(result_path, "ab") if has_return_val else None
+    res_f = open(result_path, "ab") if writes_results else None
     journal = open(journal_path, "ab")
     try:
         for position, value in iter_assignment(work, assignment, completed_units):
             res = call_one(value)
-            if has_return_val:
+            if writes_results:
                 payload_bytes = cloudpickle.dumps((position, res))
                 res_f.write(struct.pack("<Q", len(payload_bytes)) + payload_bytes)
                 res_f.flush()
