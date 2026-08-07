@@ -34,9 +34,10 @@ the ones you need, e.g. `python -m pip install -e ".[io]"` or combine several
 | `cloudvolume` | `cloud-volume` | `CloudVolume` (precomputed) layers — writable, Linux only. |
 | `tensorstore` | `tensorstore` | TensorStore neuroglancer-precomputed layers — local ZYX reads and shard-safe writes. |
 | `webknossos` | `webknossos` | WebKnossos layers — read-only, remote or local. |
-| `io-all` | all of the above | Every supported I/O backend in one go. |
-| `test` | `pytest`, `zarr>=3`, `scikit-image`, `scipy`, `openpyxl` | Running the test suite. |
+| `table` | `pyarrow` | Typed, partitioned Parquet table datasets and runner result sinks. |
+| `io-all` | all array I/O packages above | Every supported array I/O backend in one install. |
+| `test` | `pytest`, `zarr>=3`, `scikit-image`, `scipy`, `openpyxl`, `pyarrow` | Running the test suite. |
 | `dev` | `flake8`, `pyflakes` | Linting. |
 
-Distributed (`subprocess` / `slurm`) execution always requires a file-backed output, so install at
-least the `io` extra for those workflows.
+Distributed array operations require a file-backed output. Install at least the `io` extra for
+those operations. Install the `table` extra to use Parquet table result sinks.

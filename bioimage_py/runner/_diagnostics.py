@@ -44,25 +44,26 @@ def create_manifest(tmp: str, *, backend: str, name: str, n_tasks: int,
                     python_executable: str, mode: Optional[str] = None,
                     work_plan: Optional[Mapping[str, Any]] = None,
                     assignments: Optional[Sequence[Mapping[str, Any]]] = None,
-                    logical_items: Optional[int] = None) -> None:
+                    logical_items: Optional[int] = None,
+                    result_sink: Optional[Mapping[str, Any]] = None) -> None:
     """Create the versioned run manifest before the first launch attempt."""
-    atomic_write_json(
-        os.path.join(tmp, "manifest.json"),
-        {
-            "schema_version": MANIFEST_SCHEMA_VERSION,
-            "backend": backend,
-            "created_at": utc_now(),
-            "name": name,
-            "n_tasks": int(n_tasks),
-            "python_executable": python_executable,
-            "mode": mode,
-            "work_plan": dict(work_plan) if work_plan is not None else None,
-            "assignments": ([dict(assignment) for assignment in assignments]
-                            if assignments is not None else None),
-            "logical_items": logical_items,
-            "attempts": [],
-        },
-    )
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "backend": backend,
+        "created_at": utc_now(),
+        "name": name,
+        "n_tasks": int(n_tasks),
+        "python_executable": python_executable,
+        "mode": mode,
+        "work_plan": dict(work_plan) if work_plan is not None else None,
+        "assignments": ([dict(assignment) for assignment in assignments]
+                        if assignments is not None else None),
+        "logical_items": logical_items,
+        "attempts": [],
+    }
+    if result_sink is not None:
+        manifest["result_sink"] = dict(result_sink)
+    atomic_write_json(os.path.join(tmp, "manifest.json"), manifest)
 
 
 def load_manifest(tmp: str, *, expected_backend: Optional[str] = None) -> Dict[str, Any]:

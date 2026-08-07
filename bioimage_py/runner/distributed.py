@@ -15,7 +15,7 @@ import threading
 import time
 import warnings
 from concurrent import futures
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import bioimage_cpp
 import cloudpickle
@@ -30,11 +30,14 @@ from ._diagnostics import (append_attempt, atomic_write_json, attempt_folder, cr
                            read_task_outcome, relative_path, update_attempt, utc_now,
                            write_task_outcome)
 from ._work import (AssignmentValues, Batch, ExplicitIdsSpec, RegularBatchPlan,
-                    WorkSpec, assignment_length, load_work_spec,
+                    WorkSpec, assignment_length, iter_assignment, load_work_spec, logical_size,
                     make_shard_routing, partition_slices,
                     persist_routed_positions, persist_work_spec)
 from .base import Runner, RunnerError, TaskFailure
 from .config import RunnerConfig, SlurmConfig
+
+if TYPE_CHECKING:
+    from ..tables import TableDataset
 
 
 def _env_versions() -> Dict[str, Any]:
@@ -277,15 +280,16 @@ class _DistributedRunner(Runner):
     def _execute_batches(
         self,
         *,
-        function: Callable[[Batch], Any],
+        function: Callable[..., Any],
         batches: RegularBatchPlan,
         has_return_val: bool,
         num_workers: int,
         name: str,
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> Optional[List[Any]]:
+        result_sink: Optional["TableDataset"] = None,
+    ) -> Any:
         return self._run_work(function, batches, {"mode": "batch"}, has_return_val,
-                              num_workers, name, pre_cleanup)
+                              num_workers, name, pre_cleanup, result_sink=result_sink)
 
     def _run_work(
         self,
@@ -297,7 +301,8 @@ class _DistributedRunner(Runner):
         name: str,
         pre_cleanup: Optional[Callable[[str], None]],
         routing: Optional[Any] = None,
-    ) -> Optional[List[Any]]:
+        result_sink: Optional["TableDataset"] = None,
+    ) -> Any:
         """Persist compact work, launch tasks, and finalize the run."""
         tmp = tempfile.mkdtemp(prefix="bioimage_py_", dir=self.config.tmp_root)
         for sub in ("results", "success", "error", "timings", "progress", "work"):
@@ -350,9 +355,18 @@ class _DistributedRunner(Runner):
             work_plan=work_descriptor,
             assignments=assignments,
             logical_items=logical_items,
+            result_sink=(result_sink._descriptor() if result_sink is not None else None),
         )
 
-        self._launch_and_wait(tmp, n_tasks, num_workers, name)
+        if result_sink is None:
+            incomplete = None
+        else:
+            incomplete = self._reconcile_table_progress(tmp, result_sink, work, assignments)
+        if incomplete is None or incomplete:
+            self._launch_and_wait(
+                tmp, n_tasks, num_workers, name,
+                task_ids=None if incomplete is None else incomplete,
+            )
         return self._finalize(tmp, has_return_val, name, pre_cleanup=pre_cleanup)
 
     def _finalize(
@@ -361,10 +375,37 @@ class _DistributedRunner(Runner):
         has_return_val: bool,
         name: str,
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> Optional[List[Any]]:
+    ) -> Any:
         """Collect a complete run or raise with compact assignment suffixes."""
         manifest, work, assignments = _manifest_work(tmp)
         n_tasks = int(manifest["n_tasks"])
+        sink_descriptor = manifest.get("result_sink")
+        if sink_descriptor is not None:
+            from ..tables import TableDataset, TablePartsError
+
+            if not isinstance(work, RegularBatchPlan):
+                raise ValueError("A table result sink requires a regular batch work plan.")
+            dataset = TableDataset._from_descriptor(sink_descriptor)
+            try:
+                results = dataset._finalize(work)
+            except TablePartsError as error:
+                failed_ids = {batch.batch_id for batch in error.failed_batches}
+                failed_tasks = []
+                for task_id, assignment in enumerate(assignments):
+                    if any(isinstance(value, Batch) and value.batch_id in failed_ids
+                           for _, value in iter_assignment(work, assignment)):
+                        failed_tasks.append(task_id)
+                task_failures = self._task_failures(tmp, failed_tasks)
+                raise RunnerError(
+                    f"{len(error.failed_batches)} table batch(es) have missing or invalid "
+                    f"parts in '{name or 'run'}'. Temp folder preserved for debugging: {tmp}.",
+                    tmp_folder=tmp,
+                    task_failures=task_failures,
+                    failed_batches=error.failed_batches,
+                ) from error
+            self._cleanup_success(tmp, pre_cleanup)
+            return results
+
         failed_tasks: List[int] = []
         failed_specs: List[AssignmentValues] = []
         failed_batches: List[Batch] = []
@@ -386,13 +427,62 @@ class _DistributedRunner(Runner):
                               failed_id_specs=failed_specs, failed_batches=failed_batches)
 
         results = self._collect(tmp, n_tasks, work) if has_return_val else None
+        self._cleanup_success(tmp, pre_cleanup)
+        return results
+
+    @staticmethod
+    def _cleanup_success(tmp: str, pre_cleanup: Optional[Callable[[str], None]]) -> None:
         if pre_cleanup is not None:
             try:
                 pre_cleanup(tmp)
-            except Exception as err:  # noqa: BLE001 - best-effort: never fail the run on this
+            except Exception as err:  # noqa: BLE001 - best-effort callback
                 print(f"pre_cleanup callback failed for {tmp}: {err!r}")
         shutil.rmtree(tmp, ignore_errors=True)
-        return results
+
+    @staticmethod
+    def _reconcile_table_progress(
+        tmp: str,
+        dataset: "TableDataset",
+        work: WorkSpec,
+        assignments: Sequence[Mapping[str, Any]],
+    ) -> List[int]:
+        """Set each journal to the longest prefix with valid table parts."""
+        if not isinstance(work, RegularBatchPlan):
+            raise ValueError("A table result sink requires a regular batch work plan.")
+        incomplete = []
+        for task_id, assignment in enumerate(assignments):
+            completed_units = 0
+            completed_items = 0
+            for _, value in iter_assignment(work, assignment):
+                if not isinstance(value, Batch):
+                    raise ValueError("A table result sink received non-batch work.")
+                if dataset._validate_part(value, recover=True) is None:
+                    break
+                completed_units += 1
+                completed_items += logical_size(value)
+
+            journal_path = os.path.join(tmp, "progress", f"{task_id}.bin")
+            if completed_units:
+                with open(journal_path, "wb") as journal:
+                    journal.write(_COMPLETION_RECORD.pack(completed_units, completed_items))
+                    journal.flush()
+                    os.fsync(journal.fileno())
+            else:
+                try:
+                    os.unlink(journal_path)
+                except FileNotFoundError:
+                    pass
+
+            success_path = os.path.join(tmp, "success", f"{task_id}.success")
+            if completed_units == assignment_length(assignment):
+                open(success_path, "a").close()
+            else:
+                incomplete.append(task_id)
+                try:
+                    os.unlink(success_path)
+                except FileNotFoundError:
+                    pass
+        return incomplete
 
     def _collect(self, tmp: str, n_tasks: int, work: WorkSpec) -> List[Any]:
         """Load result records by global work position."""
@@ -512,12 +602,21 @@ class _DistributedRunner(Runner):
         if num_workers is None:
             num_workers = int(payload.get("num_workers", 1))
 
-        _, _, assignments = _manifest_work(tmp_folder)
+        _, work, assignments = _manifest_work(tmp_folder)
         n_tasks = int(manifest["n_tasks"])
-        incomplete = [
-            task_id for task_id, assignment in enumerate(assignments)
-            if _completion_counts(tmp_folder, task_id)[0] < assignment_length(assignment)
-        ]
+        sink_descriptor = manifest.get("result_sink")
+        if sink_descriptor is None:
+            incomplete = [
+                task_id for task_id, assignment in enumerate(assignments)
+                if _completion_counts(tmp_folder, task_id)[0] < assignment_length(assignment)
+            ]
+        else:
+            from ..tables import TableDataset
+
+            dataset = TableDataset._from_descriptor(sink_descriptor)
+            incomplete = self._reconcile_table_progress(
+                tmp_folder, dataset, work, assignments,
+            )
         if incomplete:
             self._launch_and_wait(tmp_folder, n_tasks, num_workers, name, task_ids=incomplete)
         return self._finalize(tmp_folder, has_return_val, name, pre_cleanup=pre_cleanup)
@@ -1287,5 +1386,4 @@ class SlurmRunner(_DistributedRunner):
                     accounting_path=relative_path(tmp_folder, accounting_path),
                 )
 
-        results = self._finalize(tmp_folder, has_return_val, name, pre_cleanup=pre_cleanup)
-        return results if has_return_val else None
+        return self._finalize(tmp_folder, has_return_val, name, pre_cleanup=pre_cleanup)

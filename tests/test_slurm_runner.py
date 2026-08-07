@@ -13,6 +13,7 @@ import os
 import shutil
 
 import numpy as np
+import pyarrow as pa
 import pytest
 
 import bioimage_cpp as bic
@@ -62,6 +63,15 @@ def _fail_on_corner(should_fail):
         if should_fail and is_corner:
             raise RuntimeError("boom on corner block")
         return int(block.begin[0])
+    return fn
+
+
+def _make_table_writer(schema):
+    """Return a closure that writes one typed row per logical item."""
+    def fn(batch, writer):
+        writer.write(pa.table({
+            "item": pa.array(list(batch), type=pa.int64()),
+        }, schema=schema))
     return fn
 
 
@@ -140,6 +150,31 @@ def test_slurm_reattach(shared_zarr_factory, rng, shared_tmp_path):
     results = SlurmRunner(cfg).reattach(tmp, name="reattach")
     assert np.isclose(max(r for r in results if r is not None), float(a.max()))
     assert not os.path.isdir(tmp)  # cleaned up on successful finalize
+
+
+def test_slurm_table_sink_reattach(shared_tmp_path):
+    cfg = _cfg(shared_tmp_path)
+    schema = pa.schema([("item", pa.int64())])
+    dataset = bp.TableDataset.create(
+        os.path.join(shared_tmp_path, "table.parquet"),
+        schema=schema,
+        schema_version=1,
+        operation="slurm-table-test",
+        operation_version="1",
+        input_identities={"input": "synthetic"},
+        parameters={},
+    )
+
+    with pytest.raises(_Detached) as excinfo:
+        _DetachAfterSubmit(cfg).map_batches(
+            _make_table_writer(schema), 5, batch_size=2, num_workers=2,
+            result_sink=dataset, name="table-reattach-src",
+        )
+
+    result = SlurmRunner(cfg).reattach(excinfo.value.tmp, name="table-reattach")
+    assert isinstance(result, bp.TableDataset)
+    assert result.to_pandas()["item"].tolist() == list(range(5))
+    assert not os.path.isdir(excinfo.value.tmp)
 
 
 def _make_shared_flaky(marker_path):

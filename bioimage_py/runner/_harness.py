@@ -74,7 +74,16 @@ def _run_task(tmp: str, task_id: int, attempt_number: int = 1) -> None:
         def call_one(value):
             return function(int(value))
     elif mode == "batch":
-        call_one = function
+        sink_descriptor = manifest.get("result_sink")
+        if sink_descriptor is None:
+            call_one = function
+        else:
+            from ..tables import TableDataset
+
+            dataset = TableDataset._from_descriptor(sink_descriptor)
+
+            def call_one(value):
+                return dataset._run_batch(function, value)
     else:
         inputs = [from_spec(s) for s in payload["input_specs"]]
         outputs = [from_spec(s) for s in payload["output_specs"]]

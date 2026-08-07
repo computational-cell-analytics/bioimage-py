@@ -145,7 +145,49 @@ after a batch succeeds. Progress reports logical items. A failed call exposes
 assignments.
 
 Set `has_return_val=True` only when you need an ordered in-memory result for each batch. Ordered
-results use memory proportional to the batch count. Phase 3 will add file-backed result sinks.
+results use memory proportional to the batch count.
+
+Use a `TableDataset` result sink for large typed tables. Install the `table` extra first. The batch
+function receives a `TablePartWriter`, writes one Arrow table, and returns `None`.
+
+```python
+import pyarrow as pa
+
+from bioimage_py import TableDataset
+from bioimage_py.runner import Batch, get_runner
+
+schema = pa.schema([("label", pa.uint64()), ("size", pa.uint64())])
+dataset = TableDataset.create(
+    "morphology.parquet",
+    schema=schema,
+    schema_version=1,
+    operation="example-morphology",
+    operation_version="1",
+    input_identities={"segmentation": {"path": "/shared/segmentation.zarr"}},
+    parameters={"resolution": [8.0, 8.0, 8.0]},
+)
+
+def write_table(batch: Batch, writer):
+    columns = compute_columns(range(batch.start, batch.stop))
+    writer.write(pa.table(columns, schema=schema))
+
+runner = get_runner("slurm", cfg)
+result = runner.map_batches(
+    write_table,
+    n_items=10_000_000,
+    batch_size=100_000,
+    num_workers=64,
+    result_sink=dataset,
+)
+```
+
+The output path is a dataset directory, even when it ends in `.parquet`. Each batch writes one
+atomic Parquet part and one completion sidecar. A compatible fresh call reuses valid parts. Resume
+also validates the parts and recomputes missing or invalid batches.
+
+The runner returns a lightweight `TableDataset`. Use `result.iter_parts()` for part metadata. Call
+`result.to_pandas()` only when you explicitly want to materialize the complete table. Runner cleanup
+never removes the table dataset.
 
 ## Slurm configuration
 

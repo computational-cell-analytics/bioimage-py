@@ -4,8 +4,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from concurrent import futures
 from dataclasses import dataclass
-from typing import (Any, Callable, Iterable, Iterator, List, Mapping, Optional, Protocol,
-                    Sequence, Tuple)
+from typing import (TYPE_CHECKING, Any, Callable, Iterable, Iterator, List, Mapping,
+                    Optional, Protocol, Sequence, Tuple)
 
 from bioimage_cpp.utils import Blocking
 from threadpoolctl import ThreadpoolController
@@ -19,6 +19,9 @@ from ._work import (Batch, ExplicitIdsSpec, RangeSpec, RegularBatchPlan, ShardRo
                     WorkSpec, assignment_length, iter_assignment, logical_size,
                     make_shard_routing)
 from .config import RunnerConfig
+
+if TYPE_CHECKING:
+    from ..tables import TableDataset
 
 # A single, process-wide threadpool controller, built once here at import time (in the main
 # thread). Worker threads reuse it via ``_TP_CONTROLLER.limit(...)`` instead of constructing their
@@ -305,7 +308,7 @@ class Runner(ABC):
 
     def map_batches(
         self,
-        function: Callable[[Batch], Any],
+        function: Callable[..., Any],
         n_items: Optional[int] = None,
         *,
         batch_size: Optional[int] = None,
@@ -314,11 +317,13 @@ class Runner(ABC):
         name: str = "",
         pre_cleanup: Optional[Callable[[str], None]] = None,
         resume_from: Optional[str] = None,
-    ) -> Optional[list]:
+        result_sink: Optional["TableDataset"] = None,
+    ) -> Any:
         """Map ``function(batch)`` over deterministic contiguous batches.
 
         The completion, failure, and retry unit is one :class:`Batch`. A batch function can
-        write output through its closure and return no in-memory result.
+        write output through its closure and return no in-memory result. With a table result
+        sink, the runner calls ``function(batch, writer)`` and returns the completed dataset.
 
         Args:
             function: The function ``function(batch) -> result``.
@@ -329,9 +334,11 @@ class Runner(ABC):
             name: A short progress display name.
             pre_cleanup: Distributed success callback. See :meth:`run`.
             resume_from: A preserved distributed run folder.
+            result_sink: A table dataset that receives one typed part per batch.
 
         Returns:
-            One result per batch when ``has_return_val`` is true. Otherwise, returns ``None``.
+            A table dataset when ``result_sink`` is set. Otherwise, returns one result per
+            batch when ``has_return_val`` is true, or ``None``.
         """
         if resume_from is not None:
             return self._resume_entry(resume_from, name=name, pre_cleanup=pre_cleanup)
@@ -340,11 +347,20 @@ class Runner(ABC):
         if batch_size is None:
             raise ValueError("map_batches() requires batch_size.")
         batches = RegularBatchPlan(int(n_items), int(batch_size))
+        if result_sink is not None:
+            from ..tables import TableDataset
+
+            if not isinstance(result_sink, TableDataset):
+                raise TypeError("result_sink must be a TableDataset.")
+            if has_return_val:
+                raise ValueError("result_sink and has_return_val=True are mutually exclusive.")
+            result_sink._bind_batches(batches)
         results = self._execute_batches(
             function=function, batches=batches, has_return_val=has_return_val,
             num_workers=num_workers, name=name, pre_cleanup=pre_cleanup,
+            result_sink=result_sink,
         )
-        return results if has_return_val else None
+        return results if has_return_val or result_sink is not None else None
 
     def _resume_entry(self, tmp_folder: str, *, name: str,
                       pre_cleanup: Optional[Callable[[str], None]]) -> Optional[list]:
@@ -429,13 +445,14 @@ class Runner(ABC):
     def _execute_batches(
         self,
         *,
-        function: Callable[[Batch], Any],
+        function: Callable[..., Any],
         batches: RegularBatchPlan,
         has_return_val: bool,
         num_workers: int,
         name: str,
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> Optional[List[Any]]:
+        result_sink: Optional["TableDataset"] = None,
+    ) -> Any:
         """Execute ``function(batch)`` over a regular batch plan."""
         ...
 
@@ -509,13 +526,37 @@ class LocalRunner(Runner):
     def _execute_batches(
         self,
         *,
-        function: Callable[[Batch], Any],
+        function: Callable[..., Any],
         batches: RegularBatchPlan,
         has_return_val: bool,
         num_workers: int,
         name: str,
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> Optional[List[Any]]:
+        result_sink: Optional["TableDataset"] = None,
+    ) -> Any:
+        if result_sink is not None:
+            execution_error = None
+            try:
+                self._run_pool(
+                    batches, lambda batch: result_sink._run_batch(function, batch),
+                    num_workers, name, has_return_val=False, unit="batch",
+                )
+            except RunnerError as error:
+                execution_error = error
+            try:
+                return result_sink._finalize(batches)
+            except ValueError as error:
+                from ..tables import TablePartsError
+
+                if not isinstance(error, TablePartsError):
+                    raise
+                if execution_error is not None:
+                    raise execution_error
+                raise RunnerError(
+                    f"{len(error.failed_batches)} table batch(es) have missing or invalid parts "
+                    f"in '{name or 'run'}'.",
+                    failed_batches=error.failed_batches,
+                ) from error
         return self._run_pool(
             batches, function, num_workers, name, has_return_val=has_return_val,
             unit="batch",
