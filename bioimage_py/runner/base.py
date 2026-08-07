@@ -4,6 +4,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from concurrent import futures
 from dataclasses import dataclass
+import numbers
 from typing import (TYPE_CHECKING, Any, Callable, Iterable, Iterator, List, Mapping,
                     Optional, Protocol, Sequence, Tuple)
 
@@ -15,9 +16,9 @@ from ..sources.base import Source
 from ..sources.dispatch import SourceLike, as_source
 from ..util import (ComputeFn, derive_block_shape, get_blocking, group_blocks_by_shard,
                     maybe_warn_imbalance, normalize_halo)
-from ._work import (Batch, ExplicitIdsSpec, RangeSpec, RegularBatchPlan, ShardRoutingPlan,
-                    WorkSpec, assignment_length, iter_assignment, logical_size,
-                    make_shard_routing)
+from ._work import (Batch, BatchPlan, BoundaryBatchPlan, ExplicitIdsSpec, RangeSpec,
+                    RegularBatchPlan, ShardRoutingPlan, WorkSpec, assignment_length,
+                    is_batch_plan, iter_assignment, logical_size, make_shard_routing)
 from .config import RunnerConfig
 
 if TYPE_CHECKING:
@@ -312,6 +313,7 @@ class Runner(ABC):
         n_items: Optional[int] = None,
         *,
         batch_size: Optional[int] = None,
+        batch_boundaries: Optional[Sequence[int]] = None,
         num_workers: int = 1,
         has_return_val: bool = False,
         name: str = "",
@@ -329,6 +331,9 @@ class Runner(ABC):
             function: The function ``function(batch) -> result``.
             n_items: The non-negative logical item count.
             batch_size: The positive maximum number of items in each batch.
+            batch_boundaries: Explicit half-open batch boundaries. The sequence must start
+                at zero and increase strictly. Mutually exclusive with ``n_items`` and
+                ``batch_size``; ``(0,)`` represents empty work.
             num_workers: The local concurrency or distributed task throttle.
             has_return_val: Collect one ordered result per batch when true.
             name: A short progress display name.
@@ -342,11 +347,25 @@ class Runner(ABC):
         """
         if resume_from is not None:
             return self._resume_entry(resume_from, name=name, pre_cleanup=pre_cleanup)
-        if n_items is None:
-            raise ValueError("map_batches() requires n_items.")
-        if batch_size is None:
-            raise ValueError("map_batches() requires batch_size.")
-        batches = RegularBatchPlan(int(n_items), int(batch_size))
+        if batch_boundaries is None:
+            if n_items is None:
+                raise ValueError("map_batches() requires n_items.")
+            if batch_size is None:
+                raise ValueError("map_batches() requires batch_size.")
+            batches: BatchPlan = RegularBatchPlan(int(n_items), int(batch_size))
+        else:
+            if n_items is not None or batch_size is not None:
+                raise ValueError(
+                    "batch_boundaries is mutually exclusive with n_items and batch_size."
+                )
+            boundaries = []
+            for index, value in enumerate(batch_boundaries):
+                if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+                    raise TypeError(
+                        f"batch_boundaries[{index}] must be an integer."
+                    )
+                boundaries.append(int(value))
+            batches = BoundaryBatchPlan(tuple(boundaries))
         if result_sink is not None:
             from ..tables import TableDataset
 
@@ -446,14 +465,14 @@ class Runner(ABC):
         self,
         *,
         function: Callable[..., Any],
-        batches: RegularBatchPlan,
+        batches: BatchPlan,
         has_return_val: bool,
         num_workers: int,
         name: str,
         pre_cleanup: Optional[Callable[[str], None]] = None,
         result_sink: Optional["TableDataset"] = None,
     ) -> Any:
-        """Execute ``function(batch)`` over a regular batch plan."""
+        """Execute ``function(batch)`` over a deterministic batch plan."""
         ...
 
 
@@ -527,7 +546,7 @@ class LocalRunner(Runner):
         self,
         *,
         function: Callable[..., Any],
-        batches: RegularBatchPlan,
+        batches: BatchPlan,
         has_return_val: bool,
         num_workers: int,
         name: str,
@@ -587,7 +606,7 @@ class LocalRunner(Runner):
                 pending[executor.submit(invoke, value)] = (next_position, value)
                 next_position += 1
 
-        total = work.n_items if isinstance(work, RegularBatchPlan) else len(work)
+        total = work.n_items if is_batch_plan(work) else len(work)
         with futures.ThreadPoolExecutor(worker_count) as executor:
             submit(executor)
             with tqdm(total=total, desc=name or None, disable=not name) as progress:
@@ -609,7 +628,7 @@ class LocalRunner(Runner):
                     submit(executor)
 
         if failed_positions or next_position < len(work):
-            if isinstance(work, RegularBatchPlan):
+            if is_batch_plan(work):
                 failed_batches = tuple(work[position] for position in failed_positions)
                 failed_batches += tuple(work[position] for position in
                                         range(next_position, len(work)))

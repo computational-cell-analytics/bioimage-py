@@ -56,6 +56,32 @@ def test_map_batches_returns_batch_order(backend):
     assert result == [(0, 0, 3, 3), (1, 3, 6, 12), (2, 6, 9, 21), (3, 9, 10, 9)]
 
 
+@pytest.mark.parametrize("backend", ["local", "subprocess"])
+def test_map_batches_accepts_explicit_boundaries(backend):
+    result = get_runner(backend).map_batches(
+        _make_batch_result(), batch_boundaries=[0, 2, 7, 8], num_workers=2,
+        has_return_val=True,
+    )
+    assert result == [(0, 0, 2, 1), (1, 2, 7, 20), (2, 7, 8, 7)]
+
+
+def test_map_batches_validates_explicit_boundaries():
+    runner = get_runner("local")
+    assert runner.map_batches(
+        _make_batch_result(), batch_boundaries=[0], has_return_val=True,
+    ) == []
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        runner.map_batches(
+            _make_batch_result(), n_items=4, batch_boundaries=[0, 4],
+        )
+    with pytest.raises(ValueError, match="start at 0"):
+        runner.map_batches(_make_batch_result(), batch_boundaries=[1, 4])
+    with pytest.raises(ValueError, match="increase"):
+        runner.map_batches(_make_batch_result(), batch_boundaries=[0, 3, 3])
+    with pytest.raises(TypeError, match=r"batch_boundaries\[1\]"):
+        runner.map_batches(_make_batch_result(), batch_boundaries=[0, 2.5])
+
+
 def test_map_batches_no_return_writes_no_result_records(tmp_path):
     output = tmp_path / "parts"
     output.mkdir()
@@ -107,6 +133,43 @@ def test_batch_resume_reuses_exact_assignments(tmp_path):
                                 has_return_val=True, pre_cleanup=inspect_run)
     assert result == [0, 1, 2, 3, 4]
     assert resumed["assignments"] == original_assignments
+
+
+def test_boundary_batch_resume_reuses_exact_plan(tmp_path):
+    marker_folder = tmp_path / "boundary-markers"
+    marker_folder.mkdir()
+    fail_once = tmp_path / "boundary-fail-once"
+
+    def process(batch):
+        done = marker_folder / str(batch.batch_id)
+        if done.exists():
+            raise RuntimeError(f"batch {batch.batch_id} ran twice")
+        if batch.batch_id == 1 and not fail_once.exists():
+            fail_once.write_text("failed")
+            raise RuntimeError("fail once")
+        done.write_text("done")
+        return batch.start, batch.stop
+
+    runner = get_runner(
+        "subprocess", RunnerConfig(tmp_root=str(tmp_path), tasks_per_worker=2)
+    )
+    boundaries = [0, 2, 7, 8, 13]
+    with pytest.raises(RunnerError) as exc_info:
+        runner.map_batches(
+            process, batch_boundaries=boundaries, num_workers=2, has_return_val=True,
+        )
+    error = exc_info.value
+    manifest = load_manifest(error.tmp_folder)
+    assert manifest["work_plan"] == {
+        "kind": "boundary_batches", "boundaries": boundaries, "length": 4,
+    }
+    assert manifest["logical_items"] == 13
+    assert [batch.batch_id for batch in error.failed_batches] == [1]
+
+    result = runner.map_batches(
+        process, resume_from=error.tmp_folder, has_return_val=True,
+    )
+    assert result == [(0, 2), (2, 7), (7, 8), (8, 13)]
 
 
 def test_range_planning_and_partitioning_stay_compact():

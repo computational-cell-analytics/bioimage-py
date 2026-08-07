@@ -18,7 +18,7 @@ import pyarrow as pa
 
 from ..runner import get_runner
 from ..runner._diagnostics import load_manifest
-from ..runner._work import RegularBatchPlan
+from ..runner._work import BatchPlan, BoundaryBatchPlan, RegularBatchPlan
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, SourceSpec, as_source
 from ..tables import TableDataset, _describe_parquet_input, _read_parquet_rows
@@ -28,6 +28,9 @@ from .morphology import _axis_names
 __all__ = ["regionprops"]
 
 _SEG_CACHE: Dict[Any, Source] = {}
+_COST_SCAN_ROWS = 1_000_000
+_MAX_UINT64 = int(np.iinfo(np.uint64).max)
+_BATCH_COST_MODEL = "bounding_box_voxels_v1"
 
 
 def _read_table(path: str) -> "pd.DataFrame":
@@ -304,6 +307,112 @@ def _batch_column(table: pa.Table, name: str, dtype: pa.DataType) -> np.ndarray:
     return cast.to_numpy(zero_copy_only=False)
 
 
+def _bounding_box_costs(
+    table: pa.Table,
+    axes: Sequence[str],
+    shape: Sequence[int],
+    row_offset: int,
+) -> np.ndarray:
+    """Return checked bounding-box voxel counts for one bounded table chunk."""
+    bb_min = np.stack([
+        _batch_column(table, f"bb_min_{axis}", pa.int64()) for axis in axes
+    ], axis=1)
+    bb_max = np.stack([
+        _batch_column(table, f"bb_max_{axis}", pa.int64()) for axis in axes
+    ], axis=1)
+    shape_array = np.asarray(shape, dtype="int64")
+    invalid = ((bb_min < 0).any(axis=1) | (bb_max < bb_min).any(axis=1)
+               | (bb_max > shape_array).any(axis=1))
+    if invalid.any():
+        index = int(np.flatnonzero(invalid)[0]) + int(row_offset)
+        raise ValueError(f"table row {index} has a bounding box outside the segmentation.")
+
+    extents = (bb_max - bb_min).astype("uint64", copy=False)
+    costs = np.ones(table.num_rows, dtype="uint64")
+    for axis in range(len(axes)):
+        extent = extents[:, axis]
+        nonzero = extent != 0
+        if np.any(costs[nonzero] > np.uint64(_MAX_UINT64) // extent[nonzero]):
+            index = int(np.flatnonzero(
+                nonzero & (costs > np.uint64(_MAX_UINT64) // np.maximum(extent, 1))
+            )[0]) + int(row_offset)
+            raise ValueError(f"table row {index} has a bounding-box cost above uint64.")
+        costs *= extent
+    return costs
+
+
+def _extend_cost_boundaries(
+    boundaries: List[int],
+    costs: np.ndarray,
+    row_offset: int,
+    target_cost: int,
+    max_rows: int,
+    batch_cost: int,
+) -> int:
+    """Greedily extend contiguous cost batches and return the open batch cost."""
+    position = 0
+    safe_take = max(1, _MAX_UINT64 // target_cost)
+    while position < len(costs):
+        global_position = row_offset + position
+        batch_rows = global_position - boundaries[-1]
+        if batch_rows == max_rows:
+            boundaries.append(global_position)
+            batch_cost = 0
+            batch_rows = 0
+
+        cost = int(costs[position])
+        if cost > target_cost:
+            if batch_rows:
+                boundaries.append(global_position)
+                batch_cost = 0
+            boundaries.append(global_position + 1)
+            position += 1
+            continue
+
+        capacity = target_cost - batch_cost
+        if cost > capacity:
+            boundaries.append(global_position)
+            batch_cost = 0
+            continue
+
+        take = min(max_rows - batch_rows, len(costs) - position, safe_take)
+        cumulative = np.cumsum(costs[position:position + take], dtype="uint64")
+        accepted = int(np.searchsorted(cumulative, capacity, side="right"))
+        if accepted == 0:
+            raise RuntimeError("The cost batch planner did not make progress.")
+        batch_cost += int(cumulative[accepted - 1])
+        position += accepted
+        global_position += accepted
+        if accepted < take or global_position - boundaries[-1] == max_rows:
+            boundaries.append(global_position)
+            batch_cost = 0
+    return batch_cost
+
+
+def _plan_regionprops_batches(
+    descriptor: Any,
+    axes: Sequence[str],
+    shape: Sequence[int],
+    rows_per_batch: int,
+    target_batch_cost: int,
+) -> BoundaryBatchPlan:
+    """Plan deterministic cost-bounded batches without materializing all row costs."""
+    columns = ([f"bb_min_{axis}" for axis in axes]
+               + [f"bb_max_{axis}" for axis in axes])
+    boundaries = [0]
+    batch_cost = 0
+    for start in range(0, descriptor.row_count, _COST_SCAN_ROWS):
+        stop = min(start + _COST_SCAN_ROWS, descriptor.row_count)
+        table = _read_parquet_rows(descriptor, start, stop, columns)
+        costs = _bounding_box_costs(table, axes, shape, start)
+        batch_cost = _extend_cost_boundaries(
+            boundaries, costs, start, target_batch_cost, rows_per_batch, batch_cost,
+        )
+    if boundaries[-1] != descriptor.row_count:
+        boundaries.append(descriptor.row_count)
+    return BoundaryBatchPlan(tuple(boundaries))
+
+
 def _regionprops_batch(batch: Any, writer: Any, *, ctx: Dict[str, Any]) -> None:
     axes = ctx["axes"]
     ndim = ctx["ndim"]
@@ -475,6 +584,7 @@ def _file_backed_regionprops(
     compute_surface: bool,
     output_table: Union[str, os.PathLike[str]],
     rows_per_batch: int,
+    target_batch_cost: Optional[int],
     num_workers: int,
     job_type: str,
     job_config: Optional[RunnerConfig],
@@ -486,6 +596,15 @@ def _file_backed_regionprops(
     rows_per_batch = int(rows_per_batch)
     if rows_per_batch <= 0:
         raise ValueError("rows_per_batch must be positive.")
+    if target_batch_cost is not None:
+        if (isinstance(target_batch_cost, bool)
+                or not isinstance(target_batch_cost, numbers.Integral)):
+            raise TypeError("target_batch_cost must be an integer or None.")
+        target_batch_cost = int(target_batch_cost)
+        if target_batch_cost <= 0:
+            raise ValueError("target_batch_cost must be positive.")
+        if target_batch_cost > _MAX_UINT64:
+            raise ValueError("target_batch_cost must fit in uint64.")
 
     runner = get_runner(job_type, job_config)
     try:
@@ -514,6 +633,17 @@ def _file_backed_regionprops(
             raise ValueError("output_table does not match the resumed run result sink.")
 
     output_schema = _output_schema(axes, compute_surface, src.ndim)
+    parameters = {
+        "resolution": [float(value) for value in resolution],
+        "compute_surface": bool(compute_surface),
+        "axes": list(axes),
+        "rows_per_batch": rows_per_batch,
+    }
+    if target_batch_cost is not None:
+        parameters.update({
+            "target_batch_cost": target_batch_cost,
+            "batch_cost_model": _BATCH_COST_MODEL,
+        })
     dataset = TableDataset.create(
         output_path,
         schema=output_schema,
@@ -524,15 +654,19 @@ def _file_backed_regionprops(
             "segmentation": _source_identity(seg_spec, src),
             "base_table": table_identity,
         },
-        parameters={
-            "resolution": [float(value) for value in resolution],
-            "compute_surface": bool(compute_surface),
-            "axes": list(axes),
-            "rows_per_batch": rows_per_batch,
-        },
+        parameters=parameters,
     )
-    batches = RegularBatchPlan(table_descriptor.row_count, rows_per_batch)
-    dataset._bind_batches(batches)
+    if dataset._dataset_record().get("work_plan") is None:
+        batches: BatchPlan
+        if target_batch_cost is None:
+            batches = RegularBatchPlan(table_descriptor.row_count, rows_per_batch)
+        else:
+            batches = _plan_regionprops_batches(
+                table_descriptor, axes, src.shape, rows_per_batch, target_batch_cost,
+            )
+        dataset._bind_batches(batches)
+    else:
+        batches = dataset._batch_plan()
     if stored_sink is not None and stored_sink != dataset._descriptor():
         raise ValueError("The resumed run uses an incompatible table result sink.")
 
@@ -544,15 +678,22 @@ def _file_backed_regionprops(
         "ndim": src.ndim,
         "compute_surface": bool(compute_surface),
     }
+    batch_arguments: Dict[str, Any]
+    if isinstance(batches, RegularBatchPlan):
+        batch_arguments = {
+            "n_items": batches.n_items,
+            "batch_size": batches.batch_size,
+        }
+    else:
+        batch_arguments = {"batch_boundaries": batches.boundaries}
     return runner.map_batches(
         functools.partial(_regionprops_batch, ctx=ctx),
-        table_descriptor.row_count,
-        batch_size=rows_per_batch,
         num_workers=num_workers,
         name="regionprops",
         pre_cleanup=pre_cleanup,
         resume_from=resume_from,
         result_sink=dataset,
+        **batch_arguments,
     )
 
 
@@ -565,6 +706,7 @@ def regionprops(
     output_path: Optional[str] = None,
     output_table: Optional[Union[str, os.PathLike[str]]] = None,
     rows_per_batch: int = 100_000,
+    target_batch_cost: Optional[int] = None,
     num_workers: int = 1,
     job_type: str = "local",
     job_config: Optional[RunnerConfig] = None,
@@ -574,9 +716,10 @@ def regionprops(
 ) -> Union["pd.DataFrame", TableDataset]:
     """Compute per-object features for a labeled image.
 
-    Set ``output_table`` to use bounded Parquet batches. This path requires a file-backed
-    segmentation and a `TableDataset` or Parquet input. It returns a `TableDataset` in input-row
-    order. Without ``output_table``, the function returns the existing label-sorted DataFrame.
+    Set ``output_table`` to use bounded Parquet batches. Set ``target_batch_cost`` to bound batches
+    by bounding-box voxel count as well as row count. This path requires a file-backed segmentation
+    and a `TableDataset` or Parquet input. It returns a `TableDataset` in input-row order. Without
+    ``output_table``, the function returns the existing label-sorted DataFrame.
 
     Args:
         input: Integer label image. File-backed output requires a reopenable source.
@@ -587,6 +730,8 @@ def regionprops(
         output_path: Write the DataFrame result to CSV or XLSX.
         output_table: Write a partitioned Parquet dataset to this directory.
         rows_per_batch: Maximum input rows in each file-backed batch.
+        target_batch_cost: Optional target bounding-box voxel count per file-backed batch.
+            Objects above the target form one-row batches. The row limit still applies.
         num_workers: Local threads or distributed worker concurrency.
         job_type: Execution backend.
         job_config: Runner configuration.
@@ -621,6 +766,7 @@ def regionprops(
             compute_surface=compute_surface,
             output_table=output_table,
             rows_per_batch=rows_per_batch,
+            target_batch_cost=target_batch_cost,
             num_workers=num_workers,
             job_type=job_type,
             job_config=job_config,
@@ -629,6 +775,8 @@ def regionprops(
         )
     if isinstance(table, TableDataset):
         raise ValueError("A TableDataset input requires output_table.")
+    if target_batch_cost is not None:
+        raise ValueError("target_batch_cost requires output_table.")
     return _dataframe_regionprops(
         src,
         table,

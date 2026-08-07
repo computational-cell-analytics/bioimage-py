@@ -147,6 +147,15 @@ assignments.
 Set `has_return_val=True` only when you need an ordered in-memory result for each batch. Ordered
 results use memory proportional to the batch count.
 
+Pass `batch_boundaries` instead of `n_items` and `batch_size` for deterministic irregular batches.
+The boundaries must start at zero and increase strictly. The runner stores them in the run manifest,
+so resume and reattach use the exact original plan.
+
+```python
+runner.map_batches(write_part, batch_boundaries=[0, 20_000, 75_000, 100_000],
+                   num_workers=64, has_return_val=False)
+```
+
 Use a `TableDataset` result sink for large typed tables. The batch function receives a
 `TablePartWriter`, writes one Arrow table, and returns `None`.
 
@@ -203,6 +212,7 @@ features = bp.morphology.regionprops(
     compute_surface=False,
     output_table="regionprops.parquet",
     rows_per_batch=100_000,
+    target_batch_cost=2_000_000_000,
     num_workers=64,
     job_type="slurm",
     job_config=cfg,
@@ -212,6 +222,12 @@ features = bp.morphology.regionprops(
 The function returns a `TableDataset`. The `output_table` path is a directory, including when its
 name ends in `.parquet`. Each output part contains one input-row batch. Parts and rows retain input
 order. Raw Parquet directories use lexical file order.
+
+`target_batch_cost` is optional. When set, `regionprops` estimates each row's cost from its
+bounding-box voxel count and packs contiguous rows up to that target. `rows_per_batch` remains a hard
+row limit. An object whose bounding box exceeds the target gets a one-row batch. Planning reads only
+the bounding-box columns in bounded chunks. Compatible reruns and resumes reuse the stored
+boundaries without rescanning the input table.
 
 The file-backed schema uses `uint64` for `label` and `n_voxels`, `int64` for bounding boxes, and
 `float64` for measurements. It adds `surface_area` only for a 3D input when `compute_surface=True`.

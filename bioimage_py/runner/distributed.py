@@ -29,9 +29,9 @@ from ._diagnostics import (append_attempt, atomic_write_json, attempt_folder, cr
                            latest_task_outcome, load_manifest, outcome_to_failure,
                            read_task_outcome, relative_path, update_attempt, utc_now,
                            write_task_outcome)
-from ._work import (AssignmentValues, Batch, ExplicitIdsSpec, RegularBatchPlan,
-                    WorkSpec, assignment_length, iter_assignment, load_work_spec, logical_size,
-                    make_shard_routing, partition_slices,
+from ._work import (AssignmentValues, Batch, BatchPlan, ExplicitIdsSpec, WorkSpec,
+                    assignment_length, is_batch_plan, iter_assignment, load_work_spec,
+                    logical_size, make_shard_routing, partition_slices,
                     persist_routed_positions, persist_work_spec)
 from .base import Runner, RunnerError, TaskFailure
 from .config import RunnerConfig, SlurmConfig
@@ -281,7 +281,7 @@ class _DistributedRunner(Runner):
         self,
         *,
         function: Callable[..., Any],
-        batches: RegularBatchPlan,
+        batches: BatchPlan,
         has_return_val: bool,
         num_workers: int,
         name: str,
@@ -343,7 +343,7 @@ class _DistributedRunner(Runner):
             n_tasks = self._resolve_n_tasks(num_workers, len(work))
             assignments = partition_slices(len(work), n_tasks)
 
-        logical_items = work.n_items if isinstance(work, RegularBatchPlan) else len(work)
+        logical_items = work.n_items if is_batch_plan(work) else len(work)
 
         create_manifest(
             tmp,
@@ -383,8 +383,8 @@ class _DistributedRunner(Runner):
         if sink_descriptor is not None:
             from ..tables import TableDataset, TablePartsError
 
-            if not isinstance(work, RegularBatchPlan):
-                raise ValueError("A table result sink requires a regular batch work plan.")
+            if not is_batch_plan(work):
+                raise ValueError("A table result sink requires a batch work plan.")
             dataset = TableDataset._from_descriptor(sink_descriptor)
             try:
                 results = dataset._finalize(work)
@@ -416,7 +416,7 @@ class _DistributedRunner(Runner):
                 continue
             failed_tasks.append(task_id)
             values = AssignmentValues(work, assignment, completed_units, tmp=tmp)
-            if isinstance(work, RegularBatchPlan):
+            if is_batch_plan(work):
                 failed_batches.extend(value for value in values if isinstance(value, Batch))
             else:
                 failed_specs.append(values)
@@ -447,8 +447,8 @@ class _DistributedRunner(Runner):
         assignments: Sequence[Mapping[str, Any]],
     ) -> List[int]:
         """Set each journal to the longest prefix with valid table parts."""
-        if not isinstance(work, RegularBatchPlan):
-            raise ValueError("A table result sink requires a regular batch work plan.")
+        if not is_batch_plan(work):
+            raise ValueError("A table result sink requires a batch work plan.")
         incomplete = []
         for task_id, assignment in enumerate(assignments):
             completed_units = 0
@@ -510,8 +510,8 @@ class _DistributedRunner(Runner):
         if missing_positions:
             task_failures = self._task_failures(tmp, range(n_tasks))
             failed_batches = ([work[position] for position in missing_positions]
-                              if isinstance(work, RegularBatchPlan) else [])
-            failed_ids = (None if isinstance(work, RegularBatchPlan)
+                              if is_batch_plan(work) else [])
+            failed_ids = (None if is_batch_plan(work)
                           else [int(work[position]) for position in missing_positions])
             raise RunnerError(
                 f"Result records are missing for {len(missing_positions)} work unit(s) after "

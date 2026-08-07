@@ -12,7 +12,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
-from .runner._work import Batch, RegularBatchPlan
+from .runner._work import Batch, BatchPlan, BoundaryBatchPlan, RegularBatchPlan
 
 
 DATASET_FORMAT_VERSION = 1
@@ -447,13 +447,20 @@ class TableDataset:
             raise ValueError(f"Table manifest for {self._path!r} has the wrong row count.")
         return record
 
-    def _bind_batches(self, batches: RegularBatchPlan) -> None:
-        work_plan = {
-            "kind": "regular_batches",
-            "n_items": int(batches.n_items),
-            "batch_size": int(batches.batch_size),
-            "length": len(batches),
-        }
+    def _bind_batches(self, batches: BatchPlan) -> None:
+        if isinstance(batches, RegularBatchPlan):
+            work_plan = {
+                "kind": "regular_batches",
+                "n_items": int(batches.n_items),
+                "batch_size": int(batches.batch_size),
+                "length": len(batches),
+            }
+        else:
+            work_plan = {
+                "kind": "boundary_batches",
+                "boundaries": [int(value) for value in batches.boundaries],
+                "length": len(batches),
+            }
         path = os.path.join(self._path, _DATASET_FILE)
         record = self._dataset_record()
         if record.get("work_plan") is None:
@@ -477,12 +484,20 @@ class TableDataset:
         return {"kind": "parquet_table", "path": self._path,
                 "identity": str(record["identity"])}
 
-    def _batch_plan(self) -> RegularBatchPlan:
+    def _batch_plan(self) -> BatchPlan:
         record = self._dataset_record()
         work = record.get("work_plan")
-        if not isinstance(work, dict) or work.get("kind") != "regular_batches":
+        if not isinstance(work, dict):
             raise ValueError("The table dataset has no supported batch work plan.")
-        plan = RegularBatchPlan(int(work["n_items"]), int(work["batch_size"]))
+        kind = work.get("kind")
+        if kind == "regular_batches":
+            plan: BatchPlan = RegularBatchPlan(
+                int(work["n_items"]), int(work["batch_size"]),
+            )
+        elif kind == "boundary_batches":
+            plan = BoundaryBatchPlan(tuple(int(value) for value in work["boundaries"]))
+        else:
+            raise ValueError("The table dataset has no supported batch work plan.")
         if int(work.get("length", -1)) != len(plan):
             raise ValueError("The table dataset work plan has an invalid length.")
         return plan

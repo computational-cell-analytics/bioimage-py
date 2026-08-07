@@ -5,7 +5,8 @@ import json
 import os
 from dataclasses import dataclass
 from math import ceil, gcd
-from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Sequence, Tuple, Union
+from typing import (Any, Dict, Iterable, Iterator, Mapping, Optional, Sequence, Tuple,
+                    TypeGuard, Union)
 
 import numpy as np
 
@@ -150,7 +151,13 @@ class BoundaryBatchPlan(Sequence[Batch]):
         return Batch(index, self.boundaries[index], self.boundaries[index + 1])
 
 
-WorkSpec = Union[RangeSpec, ExplicitIdsSpec, RegularBatchPlan, BoundaryBatchPlan]
+BatchPlan = Union[RegularBatchPlan, BoundaryBatchPlan]
+WorkSpec = Union[RangeSpec, ExplicitIdsSpec, BatchPlan]
+
+
+def is_batch_plan(value: object) -> TypeGuard[BatchPlan]:
+    """Return whether ``value`` is a regular or boundary-based batch plan."""
+    return isinstance(value, (RegularBatchPlan, BoundaryBatchPlan))
 
 
 def logical_size(value: Union[int, Batch]) -> int:

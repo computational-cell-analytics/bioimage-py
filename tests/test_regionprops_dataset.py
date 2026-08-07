@@ -1,4 +1,5 @@
 """File-backed regionprops behavior and scaling contracts."""
+import json
 import os
 
 import numpy as np
@@ -104,6 +105,124 @@ def test_raw_parquet_directory_uses_lexical_file_order_and_bounded_ranges(tmp_pa
     descriptor, _, _ = _describe_parquet_input(root, ["value"])
     table = _read_parquet_rows(descriptor, 1, 3, ["value"])
     assert table["value"].to_pylist() == [1, 2]
+
+
+def test_cost_planner_is_bounded_deterministic_and_greedy(tmp_path, monkeypatch):
+    import importlib
+
+    module = importlib.import_module("bioimage_py.morphology.regionprops")
+    base = pd.DataFrame({
+        "bb_min_z": [0, 0, 0, 0, 0],
+        "bb_min_y": [0, 0, 0, 0, 0],
+        "bb_min_x": [0, 0, 0, 0, 0],
+        "bb_max_z": [1, 1, 3, 0, 1],
+        "bb_max_y": [1, 1, 2, 0, 1],
+        "bb_max_x": [4, 6, 2, 0, 5],
+    })
+    path = tmp_path / "costs.parquet"
+    base.to_parquet(path, index=False, row_group_size=2)
+    columns = list(base.columns)
+    descriptor, _, _ = _describe_parquet_input(path, columns)
+
+    real_read = module._read_parquet_rows
+    reads = []
+
+    def bounded_read(descriptor, start, stop, requested):
+        reads.append((start, stop, tuple(requested)))
+        return real_read(descriptor, start, stop, requested)
+
+    monkeypatch.setattr(module, "_COST_SCAN_ROWS", 2)
+    monkeypatch.setattr(module, "_read_parquet_rows", bounded_read)
+    plan = module._plan_regionprops_batches(
+        descriptor, ("z", "y", "x"), (4, 8, 8), rows_per_batch=3,
+        target_batch_cost=10,
+    )
+
+    assert plan.boundaries == (0, 2, 3, 5)
+    assert reads == [
+        (0, 2, tuple(columns)), (2, 4, tuple(columns)), (4, 5, tuple(columns)),
+    ]
+    monkeypatch.setattr(module, "_COST_SCAN_ROWS", 4)
+    assert module._plan_regionprops_batches(
+        descriptor, ("z", "y", "x"), (4, 8, 8), rows_per_batch=3,
+        target_batch_cost=10,
+    ).boundaries == plan.boundaries
+
+
+def test_cost_planner_enforces_row_cap_and_checked_boxes(tmp_path):
+    import importlib
+
+    module = importlib.import_module("bioimage_py.morphology.regionprops")
+    base = pd.DataFrame({
+        "bb_min_z": [0] * 5, "bb_min_y": [0] * 5, "bb_min_x": [0] * 5,
+        "bb_max_z": [1] * 5, "bb_max_y": [1] * 5, "bb_max_x": [1] * 5,
+    })
+    path = tmp_path / "row-cap.parquet"
+    base.to_parquet(path, index=False)
+    descriptor, _, _ = _describe_parquet_input(path, list(base.columns))
+    assert module._plan_regionprops_batches(
+        descriptor, ("z", "y", "x"), (2, 2, 2), rows_per_batch=2,
+        target_batch_cost=100,
+    ).boundaries == (0, 2, 4, 5)
+
+    invalid = pa.table({
+        "bb_min_z": pa.array([0], type=pa.int64()),
+        "bb_min_y": pa.array([0], type=pa.int64()),
+        "bb_min_x": pa.array([0], type=pa.int64()),
+        "bb_max_z": pa.array([2**32], type=pa.int64()),
+        "bb_max_y": pa.array([2**32], type=pa.int64()),
+        "bb_max_x": pa.array([2**32], type=pa.int64()),
+    })
+    with pytest.raises(ValueError, match="above uint64"):
+        module._bounding_box_costs(
+            invalid, ("z", "y", "x"), (2**32, 2**32, 2**32), 0,
+        )
+
+
+def test_cost_aware_regionprops_matches_count_batches_and_reuses_plan(
+    tmp_path, zarr_factory, monkeypatch,
+):
+    import importlib
+
+    module = importlib.import_module("bioimage_py.morphology.regionprops")
+    seg = _segmentation()
+    source = zarr_factory(seg, chunks=(12, 14, 16))
+    base = bp.morphology.morphology(seg).iloc[[2, 0, 1]].reset_index(drop=True)
+    base_path = tmp_path / "cost-base.parquet"
+    base.to_parquet(base_path, index=False, row_group_size=1)
+
+    regular = bp.morphology.regionprops(
+        source,
+        base_path,
+        output_table=tmp_path / "regular-result.parquet",
+        rows_per_batch=3,
+    )
+    cost_path = tmp_path / "cost-result.parquet"
+    cost_aware = bp.morphology.regionprops(
+        source,
+        base_path,
+        output_table=cost_path,
+        rows_per_batch=3,
+        target_batch_cost=1_200,
+        num_workers=2,
+    )
+    pd.testing.assert_frame_equal(cost_aware.to_pandas(), regular.to_pandas())
+    assert [(part.start, part.stop) for part in cost_aware.iter_parts()] == [
+        (0, 2), (2, 3),
+    ]
+
+    def must_not_plan(*args, **kwargs):
+        raise AssertionError("a compatible rerun must reuse stored cost boundaries")
+
+    monkeypatch.setattr(module, "_plan_regionprops_batches", must_not_plan)
+    reused = bp.morphology.regionprops(
+        source,
+        base_path,
+        output_table=cost_path,
+        rows_per_batch=3,
+        target_batch_cost=1_200,
+    )
+    pd.testing.assert_frame_equal(reused.to_pandas(), cost_aware.to_pandas())
 
 
 def test_file_backed_regionprops_subprocess_writes_no_result_records(tmp_path, zarr_factory):
@@ -312,6 +431,60 @@ def test_file_backed_regionprops_resumes_distributed_run(tmp_path, zarr_factory)
     pd.testing.assert_frame_equal(result.to_pandas(), expected)
 
 
+def test_cost_aware_regionprops_resume_reuses_original_boundaries(
+    tmp_path, zarr_factory, monkeypatch,
+):
+    import importlib
+
+    module = importlib.import_module("bioimage_py.morphology.regionprops")
+    seg = _segmentation()
+    source = zarr_factory(seg, chunks=(12, 14, 16))
+    base = bp.morphology.morphology(seg).iloc[[2, 0, 1]].reset_index(drop=True)
+    base_path = tmp_path / "resume-cost-base.parquet"
+    output_path = tmp_path / "resume-cost-result.parquet"
+    base.to_parquet(base_path, index=False)
+
+    with pytest.raises(RunnerError) as error_info:
+        bp.morphology.regionprops(
+            source,
+            base_path,
+            output_table=output_path,
+            rows_per_batch=3,
+            target_batch_cost=1_200,
+            num_workers=1,
+            job_type="subprocess",
+            job_config=RunnerConfig(tmp_root=str(tmp_path), task_timeout=0.01),
+        )
+    with open(os.path.join(error_info.value.tmp_folder, "manifest.json")) as file:
+        manifest = json.load(file)
+    assert manifest["work_plan"] == {
+        "kind": "boundary_batches", "boundaries": [0, 2, 3], "length": 2,
+    }
+
+    monkeypatch.setattr(
+        module,
+        "_plan_regionprops_batches",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("resume must not recompute boundaries")
+        ),
+    )
+    result = bp.morphology.regionprops(
+        source,
+        base_path,
+        output_table=output_path,
+        rows_per_batch=3,
+        target_batch_cost=1_200,
+        num_workers=1,
+        job_type="subprocess",
+        job_config=RunnerConfig(tmp_root=str(tmp_path)),
+        resume_from=error_info.value.tmp_folder,
+    )
+    expected = _expected_in_input_order(
+        seg, base, resolution=(1.0, 1.0, 1.0), compute_surface=False,
+    )
+    pd.testing.assert_frame_equal(result.to_pandas(), expected)
+
+
 def test_file_backed_regionprops_rejects_incompatible_arguments(tmp_path, zarr_factory):
     seg = _segmentation()
     source = zarr_factory(seg, chunks=(12, 14, 16))
@@ -338,6 +511,22 @@ def test_file_backed_regionprops_rejects_incompatible_arguments(tmp_path, zarr_f
         bp.morphology.regionprops(
             source, base_path, output_table=tmp_path / "bad-size", rows_per_batch=0,
         )
+    with pytest.raises(ValueError, match="target_batch_cost must be positive"):
+        bp.morphology.regionprops(
+            source,
+            base_path,
+            output_table=tmp_path / "bad-cost",
+            target_batch_cost=0,
+        )
+    with pytest.raises(TypeError, match="target_batch_cost"):
+        bp.morphology.regionprops(
+            source,
+            base_path,
+            output_table=tmp_path / "bad-cost-type",
+            target_batch_cost=1.5,
+        )
+    with pytest.raises(ValueError, match="requires output_table"):
+        bp.morphology.regionprops(source, base, target_batch_cost=100)
     with pytest.raises(ValueError, match="must not contain"):
         bp.morphology.regionprops(
             source, base_path, output_table=tmp_path,

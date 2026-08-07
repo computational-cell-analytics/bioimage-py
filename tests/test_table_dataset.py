@@ -55,6 +55,34 @@ def test_local_table_sink_roundtrip_and_order(tmp_path):
     assert result.validate() is result
 
 
+def test_table_sink_accepts_and_persists_explicit_boundaries(tmp_path):
+    path = tmp_path / "irregular.parquet"
+    result = get_runner("local").map_batches(
+        _write_values,
+        batch_boundaries=[0, 1, 5, 7],
+        num_workers=2,
+        result_sink=_dataset(path),
+    )
+
+    assert result.row_count == 7
+    assert [(part.start, part.stop) for part in result.iter_parts()] == [
+        (0, 1), (1, 5), (5, 7),
+    ]
+    with open(path / "dataset.json") as file:
+        record = json.load(file)
+    assert record["work_plan"] == {
+        "kind": "boundary_batches", "boundaries": [0, 1, 5, 7], "length": 3,
+    }
+    assert TableDataset.open(path).validate().row_count == 7
+
+    with pytest.raises(ValueError, match="different batch work plan"):
+        get_runner("local").map_batches(
+            _write_values,
+            batch_boundaries=[0, 2, 5, 7],
+            result_sink=_dataset(path),
+        )
+
+
 def test_empty_table_dataset_and_column_selection(tmp_path):
     result = get_runner("local").map_batches(
         _write_values, 0, batch_size=3, result_sink=_dataset(tmp_path / "empty"),
