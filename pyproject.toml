@@ -13,6 +13,7 @@ authors = [{ name = "Constantin Pape", email = "constantin.pape@cs.uni-goettinge
 dependencies = [
     "numpy",
     "pandas",
+    "pyarrow",
     "scipy",
     "scikit-image>=0.20",
     "cloudpickle",
@@ -32,7 +33,6 @@ msr = ["msr-reader"]
 cloudvolume = ["cloud-volume"]
 tensorstore = ["tensorstore"]
 webknossos = ["webknossos"]
-table = ["pyarrow"]
 io-all = [
     "zarr>=3", "z5py", "h5py", "mrcfile", "nibabel", "imageio", "tifffile",
     "cloud-volume", "tensorstore", "webknossos",
