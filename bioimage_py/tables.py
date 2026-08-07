@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import base64
+import bisect
 import hashlib
 import json
 import math
 import os
 import tempfile
+import threading
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .runner._work import Batch, RegularBatchPlan
 
@@ -157,6 +159,25 @@ class TablePartMetadata:
     file_size: int
     schema_fingerprint: str
     checksum: str
+
+
+@dataclass(frozen=True)
+class _ParquetInputDescriptor:
+    """Compact worker description of an ordered Parquet table."""
+
+    kind: str
+    path: str
+    identity: str
+    row_count: int
+    schema_fingerprint: str
+    columns: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _ParquetInputPart:
+    path: str
+    row_count: int
+    row_group_counts: Tuple[int, ...]
 
 
 class TablePartsError(ValueError):
@@ -687,6 +708,269 @@ class TableDataset:
                 schema = pa.schema([schema.field(name) for name in columns])
             table = pa.Table.from_batches([], schema=schema)
         return table.to_pandas()
+
+
+def _schema_fingerprint(schema: Any) -> str:
+    return hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
+
+
+def _parquet_layout(path: str) -> Tuple[Any, Tuple[int, ...]]:
+    _, pq = _pyarrow()
+    try:
+        parquet = pq.ParquetFile(path)
+        metadata = parquet.metadata
+        counts = tuple(int(metadata.row_group(index).num_rows)
+                       for index in range(metadata.num_row_groups))
+    except (OSError, ValueError, TypeError) as error:
+        raise ValueError(f"Could not read Parquet metadata from {path!r}: {error}") from error
+    if sum(counts) != int(metadata.num_rows):
+        raise ValueError(f"Parquet row-group metadata is inconsistent in {path!r}.")
+    return parquet.schema_arrow, counts
+
+
+def _selected_schema(schema: Any, columns: Optional[Sequence[str]]) -> Any:
+    if columns is None:
+        return schema
+    missing = [name for name in columns if name not in schema.names]
+    if missing:
+        raise ValueError(f"Parquet input is missing required columns {missing}.")
+    pa, _ = _pyarrow()
+    return pa.schema([schema.field(name) for name in columns], metadata=schema.metadata)
+
+
+def _table_dataset_input(
+    path: str, columns: Optional[Sequence[str]],
+) -> Tuple[Any, List[_ParquetInputPart], str]:
+    dataset = TableDataset.open(path)
+    definition = dataset._dataset_record()
+    manifest = dataset._manifest_record()
+    schema = dataset.schema
+    parts = []
+    identity_parts = []
+    for record in manifest["parts"]:
+        part_path = os.path.join(dataset.path, str(record["path"]))
+        actual_schema, row_group_counts = _parquet_layout(part_path)
+        if not actual_schema.equals(schema, check_metadata=True):
+            raise ValueError(f"Table part {part_path!r} has an incompatible schema.")
+        row_count = int(record["row_count"])
+        if sum(row_group_counts) != row_count:
+            raise ValueError(f"Table part {part_path!r} has an incompatible row count.")
+        parts.append(_ParquetInputPart(part_path, row_count, row_group_counts))
+        identity_parts.append({
+            "path": str(record["path"]),
+            "row_count": row_count,
+            "file_size": int(record["file_size"]),
+            "schema_fingerprint": str(record["schema_fingerprint"]),
+            "checksum": record["checksum"],
+        })
+    identity = _fingerprint({
+        "kind": "table_dataset",
+        "dataset_identity": definition["identity"],
+        "parts": identity_parts,
+    })
+    return _selected_schema(schema, columns), parts, identity
+
+
+def _raw_parquet_files(path: str) -> List[str]:
+    if os.path.isfile(path):
+        return [path]
+    if not os.path.isdir(path):
+        raise ValueError(f"Parquet input path {path!r} does not exist.")
+    files = []
+    for folder, folders, names in os.walk(path):
+        folders[:] = sorted(name for name in folders if not name.startswith("."))
+        for name in sorted(names):
+            if not name.startswith(".") and name.lower().endswith(".parquet"):
+                files.append(os.path.join(folder, name))
+    if not files:
+        raise ValueError(f"Parquet input directory {path!r} contains no Parquet files.")
+    return sorted(files, key=lambda file_path: os.path.relpath(file_path, path))
+
+
+def _raw_parquet_input(
+    path: str, columns: Optional[Sequence[str]],
+) -> Tuple[Any, List[_ParquetInputPart], str]:
+    root = path if os.path.isdir(path) else os.path.dirname(path)
+    files = _raw_parquet_files(path)
+    schema = None
+    parts = []
+    identity_parts = []
+    for file_path in files:
+        file_schema, row_group_counts = _parquet_layout(file_path)
+        selected_schema = _selected_schema(file_schema, columns)
+        if schema is None:
+            schema = selected_schema
+        elif not selected_schema.equals(schema, check_metadata=False):
+            raise ValueError(
+                f"Raw Parquet fragment {file_path!r} has a different schema."
+            )
+        stat = os.stat(file_path)
+        row_count = sum(row_group_counts)
+        relative_path = os.path.relpath(file_path, root)
+        parts.append(_ParquetInputPart(file_path, row_count, row_group_counts))
+        identity_parts.append({
+            "path": relative_path,
+            "file_size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "row_count": row_count,
+            "row_group_counts": list(row_group_counts),
+            "schema_fingerprint": _schema_fingerprint(selected_schema.remove_metadata()),
+        })
+    assert schema is not None
+    identity = _fingerprint({"kind": "raw_parquet", "parts": identity_parts})
+    return schema, parts, identity
+
+
+def _inspect_parquet_input(
+    path: str, kind: str, columns: Optional[Sequence[str]],
+) -> Tuple[Any, List[_ParquetInputPart], str]:
+    if kind == "table_dataset":
+        return _table_dataset_input(path, columns)
+    if kind == "raw_parquet":
+        return _raw_parquet_input(path, columns)
+    raise ValueError(f"Unsupported Parquet input kind {kind!r}.")
+
+
+def _describe_parquet_input(
+    value: Any, columns: Optional[Sequence[str]] = None,
+) -> Tuple[_ParquetInputDescriptor, Any, Dict[str, Any]]:
+    """Describe a completed `TableDataset` or an ordered raw Parquet path."""
+    if isinstance(value, TableDataset):
+        path = value.path
+        kind = "table_dataset"
+    elif isinstance(value, (str, os.PathLike)):
+        path = os.path.abspath(os.fspath(value))
+        if os.path.isdir(path) and os.path.exists(os.path.join(path, _DATASET_FILE)):
+            kind = "table_dataset"
+        else:
+            kind = "raw_parquet"
+    else:
+        raise TypeError(
+            "File-backed table input must be a TableDataset or a Parquet file or directory path."
+        )
+
+    schema, parts, identity = _inspect_parquet_input(path, kind, columns)
+    row_count = sum(part.row_count for part in parts)
+    schema_fingerprint = _schema_fingerprint(
+        schema if kind == "table_dataset" else schema.remove_metadata()
+    )
+    descriptor = _ParquetInputDescriptor(
+        kind=kind,
+        path=path,
+        identity=identity,
+        row_count=row_count,
+        schema_fingerprint=schema_fingerprint,
+        columns=tuple(columns or ()),
+    )
+    input_identity = {
+        "kind": kind,
+        "path": path,
+        "identity": identity,
+        "row_count": row_count,
+        "schema_fingerprint": schema_fingerprint,
+    }
+    return descriptor, schema, input_identity
+
+
+class _ParquetRowReader:
+    def __init__(self, descriptor: _ParquetInputDescriptor):
+        schema, parts, identity = _inspect_parquet_input(
+            descriptor.path, descriptor.kind, descriptor.columns or None,
+        )
+        schema_fingerprint = _schema_fingerprint(
+            schema if descriptor.kind == "table_dataset" else schema.remove_metadata()
+        )
+        row_count = sum(part.row_count for part in parts)
+        if (identity != descriptor.identity or row_count != descriptor.row_count
+                or schema_fingerprint != descriptor.schema_fingerprint):
+            raise ValueError(
+                f"Parquet input {descriptor.path!r} changed after planning."
+            )
+        self.schema = schema
+        self.parts = tuple(parts)
+        total = 0
+        part_ends = []
+        for part in parts:
+            total += part.row_count
+            part_ends.append(total)
+        self.part_ends = tuple(part_ends)
+
+    def read_rows(self, start: int, stop: int, columns: Sequence[str]):
+        pa, pq = _pyarrow()
+        start = int(start)
+        stop = int(stop)
+        row_count = self.part_ends[-1] if self.part_ends else 0
+        if start < 0 or stop < start or stop > row_count:
+            raise IndexError(f"Parquet row range [{start}, {stop}) is out of bounds.")
+        missing = [name for name in columns if name not in self.schema.names]
+        if missing:
+            raise ValueError(f"Parquet input is missing required columns {missing}.")
+        selected_schema = pa.schema(
+            [self.schema.field(name) for name in columns], metadata=self.schema.metadata,
+        )
+        if start == stop:
+            return pa.Table.from_batches([], schema=selected_schema)
+
+        batches = []
+        part_index = bisect.bisect_right(self.part_ends, start)
+        while part_index < len(self.parts):
+            part = self.parts[part_index]
+            part_start = 0 if part_index == 0 else self.part_ends[part_index - 1]
+            part_stop = self.part_ends[part_index]
+            if part_start >= stop:
+                break
+            local_start = max(start, part_start) - part_start
+            local_stop = min(stop, part_stop) - part_start
+            parquet = pq.ParquetFile(part.path)
+            row_group_start = 0
+            for row_group, row_group_count in enumerate(part.row_group_counts):
+                row_group_stop = row_group_start + row_group_count
+                selected_start = max(local_start, row_group_start)
+                selected_stop = min(local_stop, row_group_stop)
+                if selected_start < selected_stop:
+                    batch_start = row_group_start
+                    batch_size = max(1, min(65_536, selected_stop - selected_start))
+                    for batch in parquet.iter_batches(
+                        batch_size=batch_size, row_groups=[row_group], columns=list(columns),
+                    ):
+                        batch_stop = batch_start + batch.num_rows
+                        take_start = max(selected_start, batch_start)
+                        take_stop = min(selected_stop, batch_stop)
+                        if take_start < take_stop:
+                            piece = batch.slice(
+                                take_start - batch_start, take_stop - take_start,
+                            )
+                            batches.append(pa.RecordBatch.from_arrays(
+                                list(piece.columns), schema=selected_schema,
+                            ))
+                        batch_start = batch_stop
+                row_group_start = row_group_stop
+            part_index += 1
+
+        result = pa.Table.from_batches(batches, schema=selected_schema)
+        if result.num_rows != stop - start:
+            raise ValueError(
+                f"Parquet row range [{start}, {stop}) returned {result.num_rows} rows."
+            )
+        return result
+
+
+_PARQUET_READER_CACHE: Dict[_ParquetInputDescriptor, _ParquetRowReader] = {}
+_PARQUET_READER_LOCK = threading.Lock()
+
+
+def _read_parquet_rows(
+    descriptor: _ParquetInputDescriptor,
+    start: int,
+    stop: int,
+    columns: Sequence[str],
+):
+    with _PARQUET_READER_LOCK:
+        reader = _PARQUET_READER_CACHE.get(descriptor)
+        if reader is None:
+            reader = _ParquetRowReader(descriptor)
+            _PARQUET_READER_CACHE[descriptor] = reader
+    return reader.read_rows(start, stop, columns)
 
 
 def _validate_dataset_record(record: Mapping[str, Any], path: str) -> None:

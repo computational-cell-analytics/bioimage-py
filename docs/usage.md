@@ -147,8 +147,8 @@ assignments.
 Set `has_return_val=True` only when you need an ordered in-memory result for each batch. Ordered
 results use memory proportional to the batch count.
 
-Use a `TableDataset` result sink for large typed tables. Install the `table` extra first. The batch
-function receives a `TablePartWriter`, writes one Arrow table, and returns `None`.
+Use a `TableDataset` result sink for large typed tables. The batch function receives a
+`TablePartWriter`, writes one Arrow table, and returns `None`.
 
 ```python
 import pyarrow as pa
@@ -188,6 +188,38 @@ also validates the parts and recomputes missing or invalid batches.
 The runner returns a lightweight `TableDataset`. Use `result.iter_parts()` for part metadata. Call
 `result.to_pandas()` only when you explicitly want to materialize the complete table. Runner cleanup
 never removes the table dataset.
+
+### File-backed `regionprops`
+
+Set `output_table` to process a large base morphology table in bounded row batches. This path
+accepts a completed `TableDataset`, a Parquet file, or a directory of Parquet files. It requires a
+reopenable segmentation source for all execution backends.
+
+```python
+features = bp.morphology.regionprops(
+    segmentation,
+    "morphology-base.parquet",
+    resolution=(40.0, 4.0, 4.0),
+    compute_surface=False,
+    output_table="regionprops.parquet",
+    rows_per_batch=100_000,
+    num_workers=64,
+    job_type="slurm",
+    job_config=cfg,
+)
+```
+
+The function returns a `TableDataset`. The `output_table` path is a directory, including when its
+name ends in `.parquet`. Each output part contains one input-row batch. Parts and rows retain input
+order. Raw Parquet directories use lexical file order.
+
+The file-backed schema uses `uint64` for `label` and `n_voxels`, `int64` for bounding boxes, and
+`float64` for measurements. It adds `surface_area` only for a 3D input when `compute_surface=True`.
+Use `features.to_pandas()` only when the complete result fits in memory.
+
+A compatible fresh call validates and skips completed parts. Use `resume_from` to resume a failed
+distributed run with its original task assignments. The file-backed path does not accept
+`item_ids`; its retry unit is one batch.
 
 ## Slurm configuration
 

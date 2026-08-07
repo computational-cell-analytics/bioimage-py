@@ -14,8 +14,8 @@ You can also install it from source by cloning the repository and then running
 python -m pip install -e .
 ```
 
-This pulls the core dependencies (numpy, pandas, scikit-image, cloudpickle, tqdm, threadpoolctl and
-`bioimage-cpp`), which are enough for in-memory (numpy) workflows and the `local` execution backend.
+This pulls the core dependencies, including numpy, pandas, pyarrow, scikit-image, and
+`bioimage-cpp`. These dependencies support in-memory workflows, Parquet tables, and local runs.
 
 ## Optional dependencies
 
@@ -34,10 +34,9 @@ the ones you need, e.g. `python -m pip install -e ".[io]"` or combine several
 | `cloudvolume` | `cloud-volume` | `CloudVolume` (precomputed) layers — writable, Linux only. |
 | `tensorstore` | `tensorstore` | TensorStore neuroglancer-precomputed layers — local ZYX reads and shard-safe writes. |
 | `webknossos` | `webknossos` | WebKnossos layers — read-only, remote or local. |
-| `table` | `pyarrow` | Typed, partitioned Parquet table datasets and runner result sinks. |
 | `io-all` | all array I/O packages above | Every supported array I/O backend in one install. |
 | `test` | `pytest`, `zarr>=3`, `scikit-image`, `scipy`, `openpyxl`, `pyarrow` | Running the test suite. |
 | `dev` | `flake8`, `pyflakes` | Linting. |
 
 Distributed array operations require a file-backed output. Install at least the `io` extra for
-those operations. Install the `table` extra to use Parquet table result sinks.
+these operations.

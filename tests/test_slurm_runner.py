@@ -13,6 +13,7 @@ import os
 import shutil
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pytest
 
@@ -175,6 +176,33 @@ def test_slurm_table_sink_reattach(shared_tmp_path):
     assert isinstance(result, bp.TableDataset)
     assert result.to_pandas()["item"].tolist() == list(range(5))
     assert not os.path.isdir(excinfo.value.tmp)
+
+
+def test_slurm_file_backed_regionprops(shared_zarr_factory, shared_tmp_path):
+    seg = np.zeros((24, 28, 32), dtype="uint64")
+    seg[2:8, 3:12, 4:14] = 7
+    seg[10:19, 15:25, 18:29] = 2
+    source = shared_zarr_factory(seg, chunks=(12, 14, 16))
+    base = bp.morphology.morphology(seg).iloc[::-1].reset_index(drop=True)
+    base_path = os.path.join(shared_tmp_path, "regionprops-base.parquet")
+    output_path = os.path.join(shared_tmp_path, "regionprops-result.parquet")
+    base.to_parquet(base_path, index=False)
+    expected = bp.morphology.regionprops(seg, base)
+    expected = expected.set_index("label").loc[base["label"].tolist()].reset_index()
+    expected["label"] = expected["label"].astype("uint64")
+    expected["n_voxels"] = expected["n_voxels"].astype("uint64")
+
+    result = bp.morphology.regionprops(
+        source,
+        base_path,
+        output_table=output_path,
+        rows_per_batch=1,
+        num_workers=2,
+        job_type="slurm",
+        job_config=_cfg(shared_tmp_path),
+    )
+
+    pd.testing.assert_frame_equal(result.to_pandas(), expected)
 
 
 def _make_shared_flaky(marker_path):
