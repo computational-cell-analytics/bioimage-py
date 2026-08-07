@@ -4,7 +4,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from concurrent import futures
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (Any, Callable, Iterable, Iterator, List, Mapping, Optional, Protocol,
+                    Sequence, Tuple)
 
 from bioimage_cpp.utils import Blocking
 from threadpoolctl import ThreadpoolController
@@ -14,6 +15,9 @@ from ..sources.base import Source
 from ..sources.dispatch import SourceLike, as_source
 from ..util import (ComputeFn, derive_block_shape, get_blocking, group_blocks_by_shard,
                     maybe_warn_imbalance, normalize_halo)
+from ._work import (Batch, ExplicitIdsSpec, RangeSpec, RegularBatchPlan, ShardRoutingPlan,
+                    WorkSpec, assignment_length, iter_assignment, logical_size,
+                    make_shard_routing)
 from .config import RunnerConfig
 
 # A single, process-wide threadpool controller, built once here at import time (in the main
@@ -49,22 +53,58 @@ class TaskFailure:
     traceback_path: Optional[str] = None
 
 
+class _FailedIdSpec(Protocol):
+    def __len__(self) -> int:
+        ...
+
+    def __iter__(self) -> Iterator[int]:
+        ...
+
+
 class RunnerError(RuntimeError):
-    """Raised when one or more blocks fail.
+    """Raised when one or more runner work units fail.
 
     Attributes:
-        failed_block_ids: The ids of the blocks that failed (re-run with these).
+        failed_block_ids: The failed IDs as a list. Access materializes compact ranges.
+        failed_block_count: The number of failed IDs.
+        failed_batches: The failed batches for :meth:`Runner.map_batches`.
         tmp_folder: The preserved temp folder for distributed jobs (``None`` for local).
         task_failures: Structured diagnostics for failed distributed tasks.
     """
 
     def __init__(self, message: str, failed_block_ids: Optional[Sequence[int]] = None,
                  tmp_folder: Optional[str] = None, *,
-                 task_failures: Optional[Sequence[TaskFailure]] = None):
+                 task_failures: Optional[Sequence[TaskFailure]] = None,
+                 failed_id_specs: Optional[Sequence[_FailedIdSpec]] = None,
+                 failed_batches: Optional[Sequence[Batch]] = None):
         super().__init__(message)
-        self.failed_block_ids: List[int] = [int(b) for b in (failed_block_ids or [])]
+        self._failed_block_ids = ([int(value) for value in failed_block_ids]
+                                  if failed_block_ids is not None else None)
+        self._failed_id_specs = tuple(failed_id_specs or ())
         self.tmp_folder = tmp_folder
         self.task_failures: List[TaskFailure] = list(task_failures or [])
+        self.failed_batches: Tuple[Batch, ...] = tuple(failed_batches or ())
+
+    @property
+    def failed_block_ids(self) -> List[int]:
+        """Return failed IDs as a list, materializing compact specifications on access."""
+        if self._failed_block_ids is None:
+            self._failed_block_ids = list(self.iter_failed_block_ids())
+            self._failed_id_specs = ()
+        return self._failed_block_ids
+
+    @property
+    def failed_block_count(self) -> int:
+        """Return the failed logical ID count without expanding compact ranges."""
+        explicit = len(self._failed_block_ids) if self._failed_block_ids is not None else 0
+        return explicit + sum(len(spec) for spec in self._failed_id_specs)
+
+    def iter_failed_block_ids(self) -> Iterator[int]:
+        """Iterate over failed IDs without expanding compact ranges."""
+        if self._failed_block_ids is not None:
+            yield from self._failed_block_ids
+        for spec in self._failed_id_specs:
+            yield from (int(value) for value in spec)
 
 
 def run_block(function: ComputeFn, blocking: Blocking, block_id: int,
@@ -187,13 +227,13 @@ class Runner(ABC):
 
         blocking = get_blocking(domain.shape, block_shape, roi)
         if block_ids is None:
-            block_ids = list(range(int(blocking.number_of_blocks)))
+            work: WorkSpec = RangeSpec(0, int(blocking.number_of_blocks))
         else:
-            block_ids = [int(b) for b in block_ids]
+            work = ExplicitIdsSpec(block_ids)
 
         results = self._execute(
             function=function, inputs=inputs, outputs=outputs, mask=mask_source,
-            blocking=blocking, block_ids=block_ids, halo=halo_n,
+            blocking=blocking, block_ids=work, halo=halo_n,
             has_return_val=has_return_val, num_workers=num_workers, name=name,
             shape=tuple(domain.shape), block_shape=block_shape, roi=roi,
             pre_cleanup=pre_cleanup,
@@ -251,12 +291,57 @@ class Runner(ABC):
         if item_ids is None:
             if n_items is None:
                 raise ValueError("map() requires either n_items or item_ids.")
-            item_ids = list(range(int(n_items)))
+            if int(n_items) < 0:
+                raise ValueError("n_items must be non-negative.")
+            work: WorkSpec = RangeSpec(0, int(n_items))
         else:
-            item_ids = [int(i) for i in item_ids]
+            work = ExplicitIdsSpec(item_ids)
 
         results = self._execute_map(
-            function=function, item_ids=item_ids, has_return_val=has_return_val,
+            function=function, item_ids=work, has_return_val=has_return_val,
+            num_workers=num_workers, name=name, pre_cleanup=pre_cleanup,
+        )
+        return results if has_return_val else None
+
+    def map_batches(
+        self,
+        function: Callable[[Batch], Any],
+        n_items: Optional[int] = None,
+        *,
+        batch_size: Optional[int] = None,
+        num_workers: int = 1,
+        has_return_val: bool = False,
+        name: str = "",
+        pre_cleanup: Optional[Callable[[str], None]] = None,
+        resume_from: Optional[str] = None,
+    ) -> Optional[list]:
+        """Map ``function(batch)`` over deterministic contiguous batches.
+
+        The completion, failure, and retry unit is one :class:`Batch`. A batch function can
+        write output through its closure and return no in-memory result.
+
+        Args:
+            function: The function ``function(batch) -> result``.
+            n_items: The non-negative logical item count.
+            batch_size: The positive maximum number of items in each batch.
+            num_workers: The local concurrency or distributed task throttle.
+            has_return_val: Collect one ordered result per batch when true.
+            name: A short progress display name.
+            pre_cleanup: Distributed success callback. See :meth:`run`.
+            resume_from: A preserved distributed run folder.
+
+        Returns:
+            One result per batch when ``has_return_val`` is true. Otherwise, returns ``None``.
+        """
+        if resume_from is not None:
+            return self._resume_entry(resume_from, name=name, pre_cleanup=pre_cleanup)
+        if n_items is None:
+            raise ValueError("map_batches() requires n_items.")
+        if batch_size is None:
+            raise ValueError("map_batches() requires batch_size.")
+        batches = RegularBatchPlan(int(n_items), int(batch_size))
+        results = self._execute_batches(
+            function=function, batches=batches, has_return_val=has_return_val,
             num_workers=num_workers, name=name, pre_cleanup=pre_cleanup,
         )
         return results if has_return_val else None
@@ -313,7 +398,7 @@ class Runner(ABC):
         outputs: Sequence[Source],
         mask: Optional[Source],
         blocking: Blocking,
-        block_ids: Sequence[int],
+        block_ids: WorkSpec,
         halo: Optional[Sequence[int]],
         has_return_val: bool,
         num_workers: int,
@@ -322,7 +407,7 @@ class Runner(ABC):
         block_shape: Tuple[int, ...],
         roi: Optional[Tuple[slice, ...]],
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> List[Any]:
+    ) -> Optional[List[Any]]:
         """Execute the per-block function over ``block_ids`` and return ordered results."""
         ...
 
@@ -331,13 +416,27 @@ class Runner(ABC):
         self,
         *,
         function: Callable[[int], Any],
-        item_ids: Sequence[int],
+        item_ids: WorkSpec,
         has_return_val: bool,
         num_workers: int,
         name: str,
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> List[Any]:
+    ) -> Optional[List[Any]]:
         """Execute ``function(index)`` over ``item_ids`` and return ordered results."""
+        ...
+
+    @abstractmethod
+    def _execute_batches(
+        self,
+        *,
+        function: Callable[[Batch], Any],
+        batches: RegularBatchPlan,
+        has_return_val: bool,
+        num_workers: int,
+        name: str,
+        pre_cleanup: Optional[Callable[[str], None]] = None,
+    ) -> Optional[List[Any]]:
+        """Execute ``function(batch)`` over a regular batch plan."""
         ...
 
 
@@ -352,7 +451,7 @@ class LocalRunner(Runner):
         outputs: Sequence[Source],
         mask: Optional[Source],
         blocking: Blocking,
-        block_ids: Sequence[int],
+        block_ids: WorkSpec,
         halo: Optional[Sequence[int]],
         has_return_val: bool,
         num_workers: int,
@@ -361,106 +460,290 @@ class LocalRunner(Runner):
         block_shape: Tuple[int, ...],
         roi: Optional[Tuple[slice, ...]],
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> List[Any]:
-        """Run the blocks in a thread pool, collecting results and re-raising failures.
-
-        ``pre_cleanup`` is accepted for interface parity but ignored: the local runner has
-        no temp folder (and no per-worker concept) to read out before returning.
-        """
+    ) -> Optional[List[Any]]:
         def call_one(bid: int) -> Any:
             return run_block(function, blocking, bid, inputs, outputs, mask, halo)
 
-        # For sharded outputs, group blocks so each shard is written by a single thread
-        # (a group runs sequentially) and never corrupted by concurrent writes; otherwise
-        # each block is its own group, reproducing the plain one-future-per-block path.
+        shard_shapes = [output.shards for output in outputs if output.shards is not None]
+        if shard_shapes and isinstance(block_ids, RangeSpec) and block_ids == RangeSpec(
+                0, int(blocking.number_of_blocks)):
+            routing = make_shard_routing(blocking, shard_shapes)
+            assignments = _ComponentAssignments(routing)
+            if routing.n_components <= 10_000:
+                loads = [assignment_length(assignments[index])
+                         for index in range(len(assignments))]
+                maybe_warn_imbalance(loads, num_workers, routing.n_components, name)
+            return self._run_assignment_pool(
+                block_ids, assignments, call_one, num_workers, name,
+                has_return_val=has_return_val, unit="block",
+            )
+
         groups = group_blocks_by_shard(blocking, outputs, block_ids)
-        if groups is None:
-            groups = [[int(b)] for b in block_ids]
-        else:
-            maybe_warn_imbalance([len(g) for g in groups], num_workers, len(groups), name)
-        return self._run_pool(groups, call_one, num_workers, name, unit="block")
+        if groups is not None:
+            maybe_warn_imbalance([len(group) for group in groups], num_workers,
+                                 len(groups), name)
+            return self._run_legacy_groups(
+                groups, block_ids, call_one, num_workers, name,
+                has_return_val=has_return_val, unit="block",
+            )
+        return self._run_pool(
+            block_ids, call_one, num_workers, name,
+            has_return_val=has_return_val, unit="block",
+        )
 
     def _execute_map(
         self,
         *,
         function: Callable[[int], Any],
-        item_ids: Sequence[int],
+        item_ids: WorkSpec,
         has_return_val: bool,
         num_workers: int,
         name: str,
         pre_cleanup: Optional[Callable[[str], None]] = None,
-    ) -> List[Any]:
-        """Run ``function(index)`` over ``item_ids`` in a thread pool (``pre_cleanup`` ignored)."""
-        groups = [[int(i)] for i in item_ids]
-        return self._run_pool(groups, lambda i: function(int(i)), num_workers, name, unit="item")
+    ) -> Optional[List[Any]]:
+        return self._run_pool(
+            item_ids, lambda item_id: function(int(item_id)), num_workers, name,
+            has_return_val=has_return_val, unit="item",
+        )
+
+    def _execute_batches(
+        self,
+        *,
+        function: Callable[[Batch], Any],
+        batches: RegularBatchPlan,
+        has_return_val: bool,
+        num_workers: int,
+        name: str,
+        pre_cleanup: Optional[Callable[[str], None]] = None,
+    ) -> Optional[List[Any]]:
+        return self._run_pool(
+            batches, function, num_workers, name, has_return_val=has_return_val,
+            unit="batch",
+        )
 
     @staticmethod
-    def _run_pool(groups: Sequence[Sequence[int]], call_one: Callable[[int], Any],
-                  num_workers: int, name: str, *, unit: str = "block") -> List[Any]:
-        """Run ``call_one(id)`` for each id in a thread pool, ordered, re-raising failures.
-
-        The schedulable unit is a *group*: the ids in a group are run sequentially within one
-        worker thread, while distinct groups run concurrently. Singleton groups reproduce the
-        one-future-per-id behavior; multi-id groups serialize same-shard writes (see
-        :func:`bioimage_py.util.group_blocks_by_shard`).
-
-        Args:
-            groups: The work groups; each is a list of ids (block ids or item indices) run
-                sequentially. Results are returned in flattened ``groups`` order.
-            call_one: The per-id callable returning that id's result.
-            num_workers: Number of worker threads.
-            name: A short name for the progress bar (disabled when empty).
-            unit: The noun used in the failure message ("block" or "item").
-
-        Returns:
-            The per-id results in flattened ``groups`` order.
-
-        Raises:
-            RunnerError: If any id fails; the failed ids are attached for re-running. When an
-                id in a group fails, the remaining (un-run) ids of that group are reported as
-                failed too, since later same-shard writes cannot safely proceed.
-        """
-        groups = [list(g) for g in groups]
-        flat_ids = [i for g in groups for i in g]
-        result_by_id: Dict[int, Any] = {}
-        failed: List[int] = []
+    def _run_pool(work: WorkSpec, call_one: Callable[[Any], Any], num_workers: int,
+                  name: str, *, has_return_val: bool, unit: str) -> Optional[List[Any]]:
+        """Run scalar work with a bounded pending-future window."""
+        worker_count = max(1, int(num_workers))
+        pending_limit = 2 * worker_count
+        results = [None] * len(work) if has_return_val else None
+        pending: dict[futures.Future[Any], Tuple[int, Any]] = {}
+        next_position = 0
+        failed_positions: List[int] = []
         first_error: Optional[BaseException] = None
+        stop_submitting = False
 
-        def _run_group(group: List[int]):
-            # Limit nested BLAS/OpenMP parallelism to 1 within this worker thread, reusing the
-            # process-wide controller (see _TP_CONTROLLER) so no per-thread dl_iterate_phdr scan
-            # is performed here -- that scan would deadlock against concurrent first-time imports.
+        def invoke(value: Any) -> Any:
             with _TP_CONTROLLER.limit(limits=1):
-                local: Dict[int, Any] = {}
-                local_failed: List[int] = []
-                err: Optional[BaseException] = None
-                for k, bid in enumerate(group):
-                    try:
-                        local[bid] = call_one(bid)
-                    except Exception as error:  # noqa: BLE001 - we re-raise as RunnerError
-                        err = error
-                        local_failed = list(group[k:])
+                return call_one(value)
+
+        def submit(executor: futures.ThreadPoolExecutor) -> None:
+            nonlocal next_position
+            while (not stop_submitting and len(pending) < pending_limit
+                   and next_position < len(work)):
+                value = work[next_position]
+                pending[executor.submit(invoke, value)] = (next_position, value)
+                next_position += 1
+
+        total = work.n_items if isinstance(work, RegularBatchPlan) else len(work)
+        with futures.ThreadPoolExecutor(worker_count) as executor:
+            submit(executor)
+            with tqdm(total=total, desc=name or None, disable=not name) as progress:
+                while pending:
+                    done, _ = futures.wait(pending, return_when=futures.FIRST_COMPLETED)
+                    for future in done:
+                        position, value = pending.pop(future)
+                        try:
+                            result = future.result()
+                        except Exception as error:  # noqa: BLE001
+                            failed_positions.append(position)
+                            stop_submitting = True
+                            if first_error is None:
+                                first_error = error
+                        else:
+                            if results is not None:
+                                results[position] = result
+                            progress.update(logical_size(value))
+                    submit(executor)
+
+        if failed_positions or next_position < len(work):
+            if isinstance(work, RegularBatchPlan):
+                failed_batches = tuple(work[position] for position in failed_positions)
+                failed_batches += tuple(work[position] for position in
+                                        range(next_position, len(work)))
+                raise RunnerError(
+                    f"{len(failed_batches)} batch(es) failed or were not started in "
+                    f"'{name or 'run'}'. First error: {first_error!r}",
+                    failed_batches=failed_batches,
+                )
+            failed_specs: List[_FailedIdSpec] = [
+                ExplicitIdsSpec(tuple(int(work[position]) for position in failed_positions))
+            ]
+            if next_position < len(work):
+                failed_specs.append(work[next_position:])  # type: ignore[arg-type]
+            failed_count = sum(len(spec) for spec in failed_specs)
+            preview = []
+            for spec in failed_specs:
+                for value in spec:
+                    preview.append(int(value))
+                    if len(preview) == 10:
                         break
-                return local, local_failed, err
-
-        with futures.ThreadPoolExecutor(max(1, int(num_workers))) as tp:
-            fut_to_group = {tp.submit(_run_group, g): g for g in groups}
-            with tqdm(total=len(flat_ids), desc=name or None, disable=not name) as pbar:
-                for fut in futures.as_completed(fut_to_group):
-                    group = fut_to_group[fut]
-                    local, local_failed, err = fut.result()
-                    result_by_id.update(local)
-                    if local_failed:
-                        failed.extend(local_failed)
-                        if first_error is None:
-                            first_error = err
-                    pbar.update(len(group))
-
-        if failed:
-            failed = sorted(set(failed))
+                if len(preview) == 10:
+                    break
             raise RunnerError(
-                f"{len(failed)} {unit}(s) failed in '{name or 'run'}': "
-                f"{failed[:10]}. First error: {first_error!r}",
-                failed_block_ids=failed,
+                f"{failed_count} {unit}(s) failed or were not started in "
+                f"'{name or 'run'}': {preview}. First error: {first_error!r}",
+                failed_id_specs=failed_specs,
             )
-        return [result_by_id[i] for i in flat_ids]
+        return results
+
+    @staticmethod
+    def _run_assignment_pool(
+        work: WorkSpec,
+        assignments: Sequence[Mapping[str, Any]],
+        call_one: Callable[[Any], Any],
+        num_workers: int,
+        name: str,
+        *,
+        has_return_val: bool,
+        unit: str,
+    ) -> Optional[List[Any]]:
+        """Run compact multi-item assignments with bounded pending futures."""
+        worker_count = max(1, int(num_workers))
+        pending_limit = 2 * worker_count
+        results = [None] * len(work) if has_return_val else None
+        pending: dict[futures.Future[Any], Tuple[int, Mapping[str, Any]]] = {}
+        next_assignment = 0
+        failed_specs: List[_FailedIdSpec] = []
+        first_error: Optional[BaseException] = None
+        stop_submitting = False
+
+        def run_assignment(assignment: Mapping[str, Any]):
+            local_results = [] if has_return_val else None
+            with _TP_CONTROLLER.limit(limits=1):
+                for offset, (position, value) in enumerate(iter_assignment(work, assignment)):
+                    try:
+                        result = call_one(value)
+                    except Exception as error:  # noqa: BLE001
+                        return local_results, offset, error
+                    if local_results is not None:
+                        local_results.append((position, result))
+            return local_results, None, None
+
+        def submit(executor: futures.ThreadPoolExecutor) -> None:
+            nonlocal next_assignment
+            while (not stop_submitting and len(pending) < pending_limit
+                   and next_assignment < len(assignments)):
+                assignment = assignments[next_assignment]
+                pending[executor.submit(run_assignment, assignment)] = (
+                    next_assignment, assignment)
+                next_assignment += 1
+
+        with futures.ThreadPoolExecutor(worker_count) as executor:
+            submit(executor)
+            with tqdm(total=len(work), desc=name or None, disable=not name) as progress:
+                while pending:
+                    done, _ = futures.wait(pending, return_when=futures.FIRST_COMPLETED)
+                    for future in done:
+                        _, assignment = pending.pop(future)
+                        local_results, failed_offset, error = future.result()
+                        if results is not None:
+                            for position, result in local_results:
+                                results[position] = result
+                        if failed_offset is not None:
+                            stop_submitting = True
+                            failed_specs.append(_AssignmentValues(work, assignment, failed_offset))
+                            if first_error is None:
+                                first_error = error
+                        completed = (assignment_length(assignment) if failed_offset is None
+                                     else failed_offset)
+                        progress.update(completed)
+                    submit(executor)
+
+        if next_assignment < len(assignments):
+            first = assignments[next_assignment]
+            last = assignments[-1]
+            if first.get("kind") == "shard_components":
+                failed_specs.append(_AssignmentValues(
+                    work,
+                    {"kind": "shard_components", "start": first["start"],
+                     "stop": last["stop"], "routing": first["routing"]},
+                ))
+            else:
+                failed_specs.extend(_AssignmentValues(work, assignments[index])
+                                    for index in range(next_assignment, len(assignments)))
+        if failed_specs:
+            failed_count = sum(len(spec) for spec in failed_specs)
+            raise RunnerError(
+                f"{failed_count} {unit}(s) failed or were not started in "
+                f"'{name or 'run'}'. First error: {first_error!r}",
+                failed_id_specs=failed_specs,
+            )
+        return results
+
+    @classmethod
+    def _run_legacy_groups(
+        cls,
+        groups: Sequence[Sequence[int]],
+        work: WorkSpec,
+        call_one: Callable[[Any], Any],
+        num_workers: int,
+        name: str,
+        *,
+        has_return_val: bool,
+        unit: str,
+    ) -> Optional[List[Any]]:
+        positions: dict[int, List[int]] = {}
+        for position, value in enumerate(work):
+            positions.setdefault(int(value), []).append(position)
+        position_groups = []
+        for group in groups:
+            position_groups.append(tuple(positions[int(value)].pop(0) for value in group))
+
+        class LegacyAssignments(Sequence[Mapping[str, Any]]):
+            def __len__(self) -> int:
+                return len(position_groups)
+
+            def __getitem__(self, index: int) -> Mapping[str, Any]:
+                return {"kind": "positions", "positions": position_groups[index]}
+
+        return cls._run_assignment_pool(
+            work, LegacyAssignments(), call_one, num_workers, name,
+            has_return_val=has_return_val, unit=unit,
+        )
+
+
+class _AssignmentValues(Iterable[int]):
+    """A lazy failed-ID view over one compact task assignment."""
+
+    def __init__(self, work: WorkSpec, assignment: Mapping[str, Any], skip: int = 0):
+        self._work = work
+        self._assignment = assignment
+        self._skip = int(skip)
+
+    def __len__(self) -> int:
+        return assignment_length(self._assignment) - self._skip
+
+    def __iter__(self) -> Iterator[int]:
+        for _, value in iter_assignment(self._work, self._assignment, self._skip):
+            yield int(value)
+
+
+class _ComponentAssignments(Sequence[Mapping[str, Any]]):
+    """A lazy sequence with one assignment per shard-routing component."""
+
+    def __init__(self, routing: ShardRoutingPlan):
+        self._routing = routing
+        self._descriptor = routing.descriptor()
+
+    def __len__(self) -> int:
+        return self._routing.n_components
+
+    def __getitem__(self, index: int) -> Mapping[str, Any]:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        return {"kind": "shard_components", "start": index, "stop": index + 1,
+                "length": self._routing.component_size(index), "routing": self._descriptor}

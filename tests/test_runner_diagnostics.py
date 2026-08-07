@@ -56,7 +56,10 @@ def test_subprocess_failure_has_structured_diagnostics(tmp_path):
         assert "diagnostic boom" in f.read()
 
     manifest = load_manifest(error.tmp_folder, expected_backend="subprocess")
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
+    assert manifest["work_plan"] == {
+        "kind": "range", "start": 0, "stop": 3, "step": 1, "length": 3,
+    }
     assert manifest["attempts"][0]["status"] == "failed"
     assert manifest["attempts"][0]["outcomes_path"] == "attempts/0001/tasks"
 
@@ -93,7 +96,7 @@ def test_subprocess_resume_appends_attempt_history(zarr_factory, rng, tmp_path):
 
 def _prepare_slurm_attempt(tmp_path, task_ids=(2, 3)):
     tmp = str(tmp_path)
-    for folder in ("blocks", "error", "progress", "results", "success", "timings"):
+    for folder in ("error", "progress", "results", "success", "timings", "work"):
         os.makedirs(os.path.join(tmp, folder), exist_ok=True)
     create_manifest(tmp, backend="slurm", name="test", n_tasks=4,
                     python_executable="/usr/bin/python")
@@ -179,18 +182,20 @@ def test_slurm_accounting_falls_back_to_core_fields(tmp_path, monkeypatch):
 
 def test_reattach_uses_persisted_terminal_outcome(tmp_path, monkeypatch):
     tmp = str(tmp_path)
-    for folder in ("blocks", "error", "progress", "results", "success", "timings"):
+    for folder in ("error", "progress", "results", "success", "timings", "work"):
         os.makedirs(os.path.join(tmp, folder), exist_ok=True)
-    with open(os.path.join(tmp, "blocks", "0.json"), "w") as f:
-        json.dump([7], f)
     with open(os.path.join(tmp, "payload.pkl"), "wb") as f:
         cloudpickle.dump({
             "has_return_val": False,
             "versions": distributed._env_versions(),
         }, f)
 
-    create_manifest(tmp, backend="slurm", name="forgotten", n_tasks=1,
-                    python_executable="/usr/bin/python")
+    create_manifest(
+        tmp, backend="slurm", name="forgotten", n_tasks=1,
+        python_executable="/usr/bin/python", mode="map",
+        work_plan={"kind": "range", "start": 7, "stop": 8, "step": 1, "length": 1},
+        assignments=[{"kind": "slice", "start": 0, "stop": 1}], logical_items=1,
+    )
     append_attempt(tmp, task_ids=[0], concurrency=1)
     update_attempt(tmp, 1, status="failed", job_id="900")
     write_task_outcome(tmp, 1, {

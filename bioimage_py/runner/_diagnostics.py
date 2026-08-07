@@ -10,7 +10,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 from .base import TaskFailure
 
 
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 OUTCOME_SCHEMA_VERSION = 1
 
 
@@ -41,7 +41,10 @@ def atomic_write_json(path: str, value: Any) -> None:
 
 
 def create_manifest(tmp: str, *, backend: str, name: str, n_tasks: int,
-                    python_executable: str) -> None:
+                    python_executable: str, mode: Optional[str] = None,
+                    work_plan: Optional[Mapping[str, Any]] = None,
+                    assignments: Optional[Sequence[Mapping[str, Any]]] = None,
+                    logical_items: Optional[int] = None) -> None:
     """Create the versioned run manifest before the first launch attempt."""
     atomic_write_json(
         os.path.join(tmp, "manifest.json"),
@@ -52,6 +55,11 @@ def create_manifest(tmp: str, *, backend: str, name: str, n_tasks: int,
             "name": name,
             "n_tasks": int(n_tasks),
             "python_executable": python_executable,
+            "mode": mode,
+            "work_plan": dict(work_plan) if work_plan is not None else None,
+            "assignments": ([dict(assignment) for assignment in assignments]
+                            if assignments is not None else None),
+            "logical_items": logical_items,
             "attempts": [],
         },
     )

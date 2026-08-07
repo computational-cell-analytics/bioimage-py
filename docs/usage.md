@@ -2,7 +2,7 @@
 
 Operations run block-wise and share a common interface: pass `block_shape` and `num_workers` for
 parallel local execution, or `job_type="slurm"` to run distributed (one task per
-block). For distributed runs the `output` must be a file-backed (zarr/n5) array.
+worker by default). For distributed runs the `output` must be a file-backed (zarr/n5) array.
 
 ## `copy` — block-wise copy of one source into another
 
@@ -70,7 +70,8 @@ try:
     bp.filters.gaussian_smoothing(raw, 2.0, output=out, block_shape=(64, 64, 64),
                                   num_workers=64, job_type="slurm")
 except RunnerError as e:
-    print(e.failed_block_ids)  # e.g. [128, 129, 511]
+    print(e.failed_block_count)
+    print(list(e.iter_failed_block_ids())[:10])
     print(e.tmp_folder)        # /shared/tmp/bioimage_py_xxxx  (preserved for resume/debug)
     for failure in e.task_failures:
         print(failure.task_id, failure.scheduler_state, failure.exit_code)
@@ -86,6 +87,10 @@ The preserved folder contains a versioned `manifest.json`. Its `attempts` list k
 resume, and Slurm submission failure. Attempt-specific directories keep logs, tracebacks, outcomes,
 timings, and Slurm accounting observations. Successful runs still remove the folder after the
 optional `pre_cleanup` callback runs.
+
+The manifest also stores a compact work plan and deterministic task assignments. Default item and
+block ranges do not create one manifest entry per item. Explicit ID sequences use JSON when small
+and a memory-mapped int64 file when large.
 
 **Recommended — `resume_from`** (distributed only). Re-issue the *same* call pointing at the
 preserved temp folder: only the incomplete blocks are re-run, and the result is merged with the
@@ -115,6 +120,32 @@ global cross-block merge, so a failed `label` is re-run **whole** (it accepts ne
 `morphology.regionprops` re-runs per object via `item_ids` / `resume_from`. A `local` run keeps no
 temp folder, so re-run it (optionally with `block_ids=e.failed_block_ids`); `resume_from` is rejected
 for `job_type="local"`.
+
+## Batch mapping
+
+Use `Runner.map_batches` when one function call can process several logical items. The runner passes
+a frozen `Batch` with `batch_id`, `start`, `stop`, and `step` fields. Batch boundaries stay the same
+when the worker or task count changes.
+
+```python
+from bioimage_py.runner import Batch, get_runner
+
+def write_part(batch: Batch):
+    rows = compute_rows(range(batch.start, batch.stop))
+    write_batch_file(batch.batch_id, rows)
+
+runner = get_runner("slurm", cfg)
+runner.map_batches(write_part, n_items=10_000_000, batch_size=100_000,
+                   num_workers=64, has_return_val=False)
+```
+
+The completion and retry unit is one batch. Distributed workers write one 16-byte completion record
+after a batch succeeds. Progress reports logical items. A failed call exposes
+`RunnerError.failed_batches`. Use `resume_from` to process only incomplete batches with the original
+assignments.
+
+Set `has_return_val=True` only when you need an ordered in-memory result for each batch. Ordered
+results use memory proportional to the batch count. Phase 3 will add file-backed result sinks.
 
 ## Slurm configuration
 

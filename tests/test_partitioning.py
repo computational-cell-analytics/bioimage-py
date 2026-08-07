@@ -4,13 +4,11 @@ These need no real ``sbatch`` -- the subprocess backend exercises the shared par
 (``_run_ids`` / ``_resolve_n_tasks``) that slurm inherits, and the slurm-specific cap is checked
 against a ``max_array_size`` set in the config (so ``scontrol`` is never queried).
 """
-import glob
-import json
-import os
-
 import numpy as np
 
 from bioimage_py.runner import RunnerConfig, SlurmConfig, SlurmRunner, SubprocessRunner, get_runner
+from bioimage_py.runner._diagnostics import load_manifest
+from bioimage_py.runner._work import iter_assignment, load_assignment, load_work_spec
 
 
 def _make_return_one():
@@ -64,9 +62,16 @@ def test_partition_written_reflects_tasks_per_worker(zarr_factory, rng, tmp_path
     captured = {}
 
     def _capture(tmp_folder):
-        task_files = sorted(glob.glob(os.path.join(tmp_folder, "blocks", "*.json")))
-        captured["n_tasks"] = len(task_files)
-        captured["blocks"] = sorted(b for p in task_files for b in json.load(open(p)))
+        manifest = load_manifest(tmp_folder)
+        work = load_work_spec(tmp_folder, manifest["work_plan"])
+        assignments = [load_assignment(tmp_folder, value)
+                       for value in manifest["assignments"]]
+        captured["n_tasks"] = len(assignments)
+        captured["blocks"] = sorted(
+            int(value)
+            for assignment in assignments
+            for _, value in iter_assignment(work, assignment)
+        )
 
     runner = get_runner("subprocess", RunnerConfig(tmp_root=str(tmp_path), tasks_per_worker=3))
     runner.run(_make_return_one(), [z], block_shape=(16, 16), num_workers=2, has_return_val=True,
