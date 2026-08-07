@@ -16,7 +16,12 @@ from ..runner._diagnostics import load_manifest
 from ..runner._work import BatchPlan, BoundaryBatchPlan, RegularBatchPlan
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
-from ..tables import TableDataset, _describe_parquet_input, _read_parquet_rows
+from ..tables import (
+    TableDataset,
+    _describe_parquet_input,
+    _persist_parquet_input_layout,
+    _read_parquet_rows,
+)
 from ..util import check_rerun_args
 from ._table_utils import overlapping_paths, resolve_source, source_identity
 from .morphology import _axis_names
@@ -45,13 +50,10 @@ def _load_table(table: Union[str, "pd.DataFrame"]) -> "pd.DataFrame":
     return _read_table(str(table))
 
 
-def _required_columns(axes: Sequence[str], *, include_size: bool = False) -> List[str]:
+def _required_columns(axes: Sequence[str]) -> List[str]:
     """The base-morphology columns this op consumes."""
-    columns = (["label"] + [f"com_{a}" for a in axes]
-               + [f"bb_min_{a}" for a in axes] + [f"bb_max_{a}" for a in axes])
-    if include_size:
-        columns.insert(1, "size")
-    return columns
+    return (["label"] + [f"com_{a}" for a in axes]
+            + [f"bb_min_{a}" for a in axes] + [f"bb_max_{a}" for a in axes])
 
 
 def _column_arrays(df: "pd.DataFrame", axes: Sequence[str]) -> Dict[str, np.ndarray]:
@@ -220,24 +222,17 @@ def _output_schema(axes: Sequence[str], compute_surface: bool, ndim: int) -> pa.
                   for axis in axes)
     if compute_surface and ndim == 3:
         fields.append(pa.field("surface_area", pa.float64(), nullable=False))
-    fields.append(pa.field("regionprops_excluded", pa.bool_(), nullable=False))
     return pa.schema(fields)
 
 
-def _validate_file_table_schema(
-    schema: pa.Schema, axes: Sequence[str], *, include_size: bool,
-) -> None:
-    missing = [name for name in _required_columns(
-        axes, include_size=include_size,
-    ) if name not in schema.names]
+def _validate_file_table_schema(schema: pa.Schema, axes: Sequence[str]) -> None:
+    missing = [name for name in _required_columns(axes) if name not in schema.names]
     if missing:
         raise ValueError(
             f"table is missing required columns {missing}; pass the output of "
             "bioimage_py.morphology.morphology."
         )
     integer_columns = ["label"]
-    if include_size:
-        integer_columns.append("size")
     integer_columns.extend(f"bb_min_{axis}" for axis in axes)
     integer_columns.extend(f"bb_max_{axis}" for axis in axes)
     for name in integer_columns:
@@ -370,8 +365,7 @@ def _plan_regionprops_batches(
 def _regionprops_batch(batch: Any, writer: Any, *, ctx: Dict[str, Any]) -> None:
     axes = ctx["axes"]
     ndim = ctx["ndim"]
-    max_bbox_voxels = ctx.get("max_bbox_voxels")
-    required = _required_columns(axes, include_size=max_bbox_voxels is not None)
+    required = _required_columns(axes)
     table = _read_parquet_rows(ctx["table"], batch.start, batch.stop, required)
     if table.num_rows != batch.size:
         raise ValueError(
@@ -409,29 +403,8 @@ def _regionprops_batch(batch: Any, writer: Any, *, ctx: Dict[str, Any]) -> None:
     centroid = np.empty((row_count, ndim), dtype="float64")
     surface = (np.empty(row_count, dtype="float64")
                if ctx["compute_surface"] and ndim == 3 else None)
-    excluded = np.zeros(row_count, dtype=bool)
-    sizes = (_batch_column(table, "size", pa.uint64()).astype("uint64", copy=False)
-             if max_bbox_voxels is not None else None)
-    costs = (_bounding_box_costs(table, axes, shape, int(batch.start))
-             if max_bbox_voxels is not None else None)
 
     for index in range(row_count):
-        if max_bbox_voxels is not None and int(costs[index]) > max_bbox_voxels:
-            excluded[index] = True
-            n_voxels[index] = sizes[index]
-            area[index] = int(sizes[index]) * float(np.prod(ctx["resolution"]))
-            cost = int(costs[index])
-            extent[index] = int(sizes[index]) / cost if cost else float("nan")
-            equivalent_diameter[index] = (
-                (2 * ndim * area[index] / np.pi) ** (1.0 / ndim)
-                if area[index] > 0 else 0.0
-            )
-            major[index] = float("nan")
-            minor[index] = float("nan")
-            centroid[index] = float("nan")
-            if surface is not None:
-                surface[index] = float("nan")
-            continue
         values = _compute_object_features(
             seg, int(labels[index]), com[index], bb_min[index], bb_max[index],
             ctx["resolution"], ndim, ctx["compute_surface"],
@@ -458,7 +431,6 @@ def _regionprops_batch(batch: Any, writer: Any, *, ctx: Dict[str, Any]) -> None:
                     for index, axis in enumerate(axes)})
     if surface is not None:
         columns["surface_area"] = surface
-    columns["regionprops_excluded"] = excluded
     writer.write(pa.table(columns, schema=_output_schema(
         axes, ctx["compute_surface"], ndim,
     )))
@@ -552,7 +524,6 @@ def _file_backed_regionprops(
     output_table: Union[str, os.PathLike[str]],
     rows_per_batch: int,
     target_batch_cost: Optional[int],
-    max_bbox_voxels: Optional[int],
     provenance: Optional[Mapping[str, Any]],
     num_workers: int,
     job_type: str,
@@ -574,15 +545,6 @@ def _file_backed_regionprops(
             raise ValueError("target_batch_cost must be positive.")
         if target_batch_cost > _MAX_UINT64:
             raise ValueError("target_batch_cost must fit in uint64.")
-    if max_bbox_voxels is not None:
-        if (isinstance(max_bbox_voxels, bool)
-                or not isinstance(max_bbox_voxels, numbers.Integral)):
-            raise TypeError("max_bbox_voxels must be an integer or None.")
-        max_bbox_voxels = int(max_bbox_voxels)
-        if max_bbox_voxels < 0:
-            raise ValueError("max_bbox_voxels must be non-negative.")
-        if max_bbox_voxels > _MAX_UINT64:
-            raise ValueError("max_bbox_voxels must fit in uint64.")
     if provenance is not None and not isinstance(provenance, Mapping):
         raise TypeError("provenance must be a mapping or None.")
 
@@ -595,15 +557,11 @@ def _file_backed_regionprops(
         ) from error
 
     axes = tuple(_axis_names(src.ndim))
-    required_columns = _required_columns(
-        axes, include_size=max_bbox_voxels is not None,
-    )
-    table_descriptor, table_schema, table_identity = _describe_parquet_input(
+    required_columns = _required_columns(axes)
+    table_descriptor, table_schema, table_identity, table_parts = _describe_parquet_input(
         table, required_columns,
     )
-    _validate_file_table_schema(
-        table_schema, axes, include_size=max_bbox_voxels is not None,
-    )
+    _validate_file_table_schema(table_schema, axes)
     output_path = os.path.abspath(os.fspath(output_table))
     if overlapping_paths(output_path, table_descriptor.path):
         raise ValueError("output_table must not contain or overwrite the input table.")
@@ -623,7 +581,6 @@ def _file_backed_regionprops(
         "compute_surface": bool(compute_surface),
         "axes": list(axes),
         "rows_per_batch": rows_per_batch,
-        "max_bbox_voxels": max_bbox_voxels,
         "provenance": dict(provenance or {}),
     }
     if target_batch_cost is not None:
@@ -634,14 +591,17 @@ def _file_backed_regionprops(
     dataset = TableDataset.create(
         output_path,
         schema=output_schema,
-        schema_version=2,
+        schema_version=3,
         operation="regionprops",
-        operation_version="2",
+        operation_version="3",
         input_identities={
             "segmentation": source_identity(seg_spec, src),
             "base_table": table_identity,
         },
         parameters=parameters,
+    )
+    table_descriptor = _persist_parquet_input_layout(
+        table_descriptor, table_schema, table_parts, dataset.path,
     )
     if dataset._dataset_record().get("work_plan") is None:
         batches: BatchPlan
@@ -664,7 +624,6 @@ def _file_backed_regionprops(
         "axes": axes,
         "ndim": src.ndim,
         "compute_surface": bool(compute_surface),
-        "max_bbox_voxels": max_bbox_voxels,
     }
     batch_arguments: Dict[str, Any]
     if isinstance(batches, RegularBatchPlan):
@@ -695,7 +654,6 @@ def regionprops(
     output_table: Optional[Union[str, os.PathLike[str]]] = None,
     rows_per_batch: int = 100_000,
     target_batch_cost: Optional[int] = None,
-    max_bbox_voxels: Optional[int] = None,
     provenance: Optional[Mapping[str, Any]] = None,
     num_workers: int = 1,
     job_type: str = "local",
@@ -706,10 +664,8 @@ def regionprops(
 ) -> Union["pd.DataFrame", TableDataset]:
     """Compute per-object features for a labeled image.
 
-    Set ``output_table`` to use bounded Parquet batches. The file-backed result includes a
-    ``regionprops_excluded`` column. Set ``max_bbox_voxels`` to retain derived fallback rows while
-    skipping feature crops above a caller-selected bounding-box limit. Without ``output_table``,
-    the function returns the existing label-sorted DataFrame.
+    Set ``output_table`` to use bounded Parquet batches. Without ``output_table``, the function
+    returns the existing label-sorted DataFrame.
 
     Args:
         input: Integer label image. File-backed output requires a reopenable source.
@@ -722,8 +678,6 @@ def regionprops(
         rows_per_batch: Maximum input rows in each file-backed batch.
         target_batch_cost: Optional target bounding-box voxel count per file-backed batch.
             Objects above the target form one-row batches. The row limit still applies.
-        max_bbox_voxels: Skip feature crops above this bounding-box voxel count. Excluded rows
-            retain derivable values and contain ``NaN`` for unavailable features.
         provenance: Optional canonical-JSON metadata included in the output dataset identity.
         num_workers: Local threads or distributed worker concurrency.
         job_type: Execution backend.
@@ -760,7 +714,6 @@ def regionprops(
             output_table=output_table,
             rows_per_batch=rows_per_batch,
             target_batch_cost=target_batch_cost,
-            max_bbox_voxels=max_bbox_voxels,
             provenance=provenance,
             num_workers=num_workers,
             job_type=job_type,
@@ -772,8 +725,6 @@ def regionprops(
         raise ValueError("A TableDataset input requires output_table.")
     if target_batch_cost is not None:
         raise ValueError("target_batch_cost requires output_table.")
-    if max_bbox_voxels is not None:
-        raise ValueError("max_bbox_voxels requires output_table.")
     if provenance is not None:
         raise ValueError("provenance requires output_table.")
     return _dataframe_regionprops(

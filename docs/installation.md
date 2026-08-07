@@ -35,8 +35,9 @@ the ones you need, e.g. `python -m pip install -e ".[io]"` or combine several
 | `tensorstore` | `tensorstore` | TensorStore neuroglancer-precomputed layers — local ZYX reads and shard-safe writes. |
 | `webknossos` | `webknossos` | WebKnossos layers — read-only, remote or local. |
 | `io-all` | all array I/O packages above | Every supported array I/O backend in one install. |
-| `test` | `pytest`, `zarr>=3`, `scikit-image`, `scipy`, `openpyxl`, `pyarrow` | Running the test suite. |
+| `test` | `pytest`, `zarr>=3`, `scikit-image`, `scipy`, `openpyxl` | Running the test suite. |
 | `dev` | `flake8`, `pyflakes` | Linting. |
 
-Distributed array operations require a file-backed output. Install at least the `io` extra for
-these operations.
+Distributed operations require sources that workers can reopen. Array-writing operations also
+require a file-backed output. Read-only reducers, such as `stats.mean`, do not require an output.
+Install the extra for each file format that the workers must access.

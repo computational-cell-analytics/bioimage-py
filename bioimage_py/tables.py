@@ -9,8 +9,11 @@ import math
 import os
 import tempfile
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from .runner._work import Batch, BatchPlan, BoundaryBatchPlan, RegularBatchPlan
 
@@ -20,17 +23,7 @@ _DATASET_FILE = "dataset.json"
 _MANIFEST_FILE = "manifest.json"
 _PARTS_FOLDER = "parts"
 _COMPLETIONS_FOLDER = "completions"
-
-
-def _pyarrow():
-    try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-    except ImportError as error:
-        raise ImportError(
-            "Table datasets require pyarrow. Install bioimage-py with the 'table' extra."
-        ) from error
-    return pa, pq
+_INPUT_LAYOUT_VERSION = 1
 
 
 def _atomic_write_json(path: str, value: Any) -> None:
@@ -130,7 +123,6 @@ def _schema_record(schema: Any) -> Dict[str, str]:
 
 
 def _schema_from_record(record: Mapping[str, Any]):
-    pa, _ = _pyarrow()
     if record.get("encoding") != "arrow-ipc-base64":
         raise ValueError(f"Unsupported table schema encoding {record.get('encoding')!r}.")
     try:
@@ -172,6 +164,8 @@ class _ParquetInputDescriptor:
     row_count: int
     schema_fingerprint: str
     columns: Tuple[str, ...]
+    layout_path: Optional[str] = None
+    layout_fingerprint: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -201,7 +195,6 @@ class TablePartWriter:
 
     def write(self, table: Any) -> None:
         """Write one Arrow table for this batch."""
-        pa, pq = _pyarrow()
         if self._written:
             raise ValueError(f"Batch {self._batch.batch_id} already wrote its table part.")
         if not isinstance(table, pa.Table):
@@ -302,7 +295,6 @@ class TableDataset:
         parameters: Mapping[str, Any],
     ) -> "TableDataset":
         """Create a dataset definition or open an identical existing definition."""
-        pa, _ = _pyarrow()
         if not isinstance(schema, pa.Schema):
             raise TypeError("TableDataset.create() requires a pyarrow.Schema.")
         if int(schema_version) < 1:
@@ -591,7 +583,6 @@ class TableDataset:
         except OSError:
             return None
 
-        _, pq = _pyarrow()
         try:
             parquet = pq.ParquetFile(part_path)
             row_count = int(parquet.metadata.num_rows)
@@ -762,7 +753,6 @@ class TableDataset:
 
     def to_pandas(self, columns: Optional[Sequence[str]] = None):
         """Materialize selected columns as a pandas DataFrame."""
-        pa, pq = _pyarrow()
         tables = [pq.read_table(part.path, columns=columns) for part in self.iter_parts()]
         if tables:
             table = pa.concat_tables(tables)
@@ -779,7 +769,6 @@ def _schema_fingerprint(schema: Any) -> str:
 
 
 def _parquet_layout(path: str) -> Tuple[Any, Tuple[int, ...]]:
-    _, pq = _pyarrow()
     try:
         parquet = pq.ParquetFile(path)
         metadata = parquet.metadata
@@ -798,7 +787,6 @@ def _selected_schema(schema: Any, columns: Optional[Sequence[str]]) -> Any:
     missing = [name for name in columns if name not in schema.names]
     if missing:
         raise ValueError(f"Parquet input is missing required columns {missing}.")
-    pa, _ = _pyarrow()
     return pa.schema([schema.field(name) for name in columns], metadata=schema.metadata)
 
 
@@ -813,6 +801,17 @@ def _table_dataset_input(
     identity_parts = []
     for record in manifest["parts"]:
         part_path = os.path.join(dataset.path, str(record["path"]))
+        try:
+            file_size = os.path.getsize(part_path)
+        except OSError as error:
+            raise ValueError(f"Could not read table part {part_path!r}.") from error
+        if file_size != int(record["file_size"]):
+            raise ValueError(f"Table part {part_path!r} has an incompatible file size.")
+        checksum = record.get("checksum")
+        if not isinstance(checksum, dict) or checksum.get("algorithm") != "sha256":
+            raise ValueError(f"Table part {part_path!r} has invalid checksum metadata.")
+        if _file_checksum(part_path) != checksum.get("value"):
+            raise ValueError(f"Table part {part_path!r} does not match its checksum.")
         actual_schema, row_group_counts = _parquet_layout(part_path)
         if not actual_schema.equals(schema, check_metadata=True):
             raise ValueError(f"Table part {part_path!r} has an incompatible schema.")
@@ -897,7 +896,7 @@ def _inspect_parquet_input(
 
 def _describe_parquet_input(
     value: Any, columns: Optional[Sequence[str]] = None,
-) -> Tuple[_ParquetInputDescriptor, Any, Dict[str, Any]]:
+) -> Tuple[_ParquetInputDescriptor, Any, Dict[str, Any], Tuple[_ParquetInputPart, ...]]:
     """Describe a completed `TableDataset` or an ordered raw Parquet path."""
     if isinstance(value, TableDataset):
         path = value.path
@@ -933,25 +932,135 @@ def _describe_parquet_input(
         "row_count": row_count,
         "schema_fingerprint": schema_fingerprint,
     }
-    return descriptor, schema, input_identity
+    return descriptor, schema, input_identity, tuple(parts)
+
+
+def _persist_parquet_input_layout(
+    descriptor: _ParquetInputDescriptor,
+    schema: Any,
+    parts: Sequence[_ParquetInputPart],
+    dataset_path: str,
+) -> _ParquetInputDescriptor:
+    """Persist one verified input layout and return its worker descriptor."""
+    record = {
+        "format_version": _INPUT_LAYOUT_VERSION,
+        "kind": descriptor.kind,
+        "path": descriptor.path,
+        "identity": descriptor.identity,
+        "row_count": descriptor.row_count,
+        "schema": _schema_record(schema),
+        "schema_fingerprint": descriptor.schema_fingerprint,
+        "columns": list(descriptor.columns),
+        "parts": [
+            {
+                "path": part.path,
+                "row_count": part.row_count,
+                "row_group_counts": list(part.row_group_counts),
+            }
+            for part in parts
+        ],
+    }
+    layout_fingerprint = _fingerprint(record)
+    record["layout_fingerprint"] = layout_fingerprint
+    layout_path = os.path.join(dataset_path, "inputs", "base-table-layout.json")
+    if os.path.exists(layout_path):
+        existing = _read_json(layout_path)
+        if existing != record:
+            raise ValueError(
+                f"Parquet input layout {layout_path!r} does not match the planned input."
+            )
+    else:
+        _atomic_write_json(layout_path, record)
+    return replace(
+        descriptor,
+        layout_path=layout_path,
+        layout_fingerprint=layout_fingerprint,
+    )
+
+
+def _load_parquet_input_layout(
+    descriptor: _ParquetInputDescriptor,
+) -> Tuple[Any, Tuple[_ParquetInputPart, ...]]:
+    if descriptor.layout_path is None or descriptor.layout_fingerprint is None:
+        raise ValueError("The Parquet input descriptor has no persisted layout.")
+    record = _read_json(descriptor.layout_path)
+    content = {
+        key: value for key, value in record.items() if key != "layout_fingerprint"
+    }
+    fingerprint = _fingerprint(content)
+    if (fingerprint != descriptor.layout_fingerprint
+            or record.get("layout_fingerprint") != descriptor.layout_fingerprint):
+        raise ValueError(f"Parquet input layout {descriptor.layout_path!r} is invalid.")
+    expected = {
+        "format_version": _INPUT_LAYOUT_VERSION,
+        "kind": descriptor.kind,
+        "path": descriptor.path,
+        "identity": descriptor.identity,
+        "row_count": descriptor.row_count,
+        "schema_fingerprint": descriptor.schema_fingerprint,
+        "columns": list(descriptor.columns),
+    }
+    if any(record.get(key) != value for key, value in expected.items()):
+        raise ValueError(
+            f"Parquet input layout {descriptor.layout_path!r} does not match its descriptor."
+        )
+    schema_record = record.get("schema")
+    if not isinstance(schema_record, dict):
+        raise ValueError(f"Parquet input layout {descriptor.layout_path!r} has no schema.")
+    schema = _schema_from_record(schema_record)
+    schema_fingerprint = _schema_fingerprint(
+        schema if descriptor.kind == "table_dataset" else schema.remove_metadata()
+    )
+    if schema_fingerprint != descriptor.schema_fingerprint:
+        raise ValueError(f"Parquet input layout {descriptor.layout_path!r} has the wrong schema.")
+    raw_parts = record.get("parts")
+    if not isinstance(raw_parts, list):
+        raise ValueError(f"Parquet input layout {descriptor.layout_path!r} has no parts.")
+    try:
+        parts = tuple(
+            _ParquetInputPart(
+                path=str(part["path"]),
+                row_count=int(part["row_count"]),
+                row_group_counts=tuple(int(value) for value in part["row_group_counts"]),
+            )
+            for part in raw_parts
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"Parquet input layout {descriptor.layout_path!r} contains invalid parts."
+        ) from error
+    if any(
+        part.row_count < 0
+        or any(row_group_count < 0 for row_group_count in part.row_group_counts)
+        or sum(part.row_group_counts) != part.row_count
+        for part in parts
+    ):
+        raise ValueError(f"Parquet input layout {descriptor.layout_path!r} has invalid row counts.")
+    if sum(part.row_count for part in parts) != descriptor.row_count:
+        raise ValueError(f"Parquet input layout {descriptor.layout_path!r} has the wrong row count.")
+    return schema, parts
 
 
 class _ParquetRowReader:
     def __init__(self, descriptor: _ParquetInputDescriptor):
-        schema, parts, identity = _inspect_parquet_input(
-            descriptor.path, descriptor.kind, descriptor.columns or None,
-        )
-        schema_fingerprint = _schema_fingerprint(
-            schema if descriptor.kind == "table_dataset" else schema.remove_metadata()
-        )
-        row_count = sum(part.row_count for part in parts)
-        if (identity != descriptor.identity or row_count != descriptor.row_count
-                or schema_fingerprint != descriptor.schema_fingerprint):
-            raise ValueError(
-                f"Parquet input {descriptor.path!r} changed after planning."
+        if descriptor.layout_path is None:
+            schema, raw_parts, identity = _inspect_parquet_input(
+                descriptor.path, descriptor.kind, descriptor.columns or None,
             )
+            parts = tuple(raw_parts)
+            schema_fingerprint = _schema_fingerprint(
+                schema if descriptor.kind == "table_dataset" else schema.remove_metadata()
+            )
+            row_count = sum(part.row_count for part in parts)
+            if (identity != descriptor.identity or row_count != descriptor.row_count
+                    or schema_fingerprint != descriptor.schema_fingerprint):
+                raise ValueError(
+                    f"Parquet input {descriptor.path!r} changed after planning."
+                )
+        else:
+            schema, parts = _load_parquet_input_layout(descriptor)
         self.schema = schema
-        self.parts = tuple(parts)
+        self.parts = parts
         total = 0
         part_ends = []
         for part in parts:
@@ -960,7 +1069,6 @@ class _ParquetRowReader:
         self.part_ends = tuple(part_ends)
 
     def read_rows(self, start: int, stop: int, columns: Sequence[str]):
-        pa, pq = _pyarrow()
         start = int(start)
         stop = int(stop)
         row_count = self.part_ends[-1] if self.part_ends else 0

@@ -1,5 +1,6 @@
 """File-backed base morphology tests."""
 import importlib
+import json
 import os
 
 import numpy as np
@@ -47,6 +48,38 @@ def test_file_backed_morphology_matches_dataframe_and_partitions(
     assert not os.path.exists(str(output) + ".morphology-work")
     definition = result._dataset_record()
     assert definition["parameters"]["provenance"] == {"mask": "abc"}
+
+
+def test_file_backed_morphology_repairs_corrupt_completed_output(
+    tmp_path, zarr_factory,
+):
+    segmentation = _segmentation()
+    source = zarr_factory(segmentation, chunks=(4, 4))
+    output = tmp_path / "repaired.parquet"
+    first = bp.morphology.morphology(
+        source,
+        block_shape=(4, 4),
+        output_table=output,
+        blocks_per_batch=2,
+        label_partition_size=10,
+    )
+    part_path = next(first.iter_parts()).path
+    with open(part_path, "r+b") as file:
+        file.truncate(16)
+
+    repaired = bp.morphology.morphology(
+        source,
+        block_shape=(4, 4),
+        output_table=output,
+        blocks_per_batch=2,
+        label_partition_size=10,
+    )
+
+    repaired.validate()
+    pd.testing.assert_frame_equal(
+        repaired.to_pandas(), bp.morphology.morphology(segmentation),
+    )
+    assert not os.path.exists(str(output) + ".morphology-work")
 
 
 def test_file_backed_morphology_preserves_high_labels_and_empty_input(
@@ -190,6 +223,14 @@ def test_file_backed_morphology_resumes_label_reduction(
                 blocks_per_batch=2,
                 label_partition_size=10,
             )
+
+    index_path = os.path.join(
+        str(output) + ".morphology-work", "partition-index", "index.json",
+    )
+    with open(index_path) as file:
+        index = json.load(file)
+    assert index["version"] == 3
+    assert len(index["partial_content_fingerprint"]) == 64
 
     def unexpected_partial(*args, **kwargs):
         raise AssertionError("completed partial batches must be reused")

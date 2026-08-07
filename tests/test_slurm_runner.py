@@ -191,7 +191,6 @@ def test_slurm_file_backed_regionprops(shared_zarr_factory, shared_tmp_path):
     expected = expected.set_index("label").loc[base["label"].tolist()].reset_index()
     expected["label"] = expected["label"].astype("uint64")
     expected["n_voxels"] = expected["n_voxels"].astype("uint64")
-    expected["regionprops_excluded"] = False
 
     result = bp.morphology.regionprops(
         source,

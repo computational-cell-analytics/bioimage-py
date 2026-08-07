@@ -122,6 +122,11 @@ file-backed morphology paths resume durable table batches instead. A `local` run
 folder, so re-run it (optionally with `block_ids=e.failed_block_ids`); `resume_from` is rejected for
 `job_type="local"`.
 
+Rerun and resume assume that inputs have not changed in place. Array identities describe the
+source, shape, and data type, but they do not hash array values. Raw Parquet identities use file
+metadata. After an in-place input change, use a new output path. For table-producing morphology
+calls, you can also change `provenance` to create a new dataset identity.
+
 ## Batch mapping
 
 Use `Runner.map_batches` when one function call can process several logical items. The runner passes
@@ -291,7 +296,6 @@ features = bp.morphology.regionprops(
     output_table="regionprops.parquet",
     rows_per_batch=100_000,
     target_batch_cost=2_000_000_000,
-    max_bbox_voxels=2_000_000_000,
     num_workers=64,
     job_type="slurm",
     job_config=cfg,
@@ -309,17 +313,9 @@ row limit. An object whose bounding box exceeds the target gets a one-row batch.
 the bounding-box columns in bounded chunks. Compatible reruns and resumes reuse the stored
 boundaries without rescanning the input table.
 
-`max_bbox_voxels` is optional. An object above this inclusive limit remains in the output, but the
-worker does not read its segmentation crop. The fallback row derives `n_voxels`, `area`, `extent`,
-`equivalent_diameter_area`, and the bounding box from the base table. It stores `NaN` for axis
-lengths, centroid coordinates, and surface area. The non-null `regionprops_excluded` column is
-`True` for these rows and `False` for processed rows. The base table must include `size` when this
-limit is set.
-
 The file-backed schema uses `uint64` for `label` and `n_voxels`, `int64` for bounding boxes, and
-`float64` for measurements. It always includes `regionprops_excluded`. It adds `surface_area` only
-for a 3D input when `compute_surface=True`. Use `features.to_pandas()` only when the complete result
-fits in memory.
+`float64` for measurements. It adds `surface_area` only for a 3D input when
+`compute_surface=True`. Use `features.to_pandas()` only when the complete result fits in memory.
 
 A compatible fresh call validates and skips completed parts. Use `resume_from` to resume a failed
 distributed run with its original task assignments. The file-backed path does not accept

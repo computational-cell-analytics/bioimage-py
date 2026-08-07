@@ -446,9 +446,14 @@ def _build_partition_index(
     label_partition_size: int,
 ) -> Dict[str, Any]:
     """Build a disk-backed label-range to partial-part index."""
+    manifest = partial._manifest_record()
+    manifest_parts = json.dumps(
+        manifest["parts"], sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
     expected = {
-        "version": 2,
+        "version": 3,
         "partial_identity": partial._descriptor()["identity"],
+        "partial_content_fingerprint": hashlib.sha256(manifest_parts).hexdigest(),
         "label_partition_size": int(label_partition_size),
     }
     existing = _index_record(index_dir)
@@ -737,8 +742,13 @@ def _file_backed_morphology(
         parameters=parameters,
     )
     if final.complete:
-        shutil.rmtree(work_dir, ignore_errors=True)
-        return TableDataset.open(output_path)
+        try:
+            final.validate()
+        except ValueError:
+            pass
+        else:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            return final
 
     partial_path = os.path.join(work_dir, "partials")
     partial = TableDataset.create(
@@ -756,7 +766,16 @@ def _file_backed_morphology(
     if sink_path is not None and sink_path not in valid_sinks:
         raise ValueError("resume_from belongs to a different morphology output.")
 
-    if not partial.complete:
+    reuse_partial = False
+    if partial.complete:
+        try:
+            partial.validate()
+        except ValueError:
+            pass
+        else:
+            reuse_partial = True
+
+    if not reuse_partial:
         context = {
             "source": source_spec,
             "mask": mask_spec,
@@ -776,9 +795,6 @@ def _file_backed_morphology(
             resume_from=(resume_from if sink_path == os.path.abspath(partial_path) else None),
             result_sink=partial,
         )
-    else:
-        partial = TableDataset.open(partial_path)
-
     index_dir = os.path.join(work_dir, "partition-index")
     index = _build_partition_index(partial, index_dir, label_partition_size)
     range_ids = np.load(os.path.join(index_dir, "range_ids.npy"), mmap_mode="r")

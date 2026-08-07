@@ -10,7 +10,12 @@ import pytest
 import bioimage_py as bp
 from bioimage_py.morphology import regionprops as regionprops_function
 from bioimage_py.runner import RunnerConfig, RunnerError, get_runner
-from bioimage_py.tables import TableDataset, _describe_parquet_input, _read_parquet_rows
+from bioimage_py.tables import (
+    TableDataset,
+    _describe_parquet_input,
+    _persist_parquet_input_layout,
+    _read_parquet_rows,
+)
 
 
 def _segmentation():
@@ -28,7 +33,6 @@ def _expected_in_input_order(seg, base, *, resolution, compute_surface):
     expected = expected.loc[base["label"].tolist()].reset_index()
     expected["label"] = expected["label"].astype("uint64")
     expected["n_voxels"] = expected["n_voxels"].astype("uint64")
-    expected["regionprops_excluded"] = False
     return expected
 
 
@@ -90,46 +94,8 @@ def test_file_backed_regionprops_matches_dataframe_and_preserves_order(
     assert result.schema.field("n_voxels").type == pa.uint64()
     assert all(not field.nullable for field in result.schema)
     assert ("surface_area" in result.schema.names) is compute_surface
-    assert result.schema.field("regionprops_excluded").type == pa.bool_()
-
-
-def test_file_backed_regionprops_retains_fallback_rows_above_cutoff(
-    tmp_path, zarr_factory,
-):
-    seg = _segmentation()
-    source = zarr_factory(seg, chunks=(12, 14, 16))
-    base = bp.morphology.morphology(seg)
-    base_path = tmp_path / "base.parquet"
-    base.to_parquet(base_path, index=False)
-    costs = np.prod(np.column_stack([
-        base[f"bb_max_{axis}"] - base[f"bb_min_{axis}"]
-        for axis in ("z", "y", "x")
-    ]), axis=1)
-    cutoff = int(np.sort(costs)[-2])
-
-    result = bp.morphology.regionprops(
-        source,
-        base_path,
-        resolution=(2.0, 1.0, 1.5),
-        compute_surface=True,
-        output_table=tmp_path / "result.parquet",
-        rows_per_batch=2,
-        max_bbox_voxels=cutoff,
-        provenance={"policy": "test"},
-    )
-    actual = result.to_pandas()
-    excluded = actual["regionprops_excluded"]
-    assert excluded.tolist() == (costs > cutoff).tolist()
-    assert int(excluded.sum()) == 1
-    row_index = int(np.flatnonzero(excluded)[0])
-    base_row = base.iloc[row_index]
-    row = actual.iloc[row_index]
-    assert int(row["n_voxels"]) == int(base_row["size"])
-    assert row["area"] == int(base_row["size"]) * 3.0
-    assert np.isnan(row["axis_major_length"])
-    assert np.isnan(row["centroid_z"])
-    assert np.isnan(row["surface_area"])
-    assert result._dataset_record()["parameters"]["provenance"] == {"policy": "test"}
+    assert result.schema_version == 3
+    assert result.operation_version == "3"
 
 
 def test_raw_parquet_directory_uses_lexical_file_order_and_bounded_ranges(tmp_path):
@@ -143,9 +109,44 @@ def test_raw_parquet_directory_uses_lexical_file_order_and_bounded_ranges(tmp_pa
         nested / "part.parquet", index=False, row_group_size=1,
     )
 
-    descriptor, _, _ = _describe_parquet_input(root, ["value"])
+    descriptor, _, _, _ = _describe_parquet_input(root, ["value"])
     table = _read_parquet_rows(descriptor, 1, 3, ["value"])
     assert table["value"].to_pylist() == [1, 2]
+
+
+def test_table_dataset_input_verifies_part_checksum(tmp_path):
+    base = pd.DataFrame({"value": [1, 2, 3]})
+    dataset = _base_dataset(tmp_path / "base-dataset", base)
+    part_path = next(dataset.iter_parts()).path
+    with open(part_path, "rb") as file:
+        content = bytearray(file.read())
+    content[len(content) // 2] ^= 1
+    with open(part_path, "wb") as file:
+        file.write(content)
+
+    with pytest.raises(ValueError, match="does not match its checksum"):
+        _describe_parquet_input(dataset, ["value"])
+
+
+def test_persisted_parquet_layout_avoids_worker_metadata_scan(tmp_path, monkeypatch):
+    import bioimage_py.tables as tables_module
+
+    path = tmp_path / "input.parquet"
+    pd.DataFrame({"value": [1, 2, 3]}).to_parquet(
+        path, index=False, row_group_size=1,
+    )
+    descriptor, schema, _, parts = _describe_parquet_input(path, ["value"])
+    descriptor = _persist_parquet_input_layout(
+        descriptor, schema, parts, str(tmp_path / "output"),
+    )
+    tables_module._PARQUET_READER_CACHE.clear()
+
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError("workers must use the persisted Parquet layout")
+
+    monkeypatch.setattr(tables_module, "_inspect_parquet_input", unexpected_scan)
+    table = _read_parquet_rows(descriptor, 1, 3, ["value"])
+    assert table["value"].to_pylist() == [2, 3]
 
 
 def test_cost_planner_is_bounded_deterministic_and_greedy(tmp_path, monkeypatch):
@@ -163,7 +164,7 @@ def test_cost_planner_is_bounded_deterministic_and_greedy(tmp_path, monkeypatch)
     path = tmp_path / "costs.parquet"
     base.to_parquet(path, index=False, row_group_size=2)
     columns = list(base.columns)
-    descriptor, _, _ = _describe_parquet_input(path, columns)
+    descriptor, _, _, _ = _describe_parquet_input(path, columns)
 
     real_read = module._read_parquet_rows
     reads = []
@@ -200,7 +201,7 @@ def test_cost_planner_enforces_row_cap_and_checked_boxes(tmp_path):
     })
     path = tmp_path / "row-cap.parquet"
     base.to_parquet(path, index=False)
-    descriptor, _, _ = _describe_parquet_input(path, list(base.columns))
+    descriptor, _, _, _ = _describe_parquet_input(path, list(base.columns))
     assert module._plan_regionprops_batches(
         descriptor, ("z", "y", "x"), (2, 2, 2), rows_per_batch=2,
         target_batch_cost=100,
