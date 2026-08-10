@@ -18,7 +18,8 @@ import pyarrow.parquet as pq
 from .runner._work import Batch, BatchPlan, BoundaryBatchPlan, RegularBatchPlan
 
 
-DATASET_FORMAT_VERSION = 1
+DATASET_FORMAT_VERSION = 2
+DEFAULT_ROW_GROUP_ROWS = 65_536
 _DATASET_FILE = "dataset.json"
 _MANIFEST_FILE = "manifest.json"
 _PARTS_FOLDER = "parts"
@@ -191,29 +192,101 @@ class TablePartWriter:
     def __init__(self, dataset: "TableDataset", batch: Batch):
         self._dataset = dataset
         self._batch = batch
-        self._written = False
+        self._buffer: List[pa.Table] = []
+        self._buffer_rows = 0
+        self._row_count = 0
+        self._parquet: Optional[pq.ParquetWriter] = None
+        self._tmp_path: Optional[str] = None
+        self._appended = False
+        self._sealed = False
+        self._committed = False
+        self._part_promoted = False
 
     def write(self, table: Any) -> None:
         """Write one Arrow table for this batch."""
-        if self._written:
+        if self._appended:
             raise ValueError(f"Batch {self._batch.batch_id} already wrote its table part.")
+        self.append(table)
+        self._sealed = True
+        self._commit()
+
+    def append(self, table: Any) -> None:
+        """Append one Arrow table to this batch's durable part."""
+        if self._sealed:
+            raise ValueError(f"Batch {self._batch.batch_id} already sealed its table part.")
         if not isinstance(table, pa.Table):
-            raise TypeError("TablePartWriter.write() requires a pyarrow.Table.")
+            raise TypeError("TablePartWriter.append() requires a pyarrow.Table.")
         expected_schema = self._dataset.schema
         if not table.schema.equals(expected_schema, check_metadata=True):
             raise ValueError(
                 f"Batch {self._batch.batch_id} returned schema {table.schema}, expected "
                 f"{expected_schema}."
             )
+        self._open()
+        self._appended = True
+        self._row_count += int(table.num_rows)
+        if table.num_rows:
+            self._buffer.append(table)
+            self._buffer_rows += int(table.num_rows)
+            self._flush_complete_groups()
 
+    def _open(self) -> None:
+        if self._parquet is not None:
+            return
         parts_folder = self._dataset._parts_folder
         os.makedirs(parts_folder, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=f".{_part_stem(self._batch.batch_id)}.", suffix=".tmp", dir=parts_folder,
+        temporary_prefix = f".{_part_stem(self._batch.batch_id)}."
+        for name in os.listdir(parts_folder):
+            if name.startswith(temporary_prefix) and name.endswith(".tmp"):
+                try:
+                    os.unlink(os.path.join(parts_folder, name))
+                except FileNotFoundError:
+                    pass
+        fd, self._tmp_path = tempfile.mkstemp(
+            prefix=temporary_prefix, suffix=".tmp",
+            dir=parts_folder,
         )
         os.close(fd)
+        self._parquet = pq.ParquetWriter(self._tmp_path, self._dataset.schema)
+
+    def _flush_complete_groups(self) -> None:
+        row_group_rows = self._dataset.row_group_rows
+        if self._buffer_rows < row_group_rows:
+            return
+        assert self._parquet is not None
+        buffered = (
+            self._buffer[0] if len(self._buffer) == 1 else pa.concat_tables(self._buffer)
+        )
+        offset = 0
+        while buffered.num_rows - offset >= row_group_rows:
+            self._parquet.write_table(buffered.slice(offset, row_group_rows))
+            offset += row_group_rows
+        remainder = buffered.slice(offset)
+        self._buffer = [remainder] if remainder.num_rows else []
+        self._buffer_rows = int(remainder.num_rows)
+
+    def _flush_remainder(self) -> None:
+        if not self._buffer_rows:
+            return
+        assert self._parquet is not None
+        buffered = (
+            self._buffer[0] if len(self._buffer) == 1 else pa.concat_tables(self._buffer)
+        )
+        self._parquet.write_table(buffered)
+        self._buffer = []
+        self._buffer_rows = 0
+
+    def _commit(self) -> None:
+        if self._committed:
+            return
+        assert self._parquet is not None and self._tmp_path is not None
+        expected_schema = self._dataset.schema
+        tmp_path = self._tmp_path
+        self._flush_remainder()
+        self._parquet.close()
+        self._parquet = None
+
         try:
-            pq.write_table(table, tmp_path)
             with open(tmp_path, "rb") as file:
                 os.fsync(file.fileno())
             file_size = os.path.getsize(tmp_path)
@@ -224,14 +297,14 @@ class TablePartWriter:
                 raise ValueError(
                     f"The Parquet schema for batch {self._batch.batch_id} changed during write."
                 )
-            if int(parquet.metadata.num_rows) != int(table.num_rows):
+            if int(parquet.metadata.num_rows) != self._row_count:
                 raise ValueError(
                     f"The Parquet row count for batch {self._batch.batch_id} changed during write."
                 )
 
             record = self._dataset._make_part_record(
                 self._batch,
-                row_count=int(table.num_rows),
+                row_count=self._row_count,
                 file_size=file_size,
                 checksum=checksum,
             )
@@ -240,26 +313,41 @@ class TablePartWriter:
             )
             final_path = self._dataset._part_path(self._batch.batch_id)
             os.replace(tmp_path, final_path)
-            _sync_directory(parts_folder)
+            self._part_promoted = True
+            self._tmp_path = None
+            _sync_directory(self._dataset._parts_folder)
             self._dataset._promote_completion(self._batch.batch_id)
-            self._written = True
+            self._committed = True
         except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
+            if not self._part_promoted:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
             raise
 
     def _finish(self, result: Any) -> None:
         if result is not None:
             raise ValueError("A table sink batch function must return None.")
-        if not self._written:
+        if not self._appended:
             raise ValueError(
-                f"Batch {self._batch.batch_id} did not call TablePartWriter.write()."
+                f"Batch {self._batch.batch_id} did not write or append a table part."
             )
+        self._commit()
 
     def _discard(self) -> None:
-        if not self._written:
+        if self._parquet is not None:
+            self._parquet.close()
+            self._parquet = None
+        if self._tmp_path is not None:
+            try:
+                os.unlink(self._tmp_path)
+            except FileNotFoundError:
+                pass
+            self._tmp_path = None
+        if self._part_promoted and not self._committed:
+            return
+        if not self._committed:
             return
         for path in (
             self._dataset._pending_completion_path(self._batch.batch_id),
@@ -272,7 +360,7 @@ class TablePartWriter:
                 pass
         _sync_directory(self._dataset._parts_folder)
         _sync_directory(os.path.join(self._dataset.path, _COMPLETIONS_FOLDER))
-        self._written = False
+        self._committed = False
 
 
 class TableDataset:
@@ -293,6 +381,7 @@ class TableDataset:
         operation_version: str,
         input_identities: Mapping[str, Any],
         parameters: Mapping[str, Any],
+        row_group_rows: int = DEFAULT_ROW_GROUP_ROWS,
     ) -> "TableDataset":
         """Create a dataset definition or open an identical existing definition."""
         if not isinstance(schema, pa.Schema):
@@ -303,6 +392,10 @@ class TableDataset:
             raise ValueError("operation must not be empty.")
         if not operation_version:
             raise ValueError("operation_version must not be empty.")
+        if isinstance(row_group_rows, bool) or not isinstance(row_group_rows, int):
+            raise TypeError("row_group_rows must be an integer.")
+        if row_group_rows <= 0:
+            raise ValueError("row_group_rows must be positive.")
 
         expected = {
             "format_version": DATASET_FORMAT_VERSION,
@@ -311,6 +404,7 @@ class TableDataset:
             "operation": {"name": str(operation), "version": str(operation_version)},
             "input_identities": _normalize_json(input_identities, "input_identities"),
             "parameters": _normalize_json(parameters, "parameters"),
+            "row_group_rows": int(row_group_rows),
             "work_plan": None,
             "identity": None,
         }
@@ -377,6 +471,10 @@ class TableDataset:
     @property
     def operation_version(self) -> str:
         return str(self._dataset_record()["operation"]["version"])
+
+    @property
+    def row_group_rows(self) -> int:
+        return int(self._dataset_record()["row_group_rows"])
 
     @property
     def row_count(self) -> int:
@@ -1068,7 +1166,7 @@ class _ParquetRowReader:
             part_ends.append(total)
         self.part_ends = tuple(part_ends)
 
-    def read_rows(self, start: int, stop: int, columns: Sequence[str]):
+    def _validate_range(self, start: int, stop: int, columns: Sequence[str]):
         start = int(start)
         stop = int(stop)
         row_count = self.part_ends[-1] if self.part_ends else 0
@@ -1080,10 +1178,24 @@ class _ParquetRowReader:
         selected_schema = pa.schema(
             [self.schema.field(name) for name in columns], metadata=self.schema.metadata,
         )
-        if start == stop:
-            return pa.Table.from_batches([], schema=selected_schema)
+        return start, stop, selected_schema
 
-        batches = []
+    def iter_rows(
+        self,
+        start: int,
+        stop: int,
+        columns: Sequence[str],
+        batch_size: int,
+    ) -> Iterator[pa.RecordBatch]:
+        start, stop, selected_schema = self._validate_range(start, stop, columns)
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+            raise TypeError("batch_size must be an integer.")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if start == stop:
+            return
+
+        returned_rows = 0
         part_index = bisect.bisect_right(self.part_ends, start)
         while part_index < len(self.parts):
             part = self.parts[part_index]
@@ -1101,7 +1213,6 @@ class _ParquetRowReader:
                 selected_stop = min(local_stop, row_group_stop)
                 if selected_start < selected_stop:
                     batch_start = row_group_start
-                    batch_size = max(1, min(65_536, selected_stop - selected_start))
                     for batch in parquet.iter_batches(
                         batch_size=batch_size, row_groups=[row_group], columns=list(columns),
                     ):
@@ -1112,18 +1223,24 @@ class _ParquetRowReader:
                             piece = batch.slice(
                                 take_start - batch_start, take_stop - take_start,
                             )
-                            batches.append(pa.RecordBatch.from_arrays(
+                            output = pa.RecordBatch.from_arrays(
                                 list(piece.columns), schema=selected_schema,
-                            ))
+                            )
+                            returned_rows += output.num_rows
+                            yield output
                         batch_start = batch_stop
                 row_group_start = row_group_stop
             part_index += 1
 
-        result = pa.Table.from_batches(batches, schema=selected_schema)
-        if result.num_rows != stop - start:
+        if returned_rows != stop - start:
             raise ValueError(
-                f"Parquet row range [{start}, {stop}) returned {result.num_rows} rows."
+                f"Parquet row range [{start}, {stop}) returned {returned_rows} rows."
             )
+
+    def read_rows(self, start: int, stop: int, columns: Sequence[str]):
+        start, stop, selected_schema = self._validate_range(start, stop, columns)
+        batches = list(self.iter_rows(start, stop, columns, DEFAULT_ROW_GROUP_ROWS))
+        result = pa.Table.from_batches(batches, schema=selected_schema)
         return result
 
 
@@ -1143,6 +1260,23 @@ def _read_parquet_rows(
             reader = _ParquetRowReader(descriptor)
             _PARQUET_READER_CACHE[descriptor] = reader
     return reader.read_rows(start, stop, columns)
+
+
+def _iter_parquet_rows(
+    descriptor: _ParquetInputDescriptor,
+    start: int,
+    stop: int,
+    columns: Sequence[str],
+    *,
+    batch_size: int,
+) -> Iterator[pa.RecordBatch]:
+    """Yield one row range without decoding a row group for each compute chunk."""
+    with _PARQUET_READER_LOCK:
+        reader = _PARQUET_READER_CACHE.get(descriptor)
+        if reader is None:
+            reader = _ParquetRowReader(descriptor)
+            _PARQUET_READER_CACHE[descriptor] = reader
+    yield from reader.iter_rows(start, stop, columns, batch_size)
 
 
 def _validate_dataset_record(record: Mapping[str, Any], path: str) -> None:

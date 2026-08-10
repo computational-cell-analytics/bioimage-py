@@ -94,8 +94,8 @@ def test_file_backed_regionprops_matches_dataframe_and_preserves_order(
     assert result.schema.field("n_voxels").type == pa.uint64()
     assert all(not field.nullable for field in result.schema)
     assert ("surface_area" in result.schema.names) is compute_surface
-    assert result.schema_version == 3
-    assert result.operation_version == "3"
+    assert result.schema_version == 4
+    assert result.operation_version == "4"
 
 
 def test_raw_parquet_directory_uses_lexical_file_order_and_bounded_ranges(tmp_path):
@@ -166,29 +166,49 @@ def test_cost_planner_is_bounded_deterministic_and_greedy(tmp_path, monkeypatch)
     columns = list(base.columns)
     descriptor, _, _, _ = _describe_parquet_input(path, columns)
 
-    real_read = module._read_parquet_rows
+    real_iter = module._iter_parquet_rows
     reads = []
 
-    def bounded_read(descriptor, start, stop, requested):
-        reads.append((start, stop, tuple(requested)))
-        return real_read(descriptor, start, stop, requested)
+    def bounded_iter(descriptor, start, stop, requested, *, batch_size):
+        reads.append((start, stop, tuple(requested), batch_size))
+        yield from real_iter(
+            descriptor, start, stop, requested, batch_size=batch_size,
+        )
 
     monkeypatch.setattr(module, "_COST_SCAN_ROWS", 2)
-    monkeypatch.setattr(module, "_read_parquet_rows", bounded_read)
+    monkeypatch.setattr(module, "_iter_parquet_rows", bounded_iter)
     plan = module._plan_regionprops_batches(
         descriptor, ("z", "y", "x"), (4, 8, 8), rows_per_batch=3,
         target_batch_cost=10,
     )
 
     assert plan.boundaries == (0, 2, 3, 5)
-    assert reads == [
-        (0, 2, tuple(columns)), (2, 4, tuple(columns)), (4, 5, tuple(columns)),
-    ]
+    assert reads == [(0, 5, tuple(columns), 2)]
     monkeypatch.setattr(module, "_COST_SCAN_ROWS", 4)
     assert module._plan_regionprops_batches(
         descriptor, ("z", "y", "x"), (4, 8, 8), rows_per_batch=3,
         target_batch_cost=10,
     ).boundaries == plan.boundaries
+
+
+def test_cost_batches_group_into_fewer_durable_parts(tmp_path):
+    import importlib
+
+    module = importlib.import_module("bioimage_py.morphology.regionprops")
+    base = pd.DataFrame({
+        "bb_min_z": [0] * 8, "bb_min_y": [0] * 8, "bb_min_x": [0] * 8,
+        "bb_max_z": [1] * 8, "bb_max_y": [1] * 8, "bb_max_x": [4] * 8,
+    })
+    path = tmp_path / "costs.parquet"
+    base.to_parquet(path, index=False, row_group_size=2)
+    descriptor, _, _, _ = _describe_parquet_input(path, list(base.columns))
+    fine, costs = module._plan_regionprops_cost_batches(
+        descriptor, ("z", "y", "x"), (2, 2, 8), 2, 5,
+    )
+    grouped = module._group_cost_batches(fine, costs, 2)
+
+    assert fine.boundaries == (0, 1, 2, 3, 4, 5, 6, 7, 8)
+    assert grouped.boundaries == (0, 4, 8)
 
 
 def test_cost_planner_enforces_row_cap_and_checked_boxes(tmp_path):
@@ -265,6 +285,41 @@ def test_cost_aware_regionprops_matches_count_batches_and_reuses_plan(
         target_batch_cost=1_200,
     )
     pd.testing.assert_frame_equal(reused.to_pandas(), cost_aware.to_pandas())
+
+
+def test_regionprops_fuses_exclusions_and_durable_parts(tmp_path, zarr_factory):
+    seg = _segmentation()
+    source = zarr_factory(seg, chunks=(12, 14, 16))
+    base = bp.morphology.morphology(seg)
+    base_path = tmp_path / "base.parquet"
+    base.to_parquet(base_path, index=False, row_group_size=1)
+
+    result = bp.morphology.regionprops(
+        source,
+        base_path,
+        output_table=tmp_path / "result.parquet",
+        rows_per_batch=1,
+        target_batch_cost=100,
+        target_part_count=1,
+        max_bbox_voxels=400,
+        include_exclusion_flag=True,
+        num_workers=2,
+    )
+
+    actual = result.to_pandas().set_index("label")
+    assert result.part_count == 1
+    assert actual["regionprops_excluded"].to_dict() == {2: True, 7: True, 11: False}
+    assert actual.loc[2, "n_voxels"] == int(base.set_index("label").loc[2, "size"])
+    assert np.isnan(actual.loc[7, "centroid_z"])
+    assert np.isnan(actual.loc[2, "axis_major_length"])
+    included = _expected_in_input_order(
+        seg,
+        base[base["label"] == 11].reset_index(drop=True),
+        resolution=(1.0, 1.0, 1.0),
+        compute_surface=False,
+    ).set_index("label")
+    for column in included.columns:
+        assert actual.loc[11, column] == included.loc[11, column]
 
 
 def test_file_backed_regionprops_subprocess_writes_no_result_records(tmp_path, zarr_factory):
@@ -566,6 +621,20 @@ def test_file_backed_regionprops_rejects_incompatible_arguments(tmp_path, zarr_f
             base_path,
             output_table=tmp_path / "bad-cost-type",
             target_batch_cost=1.5,
+        )
+    with pytest.raises(ValueError, match="target_part_count must be positive"):
+        bp.morphology.regionprops(
+            source,
+            base_path,
+            output_table=tmp_path / "bad-parts",
+            target_part_count=0,
+        )
+    with pytest.raises(ValueError, match="max_bbox_voxels must be positive"):
+        bp.morphology.regionprops(
+            source,
+            base_path,
+            output_table=tmp_path / "bad-exclusion",
+            max_bbox_voxels=0,
         )
     with pytest.raises(ValueError, match="requires output_table"):
         bp.morphology.regionprops(source, base, target_batch_cost=100)

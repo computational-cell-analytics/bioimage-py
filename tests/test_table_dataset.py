@@ -3,6 +3,7 @@ import json
 import os
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from bioimage_py.runner import RunnerConfig, RunnerError, get_runner
@@ -134,6 +135,31 @@ def test_zero_row_batch_writes_a_typed_part(tmp_path):
     assert result.row_count == 0
     assert result.part_count == 1
     assert list(result.to_pandas().columns) == ["value", "batch"]
+
+
+def test_table_sink_streams_appends_into_bounded_row_groups(tmp_path):
+    dataset = _dataset(tmp_path / "streamed", row_group_rows=3)
+
+    def append_chunks(batch, writer):
+        for start, stop in ((0, 2), (2, 4), (4, 7)):
+            writer.append(pa.table({
+                "value": pa.array(range(start, stop), type=pa.int64()),
+                "batch": pa.array([batch.batch_id] * (stop - start), type=pa.int32()),
+            }, schema=SCHEMA))
+
+    result = get_runner("local").map_batches(
+        append_chunks, 1, batch_size=1, result_sink=dataset,
+    )
+    part = next(result.iter_parts())
+    parquet = pq.ParquetFile(part.path)
+
+    assert result.part_count == 1
+    assert result.to_pandas()["value"].tolist() == list(range(7))
+    assert [
+        parquet.metadata.row_group(index).num_rows
+        for index in range(parquet.metadata.num_row_groups)
+    ] == [3, 3, 1]
+    assert len(os.listdir(tmp_path / "streamed" / "completions")) == 1
 
 
 def test_table_dataset_rejects_identity_and_work_plan_mismatches(tmp_path):
