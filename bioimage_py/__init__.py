@@ -8,12 +8,13 @@ The functionality will be extended soon; the implementation of seamlessly switch
 .. include:: ../docs/installation.md
 .. include:: ../docs/usage.md
 """  # noqa
-from . import evaluation, filters, io, morphology, operations, segmentation, stats  # noqa: F401
+from . import evaluation, filters, io, morphology, operations, segmentation, stats, tables  # noqa: F401
 from .copy import copy
 from .downsample import downsample
 from .runner import SlurmConfig, config_file_path, get_runner, write_slurm_config
 from .sources import (TensorStorePrecomputedSource, as_source, open_cloudvolume, open_source,
                       open_tensorstore_precomputed, open_webknossos)
+from .tables import TableDataset
 from .util import to_roi
 from .__version__ import __version__
 
@@ -26,6 +27,7 @@ __all__ = [
     "evaluation",
     "operations",
     "io",
+    "tables",
     "copy",
     "downsample",
     "get_runner",
@@ -38,5 +40,6 @@ __all__ = [
     "TensorStorePrecomputedSource",
     "open_tensorstore_precomputed",
     "open_webknossos",
+    "TableDataset",
     "to_roi",
 ]

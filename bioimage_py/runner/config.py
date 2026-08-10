@@ -26,8 +26,8 @@ class RunnerConfig:
             ``%throttle``) or the thread pool (subprocess). ``1`` (the default) reproduces the
             one-task-per-worker behavior. The value is clamped to the number of schedulable
             units (blocks, or shard-groups for a sharded output) and, on slurm, to the
-            cluster's ``MaxArraySize``. Ignored by the local runner, which already schedules
-            one task per block.
+            cluster's ``MaxArraySize``. Batch boundaries do not depend on this value. The local
+            runner ignores this option.
         task_timeout: Per-task wall-clock limit in seconds for the ``subprocess`` backend.
             ``None`` (the default) means no timeout. A worker that exceeds it is killed and
             its unfinished blocks are reported as a normal failure (resumable); blocks it

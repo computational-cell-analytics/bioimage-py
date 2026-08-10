@@ -1,6 +1,7 @@
 """Failure handling: RunnerError, preserved temp folder, block_ids re-run, and resume_from."""
 import glob
 import os
+import signal
 import time
 
 import numpy as np
@@ -158,6 +159,10 @@ def test_task_timeout_reported_and_resumable(zarr_factory, rng, tmp_path):
     err = excinfo.value
     assert err.failed_block_ids == [0]
     assert err.tmp_folder is not None and os.path.isdir(err.tmp_folder)
+    assert len(err.task_failures) == 1
+    assert err.task_failures[0].exit_code is None
+    assert err.task_failures[0].signal == signal.SIGKILL
+    assert err.task_failures[0].elapsed_seconds is not None
     with open(os.path.join(err.tmp_folder, "error", "0.txt")) as f:
         assert "TimeoutError" in f.read().strip().splitlines()[-1]
 
@@ -182,6 +187,9 @@ def test_launch_failure_raises_runner_error(zarr_factory, rng, tmp_path):
     err = excinfo.value
     assert len(err.failed_block_ids) == 4  # no worker launched -> every block failed
     assert err.tmp_folder is not None and os.path.isdir(err.tmp_folder)  # preserved, not leaked
+    assert len(err.task_failures) == 4
+    assert all(failure.exit_code is None for failure in err.task_failures)
+    assert all(failure.signal is None for failure in err.task_failures)
     err_files = glob.glob(os.path.join(err.tmp_folder, "error", "*.txt"))
     assert err_files
     with open(err_files[0]) as f:

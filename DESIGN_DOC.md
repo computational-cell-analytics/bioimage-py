@@ -66,7 +66,12 @@ A `Block` has no `roi`/slice member — it carries `begin`/`end` coordinate list
 
 There are two **orthogonal** output channels, and a given function may use either or both:
 - **Output sources** (`outputs`): large array results written in place to storage. These never travel back to the master.
-- **Return value** (`has_return_val=True`): a *small* value per block (e.g. a scalar or a tiny array) that the runner collects and the caller reduces locally. The local reduction must be associative and commutative, since block order is not guaranteed. *Limitation (deferred):* the master currently accumulates **all** per-block return values in memory (`_collect`) before reducing, so a run with very many blocks or large per-block returns is bounded by master RAM. An incremental/streaming reduction — folding each result into the accumulator as it arrives, rather than materializing the full list — is a future improvement; it relies only on the associativity/commutativity already required here.
+- **Return value** (`has_return_val=True`): a value per block. Without a reducer, the runner returns an ordered list and uses memory proportional to the block count. With a `Reducer`, each worker combines a durable batch into one small accumulator. The orchestrator merges these accumulators in batch order with bounded memory.
+
+Reducer mode supports read-only jobs. It does not support output sources. The reducer creates a new
+identity accumulator, adds one logical result, merges two accumulators, and converts the complete
+accumulator to the public result. Merge must be associative. The runner preserves logical order, so
+merge does not need to be commutative.
 
 ### Runner configuration
 
@@ -135,6 +140,24 @@ def _compute(block, inputs, outputs, mask):
     return np.max(input_[roi][block_mask])
 
 
+class _MaximumReducer:
+    def initial(self):
+        return None
+
+    def update(self, accumulator, value):
+        return self.merge(accumulator, value)
+
+    def merge(self, left, right):
+        if left is None:
+            return right
+        if right is None:
+            return left
+        return np.maximum(left, right)
+
+    def finalize(self, accumulator):
+        return accumulator
+
+
 def max(
     input: SourceLike,  # Any source-like object; numpy arrays restrict execution to local.
     num_workers: int = 1,  # Number of parallel workers.
@@ -169,10 +192,8 @@ def max(
     # outputs is derived from the arguments to run(), so there is no separate counts step.
     runner = get_runner(job_type, config=job_config)
 
-    # run() validates inputs/outputs, derives the block shape if None, builds the (cloudpickled) payload,
-    # provides each block's inputs/outputs/mask and the block descriptor to the function, records per-block
-    # success, updates progress, and returns the collected return values (here one per non-empty block).
-    results = runner.run(
+    # run() reduces block results in durable batches and returns the final maximum.
+    result = runner.run(
         function=_compute,
         inputs=[input],
         outputs=[],
@@ -182,34 +203,32 @@ def max(
         block_ids=block_ids,
         has_return_val=True,
         name="Compute max",
+        reducer=_MaximumReducer(),
     )
 
-    # Combine the per-block results locally, dropping empty blocks (None) from masking.
-    results = [res for res in results if res is not None]
-    if not results:  # Everything was masked out.
+    if result is None:  # Everything was masked out.
         raise ValueError("No values within the mask; cannot compute a maximum.")
-    return np.max(results)
+    return result
 ```
 
-The implementation of this is straight-forward locally (futures.ThreadPoolExecutor and tqdm prog bar).
+The local runner uses `ThreadPoolExecutor` and `tqdm`. It keeps at most twice the worker count in
+pending futures. A no-return run does not allocate a result container.
 
-For the distributed case (slurm) it's more complicated. Current design idea:
+The distributed runner adds persistent work and completion state:
+
 - The runner converts each input/output/mask to a `Source` and obtains its `to_spec()`. If a source is not reopenable (e.g. a numpy array), it fails early with a clear message.
-- It creates a temporary folder on a **shared filesystem** for the job, writes a slurm job config for an array job to it, and a small harness script that runs the computation per task. The harness loads the cloudpickled payload (function + bound args + source specs), reopens the sources, gets the blocks for this task, and runs them in a loop. It persists progress **per block** but into **per-task files** (so the file count stays bounded — one done-log and one result file per task, not per block): after each block succeeds it appends the block id to the task's done-log and, for a return-value op, a length-framed result record to the task's result file; the per-task `.success` sentinel is still written once at the end. This keeps a partially-failed task's completed blocks (so a straggler/failure costs only the un-done blocks, not the whole task) and lets a run be **resumed** — re-running only the incomplete blocks (the harness skips blocks already in its done-log) and merging over all persisted per-block results. It also writes a job **manifest** (submitted array/job ids, the block→task assignment, the temp folder) so a run can be *reattached* — if the orchestrating (login-node) process dies, a later call can pick the job back up from the manifest instead of resubmitting from scratch.
-- After submitting the array, the runner watches the respective slurm jobs. It polls every 10 seconds
-  (by default, make param in the config), and updates the progress report based on this
-  (also reports how many jobs are pending, running, have succeeded, have failed; the bar itself counts processed **blocks**, summed from the per-task done-logs). The **per-task `.success` sentinel is the ground truth for a *task* being complete**, while the per-block **done-logs are the authority for which blocks finished** (so failure reporting is precise per block, not per task). The scheduler is queried only to detect *dead* tasks — using `sacct` rather than `squeue` (squeue drops finished jobs, while sacct reports terminal states reliably: COMPLETED, FAILED, TIMEOUT, OUT_OF_MEMORY, NODE_FAIL, PREEMPTED, CANCELLED). A task that has left the scheduler in a terminal state but has no sentinel is treated as failed; `_finalize` then reports exactly the blocks missing from the done-logs.
-- After everything is done the runner checkes if computation was overall successfull. If yes, it unpickles the return values (if any),
-  cleans up the temp folder, and returns the list of return vals. Otherwise it gives an error report and throws a runtime error.
-  In the latter case the temp folder is not cleared to enable debugging; the error report contains the path to the temp folder and the
-  `block_ids` of the failed blocks, so the job can be re-run on exactly those blocks.
+- It creates a temporary folder on a **shared filesystem** and submits one array job. The harness loads the cloudpickled payload and compact task assignment. It reopens source arrays and processes the assignment in order. Each task writes cumulative completion records to one binary journal. A record contains the completed unit count and logical item count. Ordered return operations write a length-framed result before the matching completion record. Reducer operations write one atomic accumulator before the matching completion record. The manifest stores the work plan, task assignments, and submission history. Resume starts at each task's completed prefix. Reattach uses the same stored assignments.
+- The runner polls Slurm at the configured interval. The progress bar sums logical item counts from the binary journals. A `.success` sentinel shows that a task reached its end. The journal shows the completed assignment prefix. The runner uses `sacct` because `squeue` drops finished jobs.
+- `_finalize` converts each incomplete assignment suffix into compact failed work. It preserves the temp folder on failure. On success, it collects ordered results or streams reducer accumulators. It then removes the folder.
 
 
 ## Multi-stage workflows
 
 Some algorithms are not a single map + local reduce. Connected components (label per block → merge labels across block boundaries → relabel) and seeded watershed need information exchanged *between* blocks and are genuinely map → reduce → map.
 
-Statistics like mean and std are **not** in this category — they are single pass. A block returns a small tuple through the return-value channel (e.g. `sum + count` for the mean, or `sum + sum_of_squares + count` for the std), and these combine associatively and commutatively in the local reduction, exactly like `max`. No intermediate storage and no second map are needed.
+Statistics like mean and std are **not** in this category. They use one block pass and a bounded
+reducer. Workers write one accumulator per durable batch. The orchestrator streams the final fold.
+Mean and standard deviation use mergeable population moments.
 
 These are expressed simply as **multiple sequential `run()` calls**, with intermediate results persisted to a `Source` or another suitable format that lives in the job's temp folder (e.g. a temporary zarr/n5 array, or a small table for per-block summaries). Stage *N+1* reads what stage *N* wrote. This needs no task-graph machinery (in contrast to the Luigi-based cluster-tools), and does not clash with the current single-`run()` design — the high-level function just orchestrates the stages and owns the temp source's lifecycle (created before the first stage, cleaned up on overall success, preserved on failure for debugging). The same `block_ids` re-run mechanism applies per stage.
 
@@ -238,12 +257,13 @@ The **resolution/scale-adapting wrapper** is what makes a differently-sampled ma
 The first slice is implemented and tested: `stats.max/min/mean/std`, `filters.apply_filter` (+ the gaussian-family convenience functions), and `segmentation.label`, on the `local`, `subprocess` and `slurm` backends. Key decisions and insights from building it:
 
 - **One per-block code path for all backends.** `runner.run_block(...)` builds the `Block` / `BlockWithHalo` and calls the user function; both `LocalRunner` and the worker harness call it. This is what makes the `direct == local == subprocess` parity tests meaningful — there is no separate distributed code path to drift from.
-- **The `subprocess` backend is the slurm dress rehearsal.** It implements the entire distributed protocol — temp folder, cloudpickle `payload.pkl`, generated per-task work-lists, per-block persistence into per-task files (a `progress/<task>.log` done-log + length-framed `results/<task>` records, appended after each block with the result written *before* the done-line so a crash leaves at most a harmless re-runnable tail), a final `.success` sentinel, result collection (dedup by block id, merges an original run with a resume), precise per-block failure reporting with a preserved temp folder + failed `block_ids`, a block-counting progress bar, and both `block_ids` re-run and `resume_from` (resume the incomplete tasks of a preserved run). All of this lives in a shared `_DistributedRunner` base; `SubprocessRunner` overrides only `_launch_and_wait` (a local `subprocess.Popen` per task, capped at `num_workers`, accepting a `task_ids` subset for resume). The worker entry point is `python -m bioimage_py.runner._harness <tmp> <task_id>`.
+- **Associative reducers use durable batches.** A reducer run stores one atomic accumulator per batch. Resume validates these files and repairs completion journals before it launches incomplete tasks. Finalization reads one accumulator at a time in batch order.
+- **The `subprocess` backend is the slurm dress rehearsal.** It implements the complete distributed protocol. This includes compact work plans, task assignments, binary completion journals, result records, task sentinels, failure diagnostics, and resume. `_DistributedRunner` owns this protocol. `SubprocessRunner` only launches local worker processes. The worker entry point is `python -m bioimage_py.runner._harness <tmp> <task_id> <attempt>`.
 - **`output` is optional for local, required for distributed.** Array-output ops (`filters.*`, `segmentation.label`) allocate and return a fresh numpy array when `output` is omitted *and* the backend is local; distributed runs require a file-backed `output`. The runner enforces this up front via `_DistributedRunner._require_reopenable`, which calls `to_spec()` on every input/output/mask and raises a role-tagged, "file-backed (zarr/n5)" error for in-memory arrays. Always allocating a *fresh* array on omission (rather than filtering in place) also removes the halo-in-place hazard.
 - **Connected components: relabel only over labels that exist.** Stage 1 uses the cluster_tools offset scheme (`offset = block_id * prod(block_shape)`), which is *sparse*. Relabeling the whole union-find element space (size `max_label + 1`) yields a correct partition but non-compact ids (max ≫ component count). The fix: stage 1 returns each block's actual labels, and stage 3 relabels the union-find roots of only those labels → compact, consecutive output ids. This is validated with a partition-equality (not id-equality) check against whole-array `bioimage_cpp.segmentation.label`.
 - **Filters dispatch by name, not by function object.** The per-block closure looks up `bioimage_cpp.filters` functions by string in a module-level dict, so the cloudpickled closure captures only picklable values (a string, the sigma, small tuples). Halo per axis is `sigma_to_halo(sigma, order)` (mirrors elf / VIGRA: `2·ceil(3σ + 0.5·order + 0.5)`).
 - **Multi-stage = sequential `run()` calls** sharing the same `block_shape` so block ids line up across stages; the labeled volume itself is the inter-stage state (no task graph needed). A compute function recovers its own block id with `blocking.coordinates_to_block_id(block.begin)`, keeping the `function(block, inputs, outputs, mask)` convention unchanged.
-- **Slurm is `_launch_and_wait` + a manifest; the protocol is shared.** `SlurmRunner` adds only sbatch-array submission, `sacct` polling and reattach; payload/harness/`_finalize`/`block_ids` re-run are inherited (the post-launch tail of `_execute` was extracted into a shared `_finalize` so reattach finalizes a detached run identically). The one real-world subtlety, learned on the cluster: per-task `.success` sentinels written on compute nodes take **up to the NFS attribute-cache timeout (~60 s on a default v3 mount) to become visible to the orchestrating (login) node** — measured ~36 s, and neither `os.path.exists` nor a fresh `os.listdir` busts it sooner. Because `_finalize` re-checks the sentinels, the poll cannot return until they are actually visible. The fix keeps the sentinel as the success ground truth but uses the lag-free `sacct` `State` to classify: a `COMPLETED` task (harness exited 0 ⇒ sentinel written) is given a generous `latency_wait` for its sentinel to appear, while any other terminal state means the harness did not succeed and the task is declared dead after a short grace — so successes resolve the moment the sentinel lands and genuine failures are reported quickly.
+- **Slurm extends the shared protocol.** `SlurmRunner` adds sbatch-array submission, `sacct` polling, final accounting, and reattach. It inherits the payload, harness, finalization, and block re-run logic. The one real-world subtlety, learned on the cluster: per-task `.success` sentinels written on compute nodes take **up to the NFS attribute-cache timeout (~60 s on a default v3 mount) to become visible to the orchestrating (login) node** — measured ~36 s, and neither `os.path.exists` nor a fresh `os.listdir` busts it sooner. Because `_finalize` re-checks the sentinels, the poll cannot return until they are actually visible. The fix keeps the sentinel as the success ground truth but uses the lag-free `sacct` `State` to classify: a `COMPLETED` task (harness exited 0 ⇒ sentinel written) is given a generous `latency_wait` for that sentinel to appear. Any other terminal state means the harness did not succeed and the task is declared dead after a short grace.
 - **Still deferred:** the resolution-adapting mask wrapper (only equal-shape masks are accepted now), empty-block skipping, write-safety auto-derivation (only a chunk-multiple guard is implemented), and the multichannel / structure-tensor filter paths beyond the scalar gaussian family covered by parity tests.
 
 ## Evaluation metrics
@@ -258,16 +278,17 @@ Two ignore mechanisms are kept, as in elf: VI/rand/cremi/object-VI take `ignore_
 - **Rand precision on enormous volumes.** `rand_scores` accumulates `Σ count²` in float64; once a single object exceeds ~2^53 voxels the square leaves the exact-integer range and the result loses precision. A guard or a higher-precision / pairwise-exact accumulation would be needed for extreme volumes.
 - **Orientation reuse.** The `*_scores` functions expect the table in `(segmentation, groundtruth)` orientation (matching needs the same), so a power user computing many metrics builds one table. A `ContingencyTable.transpose()` (swap A/B + marginals) would let a single table also serve any future gt-first consumer without a rebuild.
 - **Ignore-label ergonomics.** `matching`/`SBD` accept a single scalar `ignore_label`; an ignore *set* (like `drop_ignore`'s sequences) would be more general. The two ignore mechanisms (pixel-drop vs object-removal) are intentionally distinct but could be unified behind a clearer shared vocabulary.
-- **Metrics need a complete table.** The wrappers deliberately omit `block_ids`/`resume_from`, since a metric over a partial table is meaningless. The distributed-rerun path is explicit: build the table with `contingency_table(…, resume_from=…)`, then call the `*_scores` function. `dice_score` (its own three-scalar reduction) currently has no table layer, so it has no resume path — a possible future addition.
+- **Metrics need a complete table.** The table-based wrappers omit `block_ids`/`resume_from`, since a metric over a partial table is meaningless. The distributed-rerun path is explicit: build the table with `contingency_table(…, resume_from=…)`, then call the `*_scores` function. `dice_score` uses a bounded three-scalar reducer and supports `resume_from` directly.
 
 ## The slurm runner
 
-The protocol is shared; slurm is a thin layer. `SlurmRunner` subclasses `_DistributedRunner` and implements only `_launch_and_wait(tmp, n_tasks, num_workers, name, task_ids=None)` (plus `reattach`) — everything else (payload, harness, per-block persistence + result collection, `_finalize` failure handling, `block_ids` re-run, the shared `resume`, `_require_reopenable`) is inherited and exercised by the `subprocess` backend. How it works and the gotchas it handles:
+The protocol is shared; slurm is a thin layer. `SlurmRunner` subclasses `_DistributedRunner` and implements task launch, polling, accounting, and reattach. The base class owns work persistence, result collection, finalization, and resume. The subprocess backend exercises the same protocol in CI.
 
 - **One array job.** It renders an sbatch script from `SlurmConfig` (partition, time, mem, cpus_per_task, gpus, account, qos, constraint, shebang) with `--array=<indices>%<throttle>` — `0-(n_tasks-1)` for a normal run, or a compressed sparse list (e.g. `0,3,7-9`) of just the incomplete tasks on a `resume_from`. Array index = task id; the per-task command is exactly the harness invocation the subprocess backend uses, run with the absolute `python_executable` (default `sys.executable`). `num_workers` is the array throttle, decoupled from task count — the base partitions into `n_tasks = num_workers * config.tasks_per_worker` independently (`_resolve_n_tasks`). `tasks_per_worker > 1` over-partitions the work into more, smaller tasks than there are workers so a worker that finishes early pulls the next queued array index — scheduler-driven load-balancing ("work-stealing"); the default `1` is one task per worker. `n_tasks` is clamped to the number of schedulable units and to the cluster's `MaxArraySize` (`_max_tasks`, queried via `scontrol` once and memoized, overridable with `SlurmConfig.max_array_size`), and the residual guard still fails an oversized run up front rather than at submit.
 - **Shared filesystem.** The temp folder (`RunnerConfig.tmp_root`) must live on a filesystem visible to all compute nodes (not node-local `/tmp`); `SlurmRunner` requires `tmp_root` to be set and errors clearly otherwise. The harness reopens sources from their specs there and writes results/sentinels there.
 - **Worker environment.** The generated script runs the absolute `python_executable`, so the submitting env (which must have `bioimage_py` / `bioimage_cpp` importable) is reused on the node with no activation when it lives on a shared filesystem; `SlurmConfig.shebang` supplies any extra preamble (module loads / `LD_LIBRARY_PATH`). The payload's Python `(major, minor)` stamp catches mismatches at run time.
-- **Poll terminal states with `sacct`, not `squeue`.** `squeue` drops finished jobs; `sacct -X -n -P --format=JobID,State -j <jobid>` reports one clean row per array task in a terminal state reliably (COMPLETED / FAILED / TIMEOUT / OUT_OF_MEMORY / NODE_FAIL / PREEMPTED / CANCELLED / …). Pending tasks collapse into a `<jobid>_[a-b%thr]` range row that is parsed out; `CANCELLED by <uid>` is normalised by first token; a non-zero `sacct` exit is a transient hiccup (skip that poll), an empty result is "not registered yet" (pending), and a task absent from `sacct` is pending, never dead. The ground truth for success stays the per-task `.success` sentinel file — see the NFS-visibility insight above for how `COMPLETED` vs other terminal states are used to detect dead tasks without false failures. Polls every `config.poll_interval` seconds and updates a progress bar (ok / failed / running / pending).
-- **Manifest + reattach.** A manifest (job id, n_tasks, throttle, temp folder, …) is written at submission time; `block→task` assignment stays the single source of truth in `blocks/*.json`. `reattach(tmp_folder)` reads the manifest + payload, reconstructs the partition in numeric task order, re-probes `sacct` (raising if the job is gone and the run is unfinished), resumes polling and runs the shared `_finalize`. The orchestrating process typically runs on a login node and may be interrupted during multi-hour jobs, so reattach matters more here than for `subprocess`. On `KeyboardInterrupt` the job is left running (not cancelled) so it can be reattached.
-- **Re-run on failure.** Two paths, both carried by the `RunnerError` (`failed_block_ids` + preserved `tmp_folder`). `block_ids` re-partitions and re-runs only the failed blocks in a fresh temp folder (correct for array-output ops; for a return-value op it reduces over only those blocks). `resume_from=tmp_folder` instead reuses the preserved run: `resume(tmp_folder)` reconstructs the partition + payload and resubmits a sparse array for just the incomplete tasks (the harness skips blocks already done), then finalizes over **all** persisted per-block results — so return-value ops get a correct merged answer too. `resume` is shared in `_DistributedRunner` (subprocess relaunches the task subset locally; slurm resubmits the sparse array); it is distinct from `reattach`, which re-polls a still-running job rather than resubmitting a dead one.
+- **Poll terminal states with `sacct`, not `squeue`.** `squeue` drops finished jobs; `sacct -X -n -P --format=JobID,State -j <jobid>` reports allocation state without step utilization. Pending tasks collapse into a `<jobid>_[a-b%thr]` range row. The parser expands these ranges and normalizes states such as `CANCELLED by <uid>`. A non-zero `sacct` exit skips that poll. An empty result means that the job is not registered yet. An absent task remains pending. The `.success` sentinel stays the source of truth for success. A separate final query includes `.batch` rows for exit status, elapsed time, memory, and node diagnostics.
+- **Manifest + reattach.** Both distributed backends write a schema-versioned manifest. The manifest stores a tagged work plan and deterministic assignments. Default ranges use `start`, `stop`, and `step`. Small explicit ID lists use JSON. Large lists use memory-mapped int64 arrays. Each attempt keeps its task IDs, status, timestamps, concurrency, logs, outcomes, and Slurm job ID when applicable. Resume appends an attempt. `reattach(tmp_folder)` uses the stored plan and latest Slurm attempt.
+- **Failure diagnostics.** `RunnerError` stores compact failed-ID views and exposes `failed_block_count` and `iter_failed_block_ids()`. The `failed_block_ids` property keeps the list API but materializes the IDs only when accessed. Batch failures use `failed_batches`. The error also exposes one immutable `TaskFailure` per failed distributed task. Subprocess and Slurm persist backend-specific diagnostics.
+- **Re-run on failure.** `block_ids` starts a new run for an explicit block subset. `resume_from=tmp_folder` reuses the preserved run. Resume reads each task's last complete 16-byte journal record and starts at the next unit. It does not construct a set of completed IDs. Result records use global work positions, so explicit duplicate IDs keep their order. `resume` resubmits incomplete tasks. `reattach` polls an existing Slurm attempt.
 - **Testing.** `subprocess` is the CI proxy for the protocol; `tests/test_slurm_runner.py` adds slurm-only tests (gated on `sbatch` + `BIOIMAGE_PY_SHARED_TMP`) asserting parity against `local`/`subprocess` plus failure+re-run, reattach, and resume end to end. Because pytest's `tmp_path` is node-local, both the test arrays and `tmp_root` are placed on the shared filesystem via the `shared_tmp_path` / `shared_zarr_factory` fixtures.

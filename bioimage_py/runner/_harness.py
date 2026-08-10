@@ -1,23 +1,9 @@
-"""Worker entry point for distributed tasks.
-
-Invoked as ``python -m bioimage_py.runner._harness <tempdir> <task_id>``. Loads the
-cloudpickled payload, reopens the sources from their specs, and runs the assigned blocks via
-the shared :func:`bioimage_py.runner.base.run_block`.
-
-Progress is persisted **per block** so a partially-failed task preserves its completed work
-and can be resumed. After each block succeeds the worker appends, in order: (1) for a
-return-value task, a length-prefixed result record to ``results/<task_id>``; then (2) the
-block id to the done-log ``progress/<task_id>.log``. The block's own output write to the
-zarr already happened (durably) inside ``run_block`` before either append, so a crash leaves
-at most a result record with no matching done-line -- harmless, since the done-log is the
-authority for "which blocks are done" and :func:`_collect` dedups results by block id. The
-``success/<task_id>.success`` sentinel is still written last and means "task fully done". On
-a resume, blocks already in the done-log are skipped.
-"""
+"""Worker entry point for distributed tasks."""
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import struct
 import sys
@@ -29,28 +15,79 @@ import cloudpickle
 
 from ..sources.dispatch import from_spec
 from ..util import get_blocking
+from ._diagnostics import load_manifest
+from ._reduction import reduce_batch
+from ._work import (ReductionBatchPlan, assignment_length, iter_assignment,
+                    load_assignment, load_work_spec, logical_size)
 from .base import run_block
-from .distributed import _check_versions
+from .distributed import _COMPLETION_RECORD, _check_versions, _completion_counts
 
 
-def _run_task(tmp: str, task_id: int) -> None:
+def _truncate_torn_journal(path: str) -> None:
+    """Remove an incomplete final completion record before appending."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    valid_size = size - size % _COMPLETION_RECORD.size
+    if valid_size != size:
+        os.truncate(path, valid_size)
+
+
+def _truncate_torn_results(path: str) -> None:
+    """Remove an incomplete final framed result before appending."""
+    try:
+        with open(path, "rb") as file:
+            valid_size = 0
+            while True:
+                header = file.read(8)
+                if not header:
+                    return
+                if len(header) < 8:
+                    break
+                (length,) = struct.unpack("<Q", header)
+                payload = file.read(length)
+                if len(payload) < length:
+                    break
+                valid_size += 8 + length
+    except FileNotFoundError:
+        return
+    os.truncate(path, valid_size)
+
+
+def _run_task(tmp: str, task_id: int, attempt_number: int = 1) -> None:
     with open(os.path.join(tmp, "payload.pkl"), "rb") as f:
         payload = cloudpickle.load(f)
 
     _check_versions(payload.get("versions", {"python": payload.get("python")}), role="worker")
 
-    with open(os.path.join(tmp, "blocks", f"{task_id}.json")) as f:
-        block_ids = json.load(f)
+    manifest = load_manifest(tmp)
+    work = load_work_spec(tmp, manifest["work_plan"])
+    assignment = load_assignment(tmp, manifest["assignments"][task_id])
 
     function = payload["function"]
     has_return_val = payload["has_return_val"]
     mode = payload.get("mode", "block")
+    result_mode = manifest.get(
+        "result_mode", "ordered" if has_return_val else "none",
+    )
 
     # In "map" mode the function carries its own data in its closure (a SourceSpec it
     # reopens, a file path it reads); the runner reopens no sources and builds no blocking.
     if mode == "map":
-        def call_one(bid):
-            return function(int(bid))
+        def call_item(value):
+            return function(int(value))
+    elif mode == "batch":
+        sink_descriptor = manifest.get("result_sink")
+        if sink_descriptor is None:
+            call_batch = function
+        else:
+            from ..tables import TableDataset
+
+            dataset = TableDataset._from_descriptor(sink_descriptor)
+
+            def call_batch(value):
+                return dataset._run_batch(function, value)
     else:
         inputs = [from_spec(s) for s in payload["input_specs"]]
         outputs = [from_spec(s) for s in payload["output_specs"]]
@@ -58,55 +95,67 @@ def _run_task(tmp: str, task_id: int) -> None:
         blocking = get_blocking(payload["shape"], payload["block_shape"], payload["roi"])
         halo = payload["halo"]
 
-        def call_one(bid):
-            return run_block(function, blocking, bid, inputs, outputs, mask, halo)
+        def call_item(value):
+            return run_block(function, blocking, int(value), inputs, outputs, mask, halo)
 
-    # Resume support: skip blocks already recorded as done in this task's done-log.
-    done_path = os.path.join(tmp, "progress", f"{task_id}.log")
-    already_done = set()
-    if os.path.exists(done_path):
-        with open(done_path) as f:
-            for line in f:
-                if line.endswith("\n"):  # only complete (flushed) lines are authoritative
-                    s = line.strip()
-                    if s:
-                        already_done.add(int(s))
+    if result_mode == "reducer":
+        if mode == "batch" or not isinstance(work, ReductionBatchPlan):
+            raise ValueError("Reducer execution requires block or map reduction work.")
+        reducer = payload.get("reducer")
+        if reducer is None:
+            raise ValueError("Reducer execution has no serialized reducer.")
 
-    # Time only the block-processing loop (the parallelizable read+compute+write work),
-    # excluding the fixed per-task payload load / source reopen above and any scheduler
-    # queue wait -- this is the "per-worker compute time" basis for scaling analysis.
+        def call_reduction_batch(value):
+            return reduce_batch(value, work, call_item, reducer, tmp=tmp)
+
+        call_one = call_reduction_batch
+    elif mode == "batch":
+        call_one = call_batch
+    elif mode != "batch":
+        call_one = call_item
+
+    journal_path = os.path.join(tmp, "progress", f"{task_id}.bin")
+    completed_units, completed_logical_items = _completion_counts(tmp, task_id)
+    completed_units = min(completed_units, assignment_length(assignment))
+    _truncate_torn_journal(journal_path)
+
+    # Measure task work after payload loading and source setup. This excludes scheduler wait.
     started = datetime.now().isoformat()
     t0 = time.time()
     n_processed = 0
-    # Append mode so a resumed task adds to, rather than truncates, prior progress.
-    res_f = open(os.path.join(tmp, "results", f"{task_id}"), "ab") if has_return_val else None
-    done_f = open(done_path, "a")
+    result_path = os.path.join(tmp, "results", f"{task_id}")
+    writes_results = result_mode == "ordered"
+    if writes_results:
+        _truncate_torn_results(result_path)
+    res_f = open(result_path, "ab") if writes_results else None
+    journal = open(journal_path, "ab")
     try:
-        for bid in block_ids:
-            bid = int(bid)
-            if bid in already_done:
-                continue
-            res = call_one(bid)              # (1) durable output write happens in here
-            if has_return_val:               # (2) append framed result, flush
-                payload_bytes = cloudpickle.dumps((bid, res))
+        for position, value in iter_assignment(work, assignment, completed_units):
+            res = call_one(value)
+            if writes_results:
+                payload_bytes = cloudpickle.dumps((position, res))
                 res_f.write(struct.pack("<Q", len(payload_bytes)) + payload_bytes)
                 res_f.flush()
-            done_f.write(f"{bid}\n")         # (3) append done-mark, flush
-            done_f.flush()
+                os.fsync(res_f.fileno())
+            completed_units += 1
+            completed_logical_items += logical_size(value)
+            journal.write(_COMPLETION_RECORD.pack(completed_units, completed_logical_items))
+            journal.flush()
+            os.fsync(journal.fileno())
             n_processed += 1
     finally:
         if res_f is not None:
             res_f.close()
-        done_f.close()
+        journal.close()
     compute_s = time.time() - t0
     ended = datetime.now().isoformat()
 
-    # Per-task timing record, written before the sentinel so a finalized run always finds it.
-    # Each task writes its own file (like results/ and progress/), so there is no contention.
+    # Write timing before the sentinel. Each task owns its timing file.
     timing = {
         "task_id": int(task_id),
-        "n_blocks": len(block_ids),
-        "n_processed": n_processed,  # excludes blocks skipped because already done (resume)
+        "n_units": assignment_length(assignment),
+        "n_processed": n_processed,
+        "completed_logical_items": completed_logical_items,
         "compute_s": compute_s,
         "started": started,
         "ended": ended,
@@ -115,8 +164,12 @@ def _run_task(tmp: str, task_id: int) -> None:
         "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
         "slurm_nodename": os.environ.get("SLURMD_NODENAME"),
     }
-    with open(os.path.join(tmp, "timings", f"{task_id}.json"), "w") as f:
+    attempt_timing_dir = os.path.join(tmp, "attempts", f"{attempt_number:04d}", "timings")
+    os.makedirs(attempt_timing_dir, exist_ok=True)
+    attempt_timing_path = os.path.join(attempt_timing_dir, f"{task_id}.json")
+    with open(attempt_timing_path, "w") as f:
         json.dump(timing, f)
+    shutil.copyfile(attempt_timing_path, os.path.join(tmp, "timings", f"{task_id}.json"))
 
     # Sentinel written last: its existence is the ground truth for a fully-completed task.
     open(os.path.join(tmp, "success", f"{task_id}.success"), "w").close()
@@ -125,11 +178,18 @@ def _run_task(tmp: str, task_id: int) -> None:
 def main() -> None:
     tmp = sys.argv[1]
     task_id = int(sys.argv[2])
+    attempt_number = int(sys.argv[3]) if len(sys.argv) > 3 else 1
     try:
-        _run_task(tmp, task_id)
+        _run_task(tmp, task_id, attempt_number)
     except Exception:
+        error_text = traceback.format_exc()
+        attempt_error_dir = os.path.join(tmp, "attempts", f"{attempt_number:04d}", "errors")
+        os.makedirs(attempt_error_dir, exist_ok=True)
+        attempt_error_path = os.path.join(attempt_error_dir, f"{task_id}.txt")
+        with open(attempt_error_path, "w") as f:
+            f.write(error_text)
         with open(os.path.join(tmp, "error", f"{task_id}.txt"), "w") as f:
-            f.write(traceback.format_exc())
+            f.write(error_text)
         sys.exit(1)
 
 

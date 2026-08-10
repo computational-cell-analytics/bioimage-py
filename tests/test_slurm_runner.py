@@ -13,6 +13,8 @@ import os
 import shutil
 
 import numpy as np
+import pandas as pd
+import pyarrow as pa
 import pytest
 
 import bioimage_cpp as bic
@@ -65,6 +67,15 @@ def _fail_on_corner(should_fail):
     return fn
 
 
+def _make_table_writer(schema):
+    """Return a closure that writes one typed row per logical item."""
+    def fn(batch, writer):
+        writer.write(pa.table({
+            "item": pa.array(list(batch), type=pa.int64()),
+        }, schema=schema))
+    return fn
+
+
 class _Detached(Exception):
     """Carries the temp folder of a run whose orchestrator 'died' right after submit."""
 
@@ -110,6 +121,13 @@ def test_slurm_failure_then_rerun(shared_zarr_factory, rng, shared_tmp_path):
     err = excinfo.value
     assert 0 in err.failed_block_ids  # the corner block is block id 0
     assert err.tmp_folder is not None and os.path.isdir(err.tmp_folder)
+    assert err.task_failures
+    failure = err.task_failures[0]
+    assert failure.backend == "slurm"
+    assert failure.scheduler_task_id is not None
+    assert failure.stderr_path is not None
+    if failure.scheduler_state is not None:
+        assert failure.scheduler_state in {"FAILED", "OUT_OF_MEMORY", "TIMEOUT", "NODE_FAIL"}
 
     # Re-running the reported failed blocks with a non-failing fn now succeeds.
     results = runner.run(_fail_on_corner(False), [z], block_shape=(16, 16), num_workers=4,
@@ -133,6 +151,81 @@ def test_slurm_reattach(shared_zarr_factory, rng, shared_tmp_path):
     results = SlurmRunner(cfg).reattach(tmp, name="reattach")
     assert np.isclose(max(r for r in results if r is not None), float(a.max()))
     assert not os.path.isdir(tmp)  # cleaned up on successful finalize
+
+
+def test_slurm_table_sink_reattach(shared_tmp_path):
+    cfg = _cfg(shared_tmp_path)
+    schema = pa.schema([("item", pa.int64())])
+    dataset = bp.TableDataset.create(
+        os.path.join(shared_tmp_path, "table.parquet"),
+        schema=schema,
+        schema_version=1,
+        operation="slurm-table-test",
+        operation_version="1",
+        input_identities={"input": "synthetic"},
+        parameters={},
+    )
+
+    with pytest.raises(_Detached) as excinfo:
+        _DetachAfterSubmit(cfg).map_batches(
+            _make_table_writer(schema), 5, batch_size=2, num_workers=2,
+            result_sink=dataset, name="table-reattach-src",
+        )
+
+    result = SlurmRunner(cfg).reattach(excinfo.value.tmp, name="table-reattach")
+    assert isinstance(result, bp.TableDataset)
+    assert result.to_pandas()["item"].tolist() == list(range(5))
+    assert not os.path.isdir(excinfo.value.tmp)
+
+
+def test_slurm_file_backed_regionprops(shared_zarr_factory, shared_tmp_path):
+    seg = np.zeros((24, 28, 32), dtype="uint64")
+    seg[2:8, 3:12, 4:14] = 7
+    seg[10:19, 15:25, 18:29] = 2
+    source = shared_zarr_factory(seg, chunks=(12, 14, 16))
+    base = bp.morphology.morphology(seg).iloc[::-1].reset_index(drop=True)
+    base_path = os.path.join(shared_tmp_path, "regionprops-base.parquet")
+    output_path = os.path.join(shared_tmp_path, "regionprops-result.parquet")
+    base.to_parquet(base_path, index=False)
+    expected = bp.morphology.regionprops(seg, base)
+    expected = expected.set_index("label").loc[base["label"].tolist()].reset_index()
+    expected["label"] = expected["label"].astype("uint64")
+    expected["n_voxels"] = expected["n_voxels"].astype("uint64")
+
+    result = bp.morphology.regionprops(
+        source,
+        base_path,
+        output_table=output_path,
+        rows_per_batch=1,
+        num_workers=2,
+        job_type="slurm",
+        job_config=_cfg(shared_tmp_path),
+    )
+
+    pd.testing.assert_frame_equal(result.to_pandas(), expected)
+
+
+def test_slurm_file_backed_morphology(shared_zarr_factory, shared_tmp_path):
+    seg = np.zeros((24, 28, 32), dtype="uint64")
+    seg[2:8, 3:12, 4:14] = 17
+    seg[10:19, 15:25, 18:29] = 2
+    source = shared_zarr_factory(seg, chunks=(12, 14, 16))
+    output_path = os.path.join(shared_tmp_path, "morphology-result.parquet")
+
+    result = bp.morphology.morphology(
+        source,
+        output_table=output_path,
+        block_shape=(12, 14, 16),
+        blocks_per_batch=2,
+        label_partition_size=10,
+        num_workers=2,
+        job_type="slurm",
+        job_config=_cfg(shared_tmp_path),
+    )
+
+    pd.testing.assert_frame_equal(
+        result.to_pandas(), bp.morphology.morphology(seg),
+    )
 
 
 def _make_shared_flaky(marker_path):

@@ -51,8 +51,7 @@ def test_direct_rejects_mask(rng):
 
 
 def test_reductions_subprocess_parity(zarr_factory, rng):
-    # Every reduction must agree across direct/local/subprocess, exercising the return-value
-    # channel (and the parallel-variance merge for mean/std) through cloudpickle + partitioning.
+    # Exercise durable batch accumulators and the parallel-variance merge through subprocesses.
     a = rng.random((33, 28)).astype("float32")
     z = zarr_factory(a, chunks=(8, 8))
     kw = dict(block_shape=(8, 8), num_workers=3, job_type="subprocess")
@@ -64,6 +63,28 @@ def test_reductions_subprocess_parity(zarr_factory, rng):
     assert np.isclose(mn, a.min()) and np.isclose(mx, a.max())
     mean_val, std_val = bp.stats.mean_and_std(z, **kw)
     assert np.isclose(mean_val, a.mean(), atol=1e-5) and np.isclose(std_val, a.std(), atol=1e-5)
+
+
+@pytest.mark.parametrize("batch_size", [1, 3, 1_000])
+def test_reductions_are_stable_across_batch_sizes(zarr_factory, rng, batch_size):
+    a = rng.normal(size=(33, 28)).astype("float32")
+    z = zarr_factory(a, chunks=(8, 8))
+    kw = {
+        "block_shape": (8, 8),
+        "num_workers": 3,
+        "reduction_batch_size": batch_size,
+    }
+    assert np.isclose(bp.stats.max(z, **kw), a.max())
+    assert np.isclose(bp.stats.min(z, **kw), a.min())
+    mean, std = bp.stats.mean_and_std(z, **kw)
+    assert np.isclose(mean, a.mean(), atol=1e-6)
+    assert np.isclose(std, a.std(), atol=1e-6)
+
+
+def test_reduction_batch_size_is_validated_on_direct_path(rng):
+    a = rng.random((8, 8)).astype("float32")
+    with pytest.raises(ValueError, match="must be positive"):
+        bp.stats.max(a, reduction_batch_size=0)
 
 
 def test_mask_shape_mismatch_raises(rng):

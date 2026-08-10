@@ -1,42 +1,39 @@
-"""Advanced per-object morphology: numpy moment features + surface area and centroid correction.
-
-A *second pass* on top of :func:`bioimage_py.morphology.morphology`: for each labeled object it crops
-the sub-volume by the precomputed bounding box, masks ``== label``, and computes shape features
-directly with numpy (in physical units via ``resolution``) — the physical volume (``area``), the
-``extent``, the ``equivalent_diameter_area`` and the major/minor ``axis_*_length`` from the object's
-second moments — plus an optional marching-cubes ``surface_area`` (3D) and a corrected centroid (the
-center-of-mass if it lies inside the object, else the deepest-interior voxel via the Euclidean
-distance transform).
-
-The moment features reproduce the corresponding scikit-image ``regionprops`` definitions exactly, but
-without constructing a ``RegionProperties`` object per label (and without the expensive convex-hull
-``solidity`` / topological ``euler_number``), so the pass scales linearly in the number of objects.
-Work is mapped one task per object with the generic
-:meth:`bioimage_py.runner.base.Runner.map`, so it runs identically across ``local`` / ``subprocess``
-/ ``slurm``; for distributed backends the base table is serialized to a temp file the workers read.
-"""
+"""Compute per-object morphology features from a base morphology table."""
 from __future__ import annotations
 
+import bisect
 import functools
+import math
+import numbers
 import os
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
 
 import bioimage_cpp as bic
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 
 from ..runner import get_runner
+from ..runner._diagnostics import load_manifest
+from ..runner._work import BatchPlan, BoundaryBatchPlan, RegularBatchPlan
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, as_source
+from ..tables import (
+    TableDataset,
+    _describe_parquet_input,
+    _iter_parquet_rows,
+    _persist_parquet_input_layout,
+    _read_parquet_rows,
+)
 from ..util import check_rerun_args
+from ._table_utils import overlapping_paths, resolve_source, source_identity
 from .morphology import _axis_names
 
 __all__ = ["regionprops"]
 
-# Per-worker cache so each task reopens the segmentation `SourceSpec` once, not per object (keyed by
-# the spec's stable fields). The consumed table columns travel in the closure as numpy arrays, so
-# they need no worker-side caching.
-_SEG_CACHE: Dict[Any, Source] = {}
+_COST_SCAN_ROWS = 1_000_000
+_MAX_UINT64 = int(np.iinfo(np.uint64).max)
+_BATCH_COST_MODEL = "bounding_box_voxels_v2"
 
 
 def _read_table(path: str) -> "pd.DataFrame":
@@ -56,23 +53,13 @@ def _load_table(table: Union[str, "pd.DataFrame"]) -> "pd.DataFrame":
     return _read_table(str(table))
 
 
-def _required_columns(axes: Sequence[str]) -> List[str]:
+def _required_columns(axes: Sequence[str], *, include_size: bool = False) -> List[str]:
     """The base-morphology columns this op consumes."""
-    return (["label"] + [f"com_{a}" for a in axes]
+    columns = ["label"]
+    if include_size:
+        columns.append("size")
+    return (columns + [f"com_{a}" for a in axes]
             + [f"bb_min_{a}" for a in axes] + [f"bb_max_{a}" for a in axes])
-
-
-def _resolve_seg(seg: Union[Source, Any]) -> Source:
-    """Return an opened segmentation source, reopening (and caching) a `SourceSpec` if needed."""
-    if isinstance(seg, Source):
-        return seg
-    key = (seg.kind, seg.path, seg.internal_path)
-    src = _SEG_CACHE.get(key)
-    if src is None:
-        from ..sources.dispatch import from_spec
-        src = from_spec(seg)
-        _SEG_CACHE[key] = src
-    return src
 
 
 def _column_arrays(df: "pd.DataFrame", axes: Sequence[str]) -> Dict[str, np.ndarray]:
@@ -152,39 +139,58 @@ def _corrected_centroid(mask: np.ndarray, com_global_vox: np.ndarray, origin: np
     return centroid_vox * spacing
 
 
-def _object_features(index: int, ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """Compute the feature row for a single object (the per-item function handed to ``runner.map``)."""
-    seg = _resolve_seg(ctx["seg"])
-    axes, ndim = ctx["axes"], ctx["ndim"]
-    res = np.asarray(ctx["resolution"], dtype="float64")
+def _compute_object_features(
+    seg: Source,
+    label: int,
+    com: np.ndarray,
+    bb_min: np.ndarray,
+    bb_max: np.ndarray,
+    resolution: Sequence[float],
+    ndim: int,
+    compute_surface: bool,
+) -> tuple:
+    res = np.asarray(resolution, dtype="float64")
+    crop = np.asarray(seg[tuple(slice(int(lo), int(hi)) for lo, hi in zip(bb_min, bb_max))])
+    mask = crop == label
+    coords = np.argwhere(mask)
+    n_voxels = int(coords.shape[0])
+    area = n_voxels * float(np.prod(res))
 
+    bbox_voxels = int(np.prod(bb_max - bb_min))
+    major, minor = _axis_lengths(coords, res, ndim)
+    extent = (n_voxels / bbox_voxels) if bbox_voxels > 0 else float("nan")
+    equivalent_diameter = (
+        (2 * ndim * area / np.pi) ** (1.0 / ndim) if area > 0 else 0.0
+    )
+    surface = _surface_area(mask, resolution) if compute_surface and ndim == 3 else None
+    centroid = _corrected_centroid(mask, com, bb_min.astype("float64"), resolution)
+    return (n_voxels, area, extent, equivalent_diameter, major, minor, centroid, surface)
+
+
+def _object_features(index: int, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute one feature row for the DataFrame execution path."""
+    seg = resolve_source(ctx["seg"])
+    axes, ndim = ctx["axes"], ctx["ndim"]
     label = int(ctx["label"][index])
     com = ctx["com"][index]
     bb_min = ctx["bb_min"][index]
     bb_max = ctx["bb_max"][index]
-
-    crop = np.asarray(seg[tuple(slice(int(lo), int(hi)) for lo, hi in zip(bb_min, bb_max))])
-    mask = crop == label
-    coords = np.argwhere(mask)  # crop-local voxel coordinates of the object.
-    n_voxels = int(coords.shape[0])
-    area = n_voxels * float(np.prod(res))  # physical volume under spacing (== skimage's 'area').
-
-    bbox_voxels = int(np.prod(bb_max - bb_min))
-    major, minor = _axis_lengths(coords, res, ndim)
+    values = _compute_object_features(
+        seg, label, com, bb_min, bb_max, ctx["resolution"], ndim,
+        ctx["compute_surface"],
+    )
+    n_voxels, area, extent, equivalent_diameter, major, minor, centroid, surface = values
     result: Dict[str, Any] = {
         "label": label,
         "n_voxels": n_voxels,
         "area": area,
-        "extent": (n_voxels / bbox_voxels) if bbox_voxels > 0 else float("nan"),
-        "equivalent_diameter_area": ((2 * ndim * area / np.pi) ** (1.0 / ndim)) if area > 0 else 0.0,
+        "extent": extent,
+        "equivalent_diameter_area": equivalent_diameter,
         "axis_major_length": major,
         "axis_minor_length": minor,
     }
-
-    if ctx["compute_surface"] and ndim == 3:
-        result["surface_area"] = _surface_area(mask, ctx["resolution"])
-
-    centroid = _corrected_centroid(mask, com, bb_min.astype("float64"), ctx["resolution"])
+    if surface is not None:
+        result["surface_area"] = surface
     for a, ax in enumerate(axes):
         result[f"centroid_{ax}"] = float(centroid[a])
     for a, ax in enumerate(axes):
@@ -204,6 +210,396 @@ def _order_columns(axes: Sequence[str], compute_surface: bool, ndim: int) -> Lis
     return cols
 
 
+def _output_schema(
+    axes: Sequence[str],
+    compute_surface: bool,
+    ndim: int,
+    include_exclusion_flag: bool = False,
+) -> pa.Schema:
+    fields = [
+        pa.field("label", pa.uint64(), nullable=False),
+        pa.field("n_voxels", pa.uint64(), nullable=False),
+        pa.field("area", pa.float64(), nullable=False),
+        pa.field("extent", pa.float64(), nullable=False),
+        pa.field("equivalent_diameter_area", pa.float64(), nullable=False),
+        pa.field("axis_major_length", pa.float64(), nullable=False),
+        pa.field("axis_minor_length", pa.float64(), nullable=False),
+    ]
+    fields.extend(pa.field(f"centroid_{axis}", pa.float64(), nullable=False)
+                  for axis in axes)
+    fields.extend(pa.field(f"bb_min_{axis}", pa.int64(), nullable=False)
+                  for axis in axes)
+    fields.extend(pa.field(f"bb_max_{axis}", pa.int64(), nullable=False)
+                  for axis in axes)
+    if compute_surface and ndim == 3:
+        fields.append(pa.field("surface_area", pa.float64(), nullable=False))
+    if include_exclusion_flag:
+        fields.append(pa.field("regionprops_excluded", pa.bool_(), nullable=False))
+    return pa.schema(fields)
+
+
+def _validate_file_table_schema(
+    schema: pa.Schema,
+    axes: Sequence[str],
+    *,
+    require_size: bool = False,
+) -> None:
+    missing = [
+        name for name in _required_columns(axes, include_size=require_size)
+        if name not in schema.names
+    ]
+    if missing:
+        raise ValueError(
+            f"table is missing required columns {missing}; pass the output of "
+            "bioimage_py.morphology.morphology."
+        )
+    integer_columns = ["label"]
+    if require_size:
+        integer_columns.append("size")
+    integer_columns.extend(f"bb_min_{axis}" for axis in axes)
+    integer_columns.extend(f"bb_max_{axis}" for axis in axes)
+    for name in integer_columns:
+        if not pa.types.is_integer(schema.field(name).type):
+            raise ValueError(f"table column {name!r} must have an integer type.")
+    for axis in axes:
+        name = f"com_{axis}"
+        column_type = schema.field(name).type
+        if not (pa.types.is_integer(column_type) or pa.types.is_floating(column_type)):
+            raise ValueError(f"table column {name!r} must have a numeric type.")
+
+
+def _batch_column(table: pa.Table, name: str, dtype: pa.DataType) -> np.ndarray:
+    column = table[name]
+    if column.null_count:
+        raise ValueError(f"table column {name!r} contains null values.")
+    try:
+        cast = column.cast(dtype, safe=True)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as error:
+        raise ValueError(f"table column {name!r} cannot be converted to {dtype}.") from error
+    return cast.to_numpy(zero_copy_only=False)
+
+
+def _bounding_box_costs(
+    table: pa.Table,
+    axes: Sequence[str],
+    shape: Sequence[int],
+    row_offset: int,
+) -> np.ndarray:
+    """Return checked bounding-box voxel counts for one bounded table chunk."""
+    bb_min = np.stack([
+        _batch_column(table, f"bb_min_{axis}", pa.int64()) for axis in axes
+    ], axis=1)
+    bb_max = np.stack([
+        _batch_column(table, f"bb_max_{axis}", pa.int64()) for axis in axes
+    ], axis=1)
+    shape_array = np.asarray(shape, dtype="int64")
+    invalid = ((bb_min < 0).any(axis=1) | (bb_max < bb_min).any(axis=1)
+               | (bb_max > shape_array).any(axis=1))
+    if invalid.any():
+        index = int(np.flatnonzero(invalid)[0]) + int(row_offset)
+        raise ValueError(f"table row {index} has a bounding box outside the segmentation.")
+
+    extents = (bb_max - bb_min).astype("uint64", copy=False)
+    costs = np.ones(table.num_rows, dtype="uint64")
+    for axis in range(len(axes)):
+        extent = extents[:, axis]
+        nonzero = extent != 0
+        if np.any(costs[nonzero] > np.uint64(_MAX_UINT64) // extent[nonzero]):
+            index = int(np.flatnonzero(
+                nonzero & (costs > np.uint64(_MAX_UINT64) // np.maximum(extent, 1))
+            )[0]) + int(row_offset)
+            raise ValueError(f"table row {index} has a bounding-box cost above uint64.")
+        costs *= extent
+    return costs
+
+
+def _extend_cost_boundaries(
+    boundaries: List[int],
+    completed_costs: List[int],
+    costs: np.ndarray,
+    row_offset: int,
+    target_cost: int,
+    max_rows: int,
+    batch_cost: int,
+) -> int:
+    """Greedily extend contiguous cost batches and return the open batch cost."""
+    position = 0
+    safe_take = max(1, _MAX_UINT64 // target_cost)
+    while position < len(costs):
+        global_position = row_offset + position
+        batch_rows = global_position - boundaries[-1]
+        if batch_rows == max_rows:
+            completed_costs.append(batch_cost)
+            boundaries.append(global_position)
+            batch_cost = 0
+            batch_rows = 0
+
+        cost = int(costs[position])
+        if cost > target_cost:
+            if batch_rows:
+                completed_costs.append(batch_cost)
+                boundaries.append(global_position)
+                batch_cost = 0
+            boundaries.append(global_position + 1)
+            completed_costs.append(cost)
+            position += 1
+            continue
+
+        capacity = target_cost - batch_cost
+        if cost > capacity:
+            completed_costs.append(batch_cost)
+            boundaries.append(global_position)
+            batch_cost = 0
+            continue
+
+        take = min(max_rows - batch_rows, len(costs) - position, safe_take)
+        cumulative = np.cumsum(costs[position:position + take], dtype="uint64")
+        accepted = int(np.searchsorted(cumulative, capacity, side="right"))
+        if accepted == 0:
+            raise RuntimeError("The cost batch planner did not make progress.")
+        batch_cost += int(cumulative[accepted - 1])
+        position += accepted
+        global_position += accepted
+        if accepted < take or global_position - boundaries[-1] == max_rows:
+            completed_costs.append(batch_cost)
+            boundaries.append(global_position)
+            batch_cost = 0
+    return batch_cost
+
+
+def _plan_regionprops_cost_batches(
+    descriptor: Any,
+    axes: Sequence[str],
+    shape: Sequence[int],
+    rows_per_batch: int,
+    target_batch_cost: int,
+    max_bbox_voxels: Optional[int] = None,
+) -> tuple[BoundaryBatchPlan, tuple[int, ...]]:
+    """Plan fine cost batches and retain one estimated cost per batch."""
+    columns = ([f"bb_min_{axis}" for axis in axes]
+               + [f"bb_max_{axis}" for axis in axes])
+    boundaries = [0]
+    completed_costs: List[int] = []
+    batch_cost = 0
+    start = 0
+    for record_batch in _iter_parquet_rows(
+        descriptor, 0, descriptor.row_count, columns, batch_size=_COST_SCAN_ROWS,
+    ):
+        table = pa.Table.from_batches([record_batch])
+        costs = _bounding_box_costs(table, axes, shape, start)
+        if max_bbox_voxels is not None:
+            costs = np.where(costs > np.uint64(max_bbox_voxels), 1, costs).astype(
+                "uint64", copy=False,
+            )
+        batch_cost = _extend_cost_boundaries(
+            boundaries, completed_costs, costs, start, target_batch_cost,
+            rows_per_batch, batch_cost,
+        )
+        start += table.num_rows
+    if start != descriptor.row_count:
+        raise ValueError(
+            f"Regionprops planning read {start} rows, expected {descriptor.row_count}."
+        )
+    if boundaries[-1] != descriptor.row_count:
+        boundaries.append(descriptor.row_count)
+        completed_costs.append(batch_cost)
+    plan = BoundaryBatchPlan(tuple(boundaries))
+    if len(completed_costs) != len(plan):
+        raise RuntimeError("Regionprops planning produced inconsistent batch costs.")
+    return plan, tuple(completed_costs)
+
+
+def _plan_regionprops_batches(
+    descriptor: Any,
+    axes: Sequence[str],
+    shape: Sequence[int],
+    rows_per_batch: int,
+    target_batch_cost: int,
+) -> BoundaryBatchPlan:
+    """Plan deterministic cost-bounded compute batches."""
+    return _plan_regionprops_cost_batches(
+        descriptor, axes, shape, rows_per_batch, target_batch_cost,
+    )[0]
+
+
+def _group_cost_batches(
+    plan: BoundaryBatchPlan,
+    costs: Sequence[int],
+    target_part_count: int,
+) -> BoundaryBatchPlan:
+    """Combine fine batches into cost-balanced contiguous durable parts."""
+    n_batches = len(plan)
+    n_parts = min(int(target_part_count), n_batches)
+    if n_parts == n_batches:
+        return plan
+    if n_parts == 0:
+        return BoundaryBatchPlan((0,))
+    if len(costs) != n_batches:
+        raise ValueError("Fine batch costs do not match the batch plan.")
+
+    cumulative = []
+    total = 0
+    for cost in costs:
+        total += int(cost)
+        cumulative.append(total)
+    selected = [0]
+    previous = 0
+    for part_index in range(1, n_parts):
+        if total:
+            target = (total * part_index + n_parts - 1) // n_parts
+            fine_index = bisect.bisect_left(cumulative, target) + 1
+        else:
+            fine_index = (n_batches * part_index) // n_parts
+        fine_index = max(previous + 1, fine_index)
+        fine_index = min(fine_index, n_batches - (n_parts - part_index))
+        selected.append(int(plan.boundaries[fine_index]))
+        previous = fine_index
+    selected.append(int(plan.boundaries[-1]))
+    return BoundaryBatchPlan(tuple(selected))
+
+
+def _regionprops_output_table(
+    table: pa.Table,
+    *,
+    ctx: Dict[str, Any],
+    row_offset: int,
+) -> pa.Table:
+    axes = ctx["axes"]
+    ndim = ctx["ndim"]
+
+    labels = _batch_column(table, "label", pa.uint64()).astype("uint64", copy=False)
+    com = np.stack([
+        _batch_column(table, f"com_{axis}", pa.float64()) for axis in axes
+    ], axis=1)
+    bb_min = np.stack([
+        _batch_column(table, f"bb_min_{axis}", pa.int64()) for axis in axes
+    ], axis=1)
+    bb_max = np.stack([
+        _batch_column(table, f"bb_max_{axis}", pa.int64()) for axis in axes
+    ], axis=1)
+    if not np.isfinite(com).all():
+        index = int(np.flatnonzero(~np.isfinite(com).all(axis=1))[0]) + row_offset
+        raise ValueError(f"table row {index} has a non-finite center of mass.")
+
+    seg = resolve_source(ctx["seg"])
+    costs = _bounding_box_costs(table, axes, seg.shape, row_offset)
+    threshold = ctx["max_bbox_voxels"]
+    excluded = (
+        np.zeros(table.num_rows, dtype=bool)
+        if threshold is None else costs > np.uint64(threshold)
+    )
+
+    row_count = int(table.num_rows)
+    n_voxels = np.empty(row_count, dtype="uint64")
+    area = np.empty(row_count, dtype="float64")
+    extent = np.empty(row_count, dtype="float64")
+    equivalent_diameter = np.empty(row_count, dtype="float64")
+    major = np.empty(row_count, dtype="float64")
+    minor = np.empty(row_count, dtype="float64")
+    centroid = np.empty((row_count, ndim), dtype="float64")
+    surface = (np.empty(row_count, dtype="float64")
+               if ctx["compute_surface"] and ndim == 3 else None)
+
+    for index in np.flatnonzero(~excluded):
+        values = _compute_object_features(
+            seg, int(labels[index]), com[index], bb_min[index], bb_max[index],
+            ctx["resolution"], ndim, ctx["compute_surface"],
+        )
+        (n_voxels[index], area[index], extent[index], equivalent_diameter[index],
+         major[index], minor[index], centroid[index], surface_value) = values
+        if surface is not None:
+            surface[index] = surface_value
+
+    if np.any(excluded):
+        sizes = _batch_column(table, "size", pa.uint64()).astype("uint64", copy=False)
+        n_voxels[excluded] = sizes[excluded]
+        area[excluded] = (
+            sizes[excluded].astype("float64") * float(np.prod(ctx["resolution"]))
+        )
+        extent[excluded] = np.divide(
+            sizes[excluded],
+            costs[excluded],
+            out=np.full(int(excluded.sum()), np.nan, dtype="float64"),
+            where=costs[excluded] > 0,
+        )
+        equivalent_diameter[excluded] = np.where(
+            area[excluded] > 0,
+            (2 * ndim * area[excluded] / np.pi) ** (1.0 / ndim),
+            0.0,
+        )
+        major[excluded] = np.nan
+        minor[excluded] = np.nan
+        centroid[excluded] = np.nan
+        if surface is not None:
+            surface[excluded] = np.nan
+
+    columns: Dict[str, Any] = {
+        "label": labels,
+        "n_voxels": n_voxels,
+        "area": area,
+        "extent": extent,
+        "equivalent_diameter_area": equivalent_diameter,
+        "axis_major_length": major,
+        "axis_minor_length": minor,
+    }
+    columns.update({f"centroid_{axis}": centroid[:, index]
+                    for index, axis in enumerate(axes)})
+    columns.update({f"bb_min_{axis}": bb_min[:, index]
+                    for index, axis in enumerate(axes)})
+    columns.update({f"bb_max_{axis}": bb_max[:, index]
+                    for index, axis in enumerate(axes)})
+    if surface is not None:
+        columns["surface_area"] = surface
+    if ctx["include_exclusion_flag"]:
+        columns["regionprops_excluded"] = excluded
+    return pa.table(columns, schema=_output_schema(
+        axes, ctx["compute_surface"], ndim, ctx["include_exclusion_flag"],
+    ))
+
+
+def _regionprops_batch(batch: Any, writer: Any, *, ctx: Dict[str, Any]) -> None:
+    axes = ctx["axes"]
+    required = _required_columns(
+        axes, include_size=ctx["max_bbox_voxels"] is not None,
+    )
+    row_offset = int(batch.start)
+    for record_batch in _iter_parquet_rows(
+        ctx["table"], batch.start, batch.stop, required,
+        batch_size=ctx["rows_per_batch"],
+    ):
+        table = pa.Table.from_batches([record_batch])
+        chunk_boundaries = (0, table.num_rows)
+        if ctx["target_batch_cost"] is not None:
+            costs = _bounding_box_costs(table, axes, ctx["shape"], row_offset)
+            threshold = ctx["max_bbox_voxels"]
+            if threshold is not None:
+                costs = np.where(costs > np.uint64(threshold), 1, costs).astype(
+                    "uint64", copy=False,
+                )
+            boundaries = [0]
+            completed_costs: List[int] = []
+            open_cost = _extend_cost_boundaries(
+                boundaries, completed_costs, costs, 0,
+                ctx["target_batch_cost"], ctx["rows_per_batch"], 0,
+            )
+            if boundaries[-1] != table.num_rows:
+                boundaries.append(table.num_rows)
+                completed_costs.append(open_cost)
+            chunk_boundaries = tuple(boundaries)
+        for start, stop in zip(chunk_boundaries[:-1], chunk_boundaries[1:]):
+            writer.append(_regionprops_output_table(
+                table.slice(start, stop - start),
+                ctx=ctx,
+                row_offset=row_offset + start,
+            ))
+        row_offset += table.num_rows
+    if row_offset != batch.stop:
+        raise ValueError(
+            f"Batch {batch.batch_id} read {row_offset - batch.start} rows, "
+            f"expected {batch.size}."
+        )
+
+
 def _write_table(out: "pd.DataFrame", output_path: str) -> None:
     """Write the result table to a ``.csv`` / ``.xlsx`` path (creating parent dirs)."""
     parent = os.path.dirname(os.path.abspath(str(output_path)))
@@ -218,71 +614,306 @@ def _write_table(out: "pd.DataFrame", output_path: str) -> None:
         raise ValueError(f"Unsupported output format: {output_path!r} (use .csv or .xlsx/.xls).")
 
 
+def _dataframe_regionprops(
+    src: Source,
+    table: Union[str, "pd.DataFrame"],
+    *,
+    resolution: Sequence[float],
+    compute_surface: bool,
+    output_path: Optional[str],
+    num_workers: int,
+    job_type: str,
+    job_config: Optional[RunnerConfig],
+    item_ids: Optional[Sequence[int]],
+    resume_from: Optional[str],
+    pre_cleanup: Optional[Callable[[str], None]],
+) -> "pd.DataFrame":
+    ndim = src.ndim
+    axes = _axis_names(ndim)
+    df = _load_table(table)
+    missing = [column for column in _required_columns(axes) if column not in df.columns]
+    if missing:
+        raise ValueError(
+            f"table is missing required columns {missing}; pass the output of "
+            "bioimage_py.morphology.morphology (label / com_* / bb_min_* / bb_max_*)."
+        )
+
+    n_items = len(df)
+    if n_items == 0:
+        columns = _order_columns(axes, compute_surface, ndim)
+        return pd.DataFrame({column: pd.Series(dtype="float64") for column in columns})
+
+    seg_arg: Any = src
+    if job_type != "local":
+        try:
+            seg_arg = src.to_spec()
+        except ValueError as error:
+            raise ValueError(
+                f"Distributed regionprops requires a file-backed segmentation. {error}"
+            ) from error
+
+    ctx = {
+        "seg": seg_arg,
+        "resolution": resolution,
+        "axes": tuple(axes),
+        "ndim": ndim,
+        "compute_surface": bool(compute_surface),
+        **_column_arrays(df, axes),
+    }
+    runner = get_runner(job_type, job_config)
+    results = runner.map(
+        functools.partial(_object_features, ctx=ctx),
+        n_items,
+        item_ids=item_ids,
+        resume_from=resume_from,
+        num_workers=num_workers,
+        has_return_val=True,
+        name="regionprops",
+        pre_cleanup=pre_cleanup,
+    )
+    out = pd.DataFrame(results)
+    out = out[_order_columns(axes, compute_surface, ndim)].sort_values("label")
+    out = out.reset_index(drop=True)
+    if output_path is not None:
+        _write_table(out, output_path)
+    return out
+
+
+def _file_backed_regionprops(
+    src: Source,
+    table: Any,
+    *,
+    resolution: Sequence[float],
+    compute_surface: bool,
+    output_table: Union[str, os.PathLike[str]],
+    rows_per_batch: int,
+    target_batch_cost: Optional[int],
+    target_part_count: Optional[int],
+    max_bbox_voxels: Optional[int],
+    include_exclusion_flag: bool,
+    provenance: Optional[Mapping[str, Any]],
+    num_workers: int,
+    job_type: str,
+    job_config: Optional[RunnerConfig],
+    resume_from: Optional[str],
+    pre_cleanup: Optional[Callable[[str], None]],
+) -> TableDataset:
+    if isinstance(rows_per_batch, bool) or not isinstance(rows_per_batch, numbers.Integral):
+        raise TypeError("rows_per_batch must be an integer.")
+    rows_per_batch = int(rows_per_batch)
+    if rows_per_batch <= 0:
+        raise ValueError("rows_per_batch must be positive.")
+    if target_batch_cost is not None:
+        if (isinstance(target_batch_cost, bool)
+                or not isinstance(target_batch_cost, numbers.Integral)):
+            raise TypeError("target_batch_cost must be an integer or None.")
+        target_batch_cost = int(target_batch_cost)
+        if target_batch_cost <= 0:
+            raise ValueError("target_batch_cost must be positive.")
+        if target_batch_cost > _MAX_UINT64:
+            raise ValueError("target_batch_cost must fit in uint64.")
+    if target_part_count is not None:
+        if (isinstance(target_part_count, bool)
+                or not isinstance(target_part_count, numbers.Integral)):
+            raise TypeError("target_part_count must be an integer or None.")
+        target_part_count = int(target_part_count)
+        if target_part_count <= 0:
+            raise ValueError("target_part_count must be positive.")
+    if max_bbox_voxels is not None:
+        if (isinstance(max_bbox_voxels, bool)
+                or not isinstance(max_bbox_voxels, numbers.Integral)):
+            raise TypeError("max_bbox_voxels must be an integer or None.")
+        max_bbox_voxels = int(max_bbox_voxels)
+        if max_bbox_voxels <= 0:
+            raise ValueError("max_bbox_voxels must be positive.")
+        if max_bbox_voxels > _MAX_UINT64:
+            raise ValueError("max_bbox_voxels must fit in uint64.")
+    if not isinstance(include_exclusion_flag, bool):
+        raise TypeError("include_exclusion_flag must be a boolean.")
+    if provenance is not None and not isinstance(provenance, Mapping):
+        raise TypeError("provenance must be a mapping or None.")
+
+    runner = get_runner(job_type, job_config)
+    try:
+        seg_spec = src.to_spec()
+    except ValueError as error:
+        raise ValueError(
+            f"File-backed regionprops requires a reopenable segmentation. {error}"
+        ) from error
+
+    axes = tuple(_axis_names(src.ndim))
+    required_columns = _required_columns(
+        axes, include_size=max_bbox_voxels is not None,
+    )
+    table_descriptor, table_schema, table_identity, table_parts = _describe_parquet_input(
+        table, required_columns,
+    )
+    _validate_file_table_schema(
+        table_schema, axes, require_size=max_bbox_voxels is not None,
+    )
+    output_path = os.path.abspath(os.fspath(output_table))
+    if overlapping_paths(output_path, table_descriptor.path):
+        raise ValueError("output_table must not contain or overwrite the input table.")
+
+    stored_sink = None
+    if resume_from is not None:
+        manifest = load_manifest(resume_from, expected_backend=job_type.lower())
+        stored_sink = manifest.get("result_sink")
+        if not isinstance(stored_sink, dict):
+            raise ValueError("The resumed run has no table result sink.")
+        if os.path.abspath(str(stored_sink.get("path", ""))) != output_path:
+            raise ValueError("output_table does not match the resumed run result sink.")
+
+    output_schema = _output_schema(
+        axes, compute_surface, src.ndim, include_exclusion_flag,
+    )
+    parameters = {
+        "resolution": [float(value) for value in resolution],
+        "compute_surface": bool(compute_surface),
+        "axes": list(axes),
+        "rows_per_batch": rows_per_batch,
+        "target_part_count": target_part_count,
+        "max_bbox_voxels": max_bbox_voxels,
+        "include_exclusion_flag": include_exclusion_flag,
+        "provenance": dict(provenance or {}),
+    }
+    if target_batch_cost is not None:
+        parameters.update({
+            "target_batch_cost": target_batch_cost,
+            "batch_cost_model": _BATCH_COST_MODEL,
+        })
+    dataset = TableDataset.create(
+        output_path,
+        schema=output_schema,
+        schema_version=4,
+        operation="regionprops",
+        operation_version="4",
+        input_identities={
+            "segmentation": source_identity(seg_spec, src),
+            "base_table": table_identity,
+        },
+        parameters=parameters,
+    )
+    table_descriptor = _persist_parquet_input_layout(
+        table_descriptor, table_schema, table_parts, dataset.path,
+    )
+    if dataset._dataset_record().get("work_plan") is None:
+        batches: BatchPlan
+        if target_batch_cost is None:
+            fine = RegularBatchPlan(table_descriptor.row_count, rows_per_batch)
+            if target_part_count is None or len(fine) <= target_part_count:
+                batches = fine
+            elif table_descriptor.row_count == 0:
+                batches = RegularBatchPlan(0, rows_per_batch)
+            else:
+                part_rows = max(
+                    1, math.ceil(table_descriptor.row_count / target_part_count),
+                )
+                batches = RegularBatchPlan(table_descriptor.row_count, part_rows)
+        else:
+            fine, costs = _plan_regionprops_cost_batches(
+                table_descriptor, axes, src.shape, rows_per_batch, target_batch_cost,
+                max_bbox_voxels,
+            )
+            batches = (
+                fine if target_part_count is None
+                else _group_cost_batches(fine, costs, target_part_count)
+            )
+        dataset._bind_batches(batches)
+    else:
+        batches = dataset._batch_plan()
+    if stored_sink is not None and stored_sink != dataset._descriptor():
+        raise ValueError("The resumed run uses an incompatible table result sink.")
+
+    ctx = {
+        "seg": seg_spec,
+        "table": table_descriptor,
+        "resolution": tuple(float(value) for value in resolution),
+        "axes": axes,
+        "ndim": src.ndim,
+        "compute_surface": bool(compute_surface),
+        "shape": tuple(int(value) for value in src.shape),
+        "rows_per_batch": rows_per_batch,
+        "target_batch_cost": target_batch_cost,
+        "max_bbox_voxels": max_bbox_voxels,
+        "include_exclusion_flag": include_exclusion_flag,
+    }
+    batch_arguments: Dict[str, Any]
+    if isinstance(batches, RegularBatchPlan):
+        batch_arguments = {
+            "n_items": batches.n_items,
+            "batch_size": batches.batch_size,
+        }
+    else:
+        batch_arguments = {"batch_boundaries": batches.boundaries}
+    return runner.map_batches(
+        functools.partial(_regionprops_batch, ctx=ctx),
+        num_workers=num_workers,
+        name="regionprops",
+        pre_cleanup=pre_cleanup,
+        resume_from=resume_from,
+        result_sink=dataset,
+        **batch_arguments,
+    )
+
+
 def regionprops(
     input: SourceLike,
-    table: Union[str, "pd.DataFrame"],
+    table: Union[str, os.PathLike[str], "pd.DataFrame", TableDataset],
     *,
     resolution: Optional[Sequence[float]] = None,
     compute_surface: bool = False,
     output_path: Optional[str] = None,
+    output_table: Optional[Union[str, os.PathLike[str]]] = None,
+    rows_per_batch: int = 100_000,
+    target_batch_cost: Optional[int] = None,
+    target_part_count: Optional[int] = None,
+    max_bbox_voxels: Optional[int] = None,
+    include_exclusion_flag: bool = False,
+    provenance: Optional[Mapping[str, Any]] = None,
     num_workers: int = 1,
     job_type: str = "local",
     job_config: Optional[RunnerConfig] = None,
     item_ids: Optional[Sequence[int]] = None,
     resume_from: Optional[str] = None,
     pre_cleanup: Optional[Callable[[str], None]] = None,
-) -> "pd.DataFrame":
-    """Compute per-object morphology features for a labeled volume, one task per object.
+) -> Union["pd.DataFrame", TableDataset]:
+    """Compute per-object features for a labeled image.
 
-    For each object listed in ``table`` (the output of :func:`morphology`), the sub-volume is cropped by
-    its bounding box, masked to the label, and described with numpy in physical units (via
-    ``resolution``): the physical volume ``area``, the ``extent`` (filled fraction of the bounding box),
-    the ``equivalent_diameter_area`` (diameter of the ball with the same volume) and the major/minor
-    ``axis_*_length`` (from the object's second moments). These reproduce the corresponding
-    scikit-image ``regionprops`` definitions exactly. Optionally a marching-cubes ``surface_area`` (3D
-    only) and a corrected centroid (the center-of-mass when it lies inside the object, otherwise the
-    deepest-interior voxel — the argmax of the Euclidean distance transform) are added.
+    Set ``output_table`` to use bounded Parquet batches. Without ``output_table``, the function
+    returns the existing label-sorted DataFrame.
 
     Args:
-        input: The labeled segmentation (a numpy/zarr/n5 array or a `Source`); integer-typed. For the
-            ``subprocess``/``slurm`` backends it must be file-backed (zarr/n5).
-        table: The base morphology table — a pandas DataFrame or a path to a ``.csv`` / ``.xlsx`` file.
-            Must contain ``label``, ``com_<axis>``, ``bb_min_<axis>`` and ``bb_max_<axis>`` (``bb_max``
-            is the exclusive slice stop, as produced by :func:`morphology`).
-        resolution: Per-axis physical voxel size in array (e.g. z, y, x) order. Defaults to ones (voxel
-            units).
-        compute_surface: Whether to add a marching-cubes ``surface_area`` (3D inputs only). This is the
-            most expensive per-object step, so it is off by default.
-        output_path: Optional ``.csv`` / ``.xlsx`` path to also write the result to.
-        num_workers: Number of parallel workers (threads for ``local``, tasks for distributed backends).
-        job_type: Execution backend: one of ``"local"``, ``"subprocess"`` or ``"slurm"``.
-        job_config: Backend configuration (a `RunnerConfig` / `SlurmConfig`).
-        item_ids: Restrict processing to these item indices (rows of ``table``), e.g. to re-run
-            previously failed objects; the result then covers only those rows. An item id indexes a
-            *row* of ``table``, so the same table (same row order) must be passed as in the original
-            run. Mutually exclusive with ``resume_from``.
-        resume_from: Distributed only; the preserved temp folder of a failed run to resume and merge
-            (see ``runner.run``). The result then covers all objects (the already-completed merged
-            with the re-run ones). The recommended rerun path for regionprops. Mutually exclusive
-            with ``item_ids``.
-        pre_cleanup: Optional ``pre_cleanup(tmp_folder)`` callback invoked on the orchestrating
-            process with the job temp folder right before it is deleted (distributed backends only).
-            Use it to read out the per-task timing files under ``tmp_folder/timings/`` before cleanup.
-            Ignored for the ``local`` backend (no temp folder).
+        input: Integer label image. File-backed output requires a reopenable source.
+        table: Base morphology table. The DataFrame path accepts DataFrames, CSV, and XLSX.
+            The file-backed path accepts `TableDataset` handles and Parquet paths.
+        resolution: Physical voxel size in array-axis order. The default is one for each axis.
+        compute_surface: Add 3D marching-cubes surface area.
+        output_path: Write the DataFrame result to CSV or XLSX.
+        output_table: Write a partitioned Parquet dataset to this directory.
+        rows_per_batch: Maximum input rows in each file-backed batch.
+        target_batch_cost: Optional target bounding-box voxel count per file-backed batch.
+            Objects above the target form one-row batches. The row limit still applies.
+        target_part_count: Combine compute batches into at most this many durable parts.
+        max_bbox_voxels: Skip segmentation reads above this bounding-box size and write
+            fallback values from the base table.
+        include_exclusion_flag: Add ``regionprops_excluded`` to the file-backed output.
+        provenance: Optional canonical-JSON metadata included in the output dataset identity.
+        num_workers: Local threads or distributed worker concurrency.
+        job_type: Execution backend.
+        job_config: Runner configuration.
+        item_ids: DataFrame-path row indices to process. Do not use with ``output_table``.
+        resume_from: Preserved distributed run folder.
+        pre_cleanup: Callback that runs before distributed temporary-folder cleanup.
 
     Returns:
-        A pandas DataFrame with one row per object, sorted by ``label``: ``label``, ``n_voxels`` (raw
-        voxel count), ``area`` (physical volume), ``extent``, ``equivalent_diameter_area``,
-        ``axis_major_length``, ``axis_minor_length``, ``centroid_<axis>`` (corrected, physical),
-        ``bb_min_<axis>``/``bb_max_<axis>`` (global voxels), and ``surface_area`` (only when
-        ``compute_surface`` and the input is 3D).
+        A DataFrame, or a `TableDataset` when ``output_table`` is set.
     """
     check_rerun_args(job_type, resume_from, item_ids, subset_name="item_ids")
     src = as_source(input)
     if not np.issubdtype(np.dtype(src.dtype), np.integer):
         raise ValueError(f"regionprops expects an integer label image, got dtype {src.dtype}.")
     ndim = src.ndim
-    axes = _axis_names(ndim)
 
     if resolution is None:
         resolution = tuple(1.0 for _ in range(ndim))
@@ -290,44 +921,51 @@ def regionprops(
         resolution = tuple(float(r) for r in resolution)
         if len(resolution) != ndim:
             raise ValueError(f"resolution {resolution} does not match the input ndim {ndim}.")
-
-    df = _load_table(table)
-    missing = [c for c in _required_columns(axes) if c not in df.columns]
-    if missing:
-        raise ValueError(
-            f"table is missing required columns {missing}; pass the output of "
-            "bioimage_py.morphology.morphology (label / com_* / bb_min_* / bb_max_*)."
+    if output_table is not None:
+        if output_path is not None:
+            raise ValueError("output_path and output_table are mutually exclusive.")
+        if item_ids is not None:
+            raise ValueError("item_ids is not supported with output_table.")
+        return _file_backed_regionprops(
+            src,
+            table,
+            resolution=resolution,
+            compute_surface=compute_surface,
+            output_table=output_table,
+            rows_per_batch=rows_per_batch,
+            target_batch_cost=target_batch_cost,
+            target_part_count=target_part_count,
+            max_bbox_voxels=max_bbox_voxels,
+            include_exclusion_flag=include_exclusion_flag,
+            provenance=provenance,
+            num_workers=num_workers,
+            job_type=job_type,
+            job_config=job_config,
+            resume_from=resume_from,
+            pre_cleanup=pre_cleanup,
         )
-
-    n = len(df)
-    if n == 0:
-        cols = _order_columns(axes, compute_surface, ndim)
-        return pd.DataFrame({c: pd.Series(dtype="float64") for c in cols})
-
-    seg_arg: Any = src
-    if job_type != "local":
-        try:
-            seg_arg = src.to_spec()
-        except ValueError as err:
-            raise ValueError(
-                f"Distributed regionprops requires a file-backed (zarr/n5) segmentation. {err}"
-            ) from err
-
-    # The consumed columns travel with the closure as numpy arrays (built once): for distributed
-    # backends they are cloudpickled into the single shared payload the workers read.
-    ctx = {
-        "seg": seg_arg, "resolution": resolution, "axes": tuple(axes), "ndim": ndim,
-        "compute_surface": bool(compute_surface), **_column_arrays(df, axes),
-    }
-    runner = get_runner(job_type, job_config)
-    results = runner.map(functools.partial(_object_features, ctx=ctx), n,
-                         item_ids=item_ids, resume_from=resume_from,
-                         num_workers=num_workers, has_return_val=True, name="regionprops",
-                         pre_cleanup=pre_cleanup)
-
-    out = pd.DataFrame(results)
-    out = out[_order_columns(axes, compute_surface, ndim)].sort_values("label")
-    out = out.reset_index(drop=True)
-    if output_path is not None:
-        _write_table(out, output_path)
-    return out
+    if isinstance(table, TableDataset):
+        raise ValueError("A TableDataset input requires output_table.")
+    if target_batch_cost is not None:
+        raise ValueError("target_batch_cost requires output_table.")
+    if target_part_count is not None:
+        raise ValueError("target_part_count requires output_table.")
+    if max_bbox_voxels is not None:
+        raise ValueError("max_bbox_voxels requires output_table.")
+    if include_exclusion_flag:
+        raise ValueError("include_exclusion_flag requires output_table.")
+    if provenance is not None:
+        raise ValueError("provenance requires output_table.")
+    return _dataframe_regionprops(
+        src,
+        table,
+        resolution=resolution,
+        compute_surface=compute_surface,
+        output_path=output_path,
+        num_workers=num_workers,
+        job_type=job_type,
+        job_config=job_config,
+        item_ids=item_ids,
+        resume_from=resume_from,
+        pre_cleanup=pre_cleanup,
+    )

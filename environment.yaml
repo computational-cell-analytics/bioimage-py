@@ -9,6 +9,7 @@ dependencies:
   - bioimage-cpp
   - numpy
   - pandas
+  - pyarrow
   - scikit-image >=0.20
   - cloudpickle
   - tqdm
