@@ -21,7 +21,7 @@ dependencies:
   - imageio
   - tifffile
   - nibabel
-  - tensorstore
+  - tensorstore  # [not win]
   # test
   - pytest
   - scipy
