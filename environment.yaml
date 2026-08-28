@@ -21,7 +21,7 @@ dependencies:
   - imageio
   - tifffile
   - nibabel
-  - tensorstore
+  # tensorstore has no win-64 conda-forge build; installed separately on non-Windows in CI
   # test
   - pytest
   - scipy

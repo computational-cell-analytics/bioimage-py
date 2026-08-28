@@ -35,6 +35,11 @@ jobs:
           create-args: >-
             python=${{ matrix.python-version }}
 
+      - name: Install tensorstore
+        if: matrix.os != 'windows-latest'
+        shell: bash -el {0}
+        run: micromamba install -n bioimage-py-dev -y -c conda-forge tensorstore
+
       - name: Install package
         shell: bash -el {0}
         run: pip install -e .

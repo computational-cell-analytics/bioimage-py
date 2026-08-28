@@ -40,9 +40,11 @@ jobs:
 
       # cloud-volume is only reliably installable on Linux; install it there so the CloudVolume
       # tests run on the Ubuntu job (they skip elsewhere via importorskip).
+      # osteoid>=0.7 has a circular import at module load (its `skeleton.py` does
+      # `from . import formats` before `osteoid/__init__.py` finishes); pin below that.
       - name: Install cloud-volume (Linux only)
         if: matrix.os == 'ubuntu-latest'
-        run: pip install cloud-volume
+        run: pip install cloud-volume "osteoid<0.7"
 
       - name: Run tests
         run: python -m pytest -q

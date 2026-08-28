@@ -1,5 +1,11 @@
 # bioimage-py
 
+[![Documentation](https://img.shields.io/badge/docs-pdoc-blue)](https://computational-cell-analytics.github.io/bioimage-py/)
+[![build (pip)](https://github.com/computational-cell-analytics/bioimage-py/actions/workflows/build_pip.yml/badge.svg)](https://github.com/computational-cell-analytics/bioimage-py/actions/workflows/build_pip.yml)
+[![build (conda)](https://github.com/computational-cell-analytics/bioimage-py/actions/workflows/build_conda.yml/badge.svg)](https://github.com/computational-cell-analytics/bioimage-py/actions/workflows/build_conda.yml)
+[![PyPI](https://img.shields.io/pypi/v/bioimage-py)](https://pypi.org/project/bioimage-py/)
+[![conda-forge](https://img.shields.io/conda/vn/conda-forge/bioimage-py)](https://anaconda.org/conda-forge/bioimage-py)
+
 Efficient, parallel, and distributed implementation of image analysis and segmentation functionality for biomedical imaging.
 
 **Note:** this package is in an early state and mainly provides support for data conversion, downsampling, and some initial segmentation functionality (connected components and watershed).
