@@ -2,7 +2,7 @@
 
 The multicut problem partitions the nodes of an (edge-weighted) graph by deciding, for every edge,
 whether it is "cut" (its endpoints land in different partitions) or kept, minimizing the total cost of
-cut edges. Positive edge costs attract their endpoints (likely same partition elelemt), negative costs repel them.
+cut edges. Positive edge costs attract their endpoints (likely the same partition element), negative costs repel them.
 """
 from __future__ import annotations
 
@@ -50,14 +50,16 @@ def transform_probabilities_to_costs(
     edge_populations: Optional[List[np.ndarray]] = None,
     weighting_exponent: float = 1.0,
 ) -> np.ndarray:
-    """Transform merge probabilities to multicut costs via the negative log-likelihood.
+    """Transform boundary probabilities to multicut costs via the log-odds.
 
-    Probabilities near ``1`` map to large positive costs (attractive, likely same segment) and
-    probabilities near ``0`` to large negative costs (repulsive). The boundary bias ``beta``
-    shifts the decision threshold.
+    ``probs`` are the probabilities that an edge is a boundary (should be cut): probabilities near
+    ``0`` map to large positive costs (attractive, likely the same segment) and probabilities near
+    ``1`` to large negative costs (repulsive). The boundary bias ``beta`` shifts the decision
+    threshold: the cost is positive iff the merge probability ``1 - probs`` exceeds ``beta``. The
+    probabilities are clipped to ``[0.001, 0.999]``, which caps the absolute cost at ~6.9.
 
     Args:
-        probs: The input edge probabilities, in ``[0, 1]``.
+        probs: The boundary probabilities of the edges, in ``[0, 1]``.
         beta: The boundary bias term; ``> 0.5`` biases towards over-segmentation (more cuts),
             ``< 0.5`` towards under-segmentation. Must be in the exclusive range ``(0, 1)``.
         edge_sizes: The sizes of the edges, used for weighting if given.
@@ -91,10 +93,11 @@ def compute_edge_costs(
     weighting_scheme: Optional[str] = None,
     weighting_exponent: float = 1.0,
 ) -> np.ndarray:
-    """Compute multicut edge costs from probabilities with a pre-defined weighting scheme.
+    """Compute multicut edge costs from boundary probabilities with a pre-defined weighting scheme.
 
     Args:
-        probs: The input edge probabilities, in ``[0, 1]``.
+        probs: The boundary probabilities of the edges, in ``[0, 1]`` (see
+            `transform_probabilities_to_costs`).
         edge_sizes: The sizes of the edges; required for all weighting schemes except ``None`` /
             ``"none"``.
         z_edge_mask: A boolean mask of inter-slice edges; required for the ``"xyz"`` and ``"z"``
@@ -223,14 +226,16 @@ def multicut_decomposition(
     """Solve the multicut problem with the decomposition solver.
 
     The graph is split into its connected components after removing strongly repulsive edges, each
-    component is solved independently (in parallel) with ``internal_solver``, and the solutions are
-    combined. Introduced in "Break and Conquer: Efficient Correlation Clustering for Image
-    Segmentation" (https://link.springer.com/chapter/10.1007/978-3-642-39140-8_9).
+    component is solved independently with ``internal_solver``, and the solutions are combined.
+    (Whether the components are solved in parallel depends on the installed ``bioimage_cpp``; its
+    ``MulticutDecomposer`` ignored ``n_threads`` up to version 0.6.) Introduced in "Break and Conquer:
+    Efficient Correlation Clustering for Image Segmentation"
+    (https://link.springer.com/chapter/10.1007/978-3-642-39140-8_9).
 
     Args:
         graph: The graph (or region adjacency graph) of the multicut problem.
         costs: The edge costs of the multicut problem.
-        n_threads: The number of threads used to solve sub-problems in parallel.
+        n_threads: The number of threads requested for solving the sub-problems.
         internal_solver: The name of the solver used for the sub-problems; one of
             ``"kernighan-lin"``, ``"greedy-additive"`` or ``"greedy-fixation"``.
 

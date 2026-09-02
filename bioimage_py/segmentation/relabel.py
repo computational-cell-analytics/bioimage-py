@@ -31,8 +31,8 @@ from ..runner import get_runner
 from ..runner.config import RunnerConfig
 from ..sources import Source, SourceLike, SourceSpec, as_source, from_spec
 from ..stats.unique import unique
-from ..util import (BlockDescriptor, ComputeFn, check_rerun_args, full_roi, is_direct, take_mapping,
-                    to_roi)
+from ..util import (BlockDescriptor, ComputeFn, check_rerun_args, full_roi, is_direct, is_inmemory_numpy,
+                    take_mapping, to_roi)
 
 __all__ = ["relabel", "relabel_consecutive"]
 
@@ -41,11 +41,6 @@ def _require_integer(source: Source, message: str) -> None:
     """Raise ``ValueError`` unless ``source`` has an integer dtype."""
     if not np.issubdtype(np.dtype(source.dtype), np.integer):
         raise ValueError(f"{message}, got dtype {source.dtype}.")
-
-
-def _is_inmemory_numpy(source: Source) -> bool:
-    """Return whether ``source`` wraps a plain in-memory numpy array (local-only, not reopenable)."""
-    return isinstance(getattr(source, "array", None), np.ndarray)
 
 
 def _make_relabel_block(mapping: Dict[int, int]) -> ComputeFn:
@@ -207,7 +202,7 @@ def relabel(
     # it), and silently mutating a passed-in array is surprising -- so allocate a fresh copy instead.
     if output is not None:
         out_array: SourceLike = output
-    elif job_type == "local" and _is_inmemory_numpy(src):
+    elif job_type == "local" and is_inmemory_numpy(src):
         out_array = np.array(src.array)
     else:
         out_array = input
