@@ -4,7 +4,8 @@ from .multicut import (compute_edge_costs, multicut_decomposition, multicut_gaec
                        multicut_kernighan_lin, transform_probabilities_to_costs)
 from .relabel import relabel, relabel_consecutive
 from .size_filter import segmentation_filter, size_filter
-from .stitching import stitch_segmentation, stitch_tiled_segmentation
+from .stitching import (block_store_shape, stitch_block_segmentations, stitch_segmentation,
+                        stitch_tiled_segmentation)
 from .watershed import watershed
 
 __all__ = [
@@ -15,7 +16,9 @@ __all__ = [
     "segmentation_filter",
     "size_filter",
     "stitch_segmentation",
+    "stitch_block_segmentations",
     "stitch_tiled_segmentation",
+    "block_store_shape",
     "compute_edge_costs",
     "transform_probabilities_to_costs",
     "multicut_decomposition",
