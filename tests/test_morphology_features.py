@@ -125,6 +125,16 @@ def test_output_path_written(tmp_path, rng):
     assert list(pd.read_csv(out)["label"]) == list(df["label"])
 
 
+def test_regionprops_verbose(rng, capsys):
+    seg = _blobs((16, 20, 22), rng)
+    table = bp.morphology.morphology(seg)
+    quiet = bp.morphology.regionprops(seg, table, verbose=False)
+    assert "regionprops" not in capsys.readouterr().err
+    loud = bp.morphology.regionprops(seg, table)
+    assert "regionprops" in capsys.readouterr().err
+    pd.testing.assert_frame_equal(quiet, loud)
+
+
 def test_regionprops_empty():
     seg = np.zeros((6, 8, 10), dtype="uint64")
     table = bp.morphology.morphology(seg)
