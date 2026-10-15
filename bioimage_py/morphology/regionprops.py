@@ -231,6 +231,7 @@ def regionprops(
     item_ids: Optional[Sequence[int]] = None,
     resume_from: Optional[str] = None,
     pre_cleanup: Optional[Callable[[str], None]] = None,
+    verbose: bool = True,
 ) -> "pd.DataFrame":
     """Compute per-object morphology features for a labeled volume, one task per object.
 
@@ -269,6 +270,8 @@ def regionprops(
             process with the job temp folder right before it is deleted (distributed backends only).
             Use it to read out the per-task timing files under ``tmp_folder/timings/`` before cleanup.
             Ignored for the ``local`` backend (no temp folder).
+        verbose: Whether to show a progress bar for the ``local`` backend. The distributed backends
+            always report their progress, since the name also labels their jobs.
 
     Returns:
         A pandas DataFrame with one row per object, sorted by ``label``: ``label``, ``n_voxels`` (raw
@@ -320,9 +323,11 @@ def regionprops(
         "compute_surface": bool(compute_surface), **_column_arrays(df, axes),
     }
     runner = get_runner(job_type, job_config)
+    # The local runner only shows a progress bar for a non-empty name.
+    name = "regionprops" if verbose or job_type != "local" else ""
     results = runner.map(functools.partial(_object_features, ctx=ctx), n,
                          item_ids=item_ids, resume_from=resume_from,
-                         num_workers=num_workers, has_return_val=True, name="regionprops",
+                         num_workers=num_workers, has_return_val=True, name=name,
                          pre_cleanup=pre_cleanup)
 
     out = pd.DataFrame(results)
