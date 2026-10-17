@@ -29,7 +29,7 @@ import numpy as np
 
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
-from ..sources import Source, SourceLike, as_source, from_spec
+from ..sources import Source, SourceLike, as_source, capture_source, resolve_source
 from ..util import BlockDescriptor, ComputeFn, full_roi, get_blocking, to_roi
 from .multicut import compute_edge_costs, multicut_decomposition
 from .relabel import relabel
@@ -140,7 +140,7 @@ def _make_seg_overlap(shape: Tuple[int, ...], tile_shape: Tuple[int, ...],
 
     def _compute(block: BlockDescriptor, inputs: Sequence[Source], outputs: Sequence[Source],
                  mask: Optional[Source]) -> Optional[np.ndarray]:
-        store = _resolve_source(store_handle)
+        store = resolve_source(store_handle)
         blocking = get_blocking(shape, tile_shape)
         block_id = blocking.coordinates_to_block_id([int(c) for c in block.begin])
         rows: List[np.ndarray] = []
@@ -181,8 +181,8 @@ def _make_segment(shape: Tuple[int, ...], tile_shape: Tuple[int, ...], tile_over
 
     def _compute(block: BlockDescriptor, inputs: Sequence[Source], outputs: Sequence[Source],
                  mask: Optional[Source]) -> Optional[np.ndarray]:
-        input_ = _resolve_source(input_handle)
-        store = _resolve_source(store_handle)
+        input_ = resolve_source(input_handle)
+        store = resolve_source(store_handle)
         output_ = outputs[0]
         blocking = get_blocking(shape, tile_shape)
         block_id = blocking.coordinates_to_block_id([int(c) for c in block.inner_block.begin])
@@ -214,20 +214,6 @@ def _make_segment(shape: Tuple[int, ...], tile_shape: Tuple[int, ...], tile_over
 # ---------------------------------------------------------------------------------------------
 # Orchestration helpers.
 # ---------------------------------------------------------------------------------------------
-
-def _resolve_source(handle) -> Source:
-    """Resolve a closure-captured handle to a live `Source` (already-live for local, spec otherwise)."""
-    return handle if isinstance(handle, Source) else from_spec(handle)
-
-
-def _capture(source: Source, job_type: str):
-    """Capture a source for a per-block closure: the live object for local, its spec otherwise.
-
-    For distributed backends ``to_spec()`` also validates the source is reopenable (raising a clear
-    error for in-memory numpy arrays).
-    """
-    return source if job_type == "local" else source.to_spec()
-
 
 def _prepare_output(output: Optional[SourceLike], shape: Tuple[int, ...], job_type: str) -> SourceLike:
     """Resolve the output array: allocate a numpy array for local, require a file-backed one otherwise."""
@@ -468,7 +454,7 @@ def stitch_segmentation(
                          "uint64. Reduce the tile shape or the volume size.")
 
     runner = get_runner(job_type, job_config)
-    input_handle = _capture(src, job_type)
+    input_handle = capture_source(src, job_type)
     store, store_cleanup, store_handle = _make_tile_store(n_blocks, max_halo, job_type, job_config)
     try:
         # Stage 1: segment each haloed tile, offset its ids, write the inner block + the store slot.

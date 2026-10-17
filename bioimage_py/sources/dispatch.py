@@ -57,6 +57,40 @@ def as_source(obj: "SourceLike") -> Source:
     raise TypeError(f"Cannot convert object of type {type(obj)!r} to a Source.")
 
 
+def capture_source(source: Source, job_type: str) -> Union[Source, SourceSpec]:
+    """Capture a source for a per-block closure: the live object for local, its spec otherwise.
+
+    Per-block compute functions are cloudpickled for distributed backends, so a captured source
+    must be picklable and reopenable on the worker. For the ``local`` backend the live `Source` is
+    captured directly; for distributed backends ``to_spec()`` is captured, which also validates that
+    the source is reopenable (raising a clear error for in-memory numpy arrays). Reconstruct the
+    captured handle on the worker with :func:`resolve_source`.
+
+    Args:
+        source: The source to capture.
+        job_type: The execution backend (``"local"`` / ``"subprocess"`` / ``"slurm"``).
+
+    Returns:
+        The live `Source` for ``local``, otherwise its `SourceSpec`.
+    """
+    return source if job_type == "local" else source.to_spec()
+
+
+def resolve_source(handle: Union[Source, SourceSpec]) -> Source:
+    """Resolve a closure-captured handle to a live `Source`.
+
+    The inverse of :func:`capture_source`: an already-live `Source` (the ``local`` case) is returned
+    unchanged, while a `SourceSpec` (the distributed case) is reopened with :func:`from_spec`.
+
+    Args:
+        handle: The captured handle (a live `Source` or a `SourceSpec`).
+
+    Returns:
+        A live `Source`.
+    """
+    return handle if isinstance(handle, Source) else from_spec(handle)
+
+
 def from_spec(spec: SourceSpec) -> Source:
     """Reconstruct a :class:`Source` from its :class:`SourceSpec`."""
     if spec.kind in ("zarr", "z5py"):

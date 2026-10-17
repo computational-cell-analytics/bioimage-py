@@ -45,9 +45,24 @@ The package lives in `bioimage_py/`:
   preserved on failure for `resume_from`) and `relabel_consecutive` (derives a consecutive mapping
   via a global `unique` reduction, then delegates the block-wise write to `relabel`; in place by
   default). `segmentation/multicut.py` ports the
-  bioimage-cpp-backed multicut cost transform + solvers (`compute_edge_costs`,
-  `multicut_decomposition` / `_gaec` / `_kernighan_lin`); meant to grow into multicut-based
-  segmentation. `segmentation/stitching.py` (`stitch_segmentation` / `stitch_tiled_segmentation`)
+  bioimage-cpp-backed multicut cost transform + whole-graph solvers (`compute_edge_costs`,
+  `multicut_decomposition` / `multicut_gaec` / `multicut_kernighan_lin`).
+  `segmentation/lifted_multicut.py` mirrors it for the lifted multicut
+  (`lifted_multicut_kernighan_lin` / `_gaec` / `_fusion_moves`, `get_lifted_multicut_solver`) plus
+  lifted-problem construction from a per-node label array (`lifted_edges_from_node_labels`,
+  `lifted_problem_from_node_labels`). `segmentation/blockwise_multicut.py` and
+  `segmentation/blockwise_lifted_multicut.py` add the hierarchical domain-decomposition solvers
+  (`blockwise_multicut` / `blockwise_lifted_multicut`): the per-block sub-problem solve is the **map**
+  step (distributed via the runner) and the union-find merge + edge contraction + final global solve
+  are the **in-process reduce**, with the block size doubling each level; both share
+  `segmentation/_blockwise_common.py` (the numpy reduce primitives, `reduce_problem`, and
+  `solve_subproblems_distributed`). They take `(graph, costs[, lifted_uv_ids, lifted_costs],
+  segmentation)` and return a node labeling — the segmentation defines the blocking domain (graph node
+  `i` == segment `i`); write the labeling to pixels with `relabel`. Unlike the elf reference, the
+  running node labeling is composed across levels (`node_ids = labels[unique(seg[block])]`) so
+  `n_levels > 1` is correct, and the graph/costs/labels are persisted to a temp zarr under the runner
+  temp root (dtypes canonicalized for zarr) for distributed backends. `segmentation/stitching.py`
+  (`stitch_segmentation` / `stitch_tiled_segmentation`)
   merges a tile-wise over-segmentation via a multicut over tile-interface object overlaps — the
   per-voxel phases (tile segmentation, overlap counting) run through the runner; RAG build +
   multicut solve are in-process private helpers (`_compute_rag` / `_project_node_labels_to_pixels`,
@@ -151,9 +166,14 @@ the operations above (`stats`, `filters`, `segmentation.label` + `segmentation.w
 + `regionprops`, `copy`, and `downsample` — the latter built on the `ResizedSource` wrapper — the
 `evaluation` package: the parallel `contingency_table` primitive plus the metrics built on it —
 `segmentation.relabel` (apply a node labeling / relabeling map, in place by default; the canonical
-node-label writer, see Conventions) + `segmentation.relabel_consecutive`, and
-`segmentation.stitch_segmentation` / `stitch_tiled_segmentation` on the new `segmentation.multicut`
-solvers). The slurm-only tests in `tests/test_slurm_runner.py` are skipped unless
+node-label writer, see Conventions) + `segmentation.relabel_consecutive`,
+`segmentation.stitch_segmentation` / `stitch_tiled_segmentation` on the `segmentation.multicut`
+solvers, the whole-graph `segmentation.lifted_multicut` solvers + lifted-problem construction, and the
+block-wise hierarchical `segmentation.blockwise_multicut` / `blockwise_lifted_multicut` — per-block
+sub-problem solves distributed via the runner (`local` / `subprocess` / `slurm`), the reduce in-process
+— verified by `tests/test_blockwise_multicut.py` (block-wise == whole-graph partition on a clean
+problem, `local == subprocess` across workers and `n_levels`) and `tests/test_lifted_multicut.py`). The
+slurm-only tests in `tests/test_slurm_runner.py` are skipped unless
 `sbatch` is on `PATH` and `BIOIMAGE_PY_SHARED_TMP` points at a shared filesystem; `subprocess` stays the
 CI proxy for the shared protocol. Note the slurm runner's key subtlety: per-task `.success` sentinels are
 written on compute nodes but can take up to the NFS attribute-cache timeout (~60 s) to become visible to
