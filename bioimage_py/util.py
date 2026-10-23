@@ -98,6 +98,11 @@ def same_array(a: Source, b: Source) -> bool:
     return getattr(a, "array", None) is getattr(b, "array", object())
 
 
+def is_inmemory_numpy(source: Source) -> bool:
+    """Return whether ``source`` wraps a plain in-memory numpy array (local-only, not reopenable)."""
+    return isinstance(getattr(source, "array", None), np.ndarray)
+
+
 def normalize_halo(halo: Union[int, Sequence[int]], ndim: int) -> List[int]:
     """Broadcast a halo to a per-axis list of length ``ndim``."""
     if isinstance(halo, numbers.Integral):

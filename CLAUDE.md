@@ -47,11 +47,20 @@ The package lives in `bioimage_py/`:
   default). `segmentation/multicut.py` ports the
   bioimage-cpp-backed multicut cost transform + solvers (`compute_edge_costs`,
   `multicut_decomposition` / `_gaec` / `_kernighan_lin`); meant to grow into multicut-based
-  segmentation. `segmentation/stitching.py` (`stitch_segmentation` / `stitch_tiled_segmentation`)
-  merges a tile-wise over-segmentation via a multicut over tile-interface object overlaps — the
-  per-voxel phases (tile segmentation, overlap counting) run through the runner; RAG build +
-  multicut solve are in-process private helpers (`_compute_rag` / `_project_node_labels_to_pixels`,
-  with a TODO to move to dedicated distributed graph functionality).
+  segmentation. `segmentation/stitching.py` (`stitch_segmentation` / `stitch_block_segmentations` /
+  `stitch_tiled_segmentation` + `block_store_shape`) merges a tile-wise over-segmentation via a
+  multicut over a compact *instance-correspondence graph*: one node per tile-local object that
+  contributes to a tile core, one edge per object pair overlapping in a shared halo face (or touching
+  across a tile interface, for the tiled variant), regardless of whether the written cores touch. Edge
+  merge probabilities come from a symmetric `overlap_metric` (default geometric mean; `iou` / `dice` /
+  `min` / `max`) gated by `min_overlap`; competing same-tile objects that both match one neighbour
+  object get a soft repulsive edge (`competition_disaffinity`, default 0.8). The per-voxel phases (tile
+  segmentation into a per-tile *block store*, core assembly, halo-overlap counting, the final write via
+  `relabel`) run through the runner; only the O(#objects) graph is built and solved in-process
+  (`_solve_correspondence_graph` is the seam for the block-wise multicut package). `stitch_segmentation`
+  = fill the block store + `stitch_block_segmentations` (the public two-phase entry point for externally
+  produced haloed tile segmentations, e.g. micro-sam's persistent GPU workers); the temporary store is
+  removed on success and preserved on failure. See "Segmentation stitching" in DESIGN_DOC.md.
 - `evaluation/` — segmentation-comparison metrics built on a parallel contingency table. `contingency_table`
   returns the `ContingencyTable` dataclass primitive (sparse overlap counts via
   `bioimage_cpp.utils.segmentation_overlap`, additive across blocks with no halo; has a `drop_ignore`
@@ -97,6 +106,9 @@ Conventions (follow these):
   blocked); array-output ops compute `direct = is_direct(...) and <their mask/block_ids/resume_from are
   None>` and silently fall through to the blocked path instead (per-op extra conditions vary, e.g.
   `watershed`'s direct path does honor a mask). `full_roi(ndim)` builds the whole-array slicing for both.
+  The stitching functions are the one exception: their `tile_shape` is a semantic parameter (the result
+  depends on the tiling), so they have no direct path — a single-tile configuration simply yields the
+  consecutively relabeled result of the segmentation function.
 - `segmentation.relabel` is the canonical way to write a *node labeling* (a relabeling of segment ids)
   onto pixels — any op that produces per-object labels (multicut, clustering, agglomeration, graph
   partitioning, size/property filters, …) should apply its result through `relabel` rather than a
@@ -109,7 +121,7 @@ Conventions (follow these):
   `take_dict` (gated by `_SUBSAMPLE_MIN_DICT` / `_SUBSAMPLE_MAX_DIVERSITY` so it never regresses on
   small dicts or pathologically diverse blocks; ~7–8× faster over a large volume) — but a dense array
   is still fastest. `util.take_mapping` is the single dict-relabel kernel: `relabel`, `label` (final
-  relabel), `stitch_segmentation` (densify) and `size_filter` all route through it (the first three via
+  relabel), `stitch_segmentation` (final node labeling) and `size_filter` all route through it (the first three via
   `relabel` itself). `relabel_consecutive` derives its `{old_id: new_id}` mapping and delegates the write to
   `relabel` (kept as a dict, not a dense array, so it stays memory-safe for sparse/large input id
   spaces — the case it is most often used to compact). `bioimage_cpp` has no dense-array `take`.
@@ -152,8 +164,9 @@ the operations above (`stats`, `filters`, `segmentation.label` + `segmentation.w
 `evaluation` package: the parallel `contingency_table` primitive plus the metrics built on it —
 `segmentation.relabel` (apply a node labeling / relabeling map, in place by default; the canonical
 node-label writer, see Conventions) + `segmentation.relabel_consecutive`, and
-`segmentation.stitch_segmentation` / `stitch_tiled_segmentation` on the new `segmentation.multicut`
-solvers). The slurm-only tests in `tests/test_slurm_runner.py` are skipped unless
+`segmentation.stitch_segmentation` / `stitch_block_segmentations` / `stitch_tiled_segmentation` (a
+multicut over the instance-correspondence graph, on the `segmentation.multicut` solvers)). The slurm-only
+tests in `tests/test_slurm_runner.py` are skipped unless
 `sbatch` is on `PATH` and `BIOIMAGE_PY_SHARED_TMP` points at a shared filesystem; `subprocess` stays the
 CI proxy for the shared protocol. Note the slurm runner's key subtlety: per-task `.success` sentinels are
 written on compute nodes but can take up to the NFS attribute-cache timeout (~60 s) to become visible to
