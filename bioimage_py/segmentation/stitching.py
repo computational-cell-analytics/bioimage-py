@@ -28,6 +28,7 @@ from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import bioimage_cpp as bic
 import numpy as np
+from scipy.ndimage import find_objects
 
 from ..runner import get_runner
 from ..runner.config import RunnerConfig
@@ -342,6 +343,19 @@ def _map_ids(ids: np.ndarray, keys: np.ndarray, values: np.ndarray) -> np.ndarra
     return np.where(keys[index] == ids, values[index], 0).astype(values.dtype, copy=False)
 
 
+def _has_object_in_block(seg: np.ndarray, bounding_boxes: list, object_id: int,
+                         begin: np.ndarray, end: np.ndarray) -> bool:
+    """Return whether ``seg`` contains ``object_id`` inside the block from ``begin`` to ``end``."""
+    box = bounding_boxes[object_id - 1]
+    if box is None:
+        return False
+    low = np.maximum([b.start for b in box], begin)
+    high = np.minimum([b.stop for b in box], end)
+    if np.any(low >= high):
+        return False
+    return bool((seg[tuple(slice(int(lo), int(hi)) for lo, hi in zip(low, high))] == object_id).any())
+
+
 def _complete_from_halo(seg: np.ndarray, store: Source, blocking, tile_overlap: Tuple[int, ...]) -> None:
     """Fill background in each tile's inner block from the halo predictions of the neighbouring tiles.
 
@@ -357,19 +371,18 @@ def _complete_from_halo(seg: np.ndarray, store: Source, blocking, tile_overlap: 
     """
     halo = list(tile_overlap)
     blocks = [blocking.get_block_with_halo(i, halo) for i in range(int(blocking.number_of_blocks))]
+    bounding_boxes = find_objects(seg)
 
-    # Map the ids of each tile to the stitched ids through its inner block, which the tile wrote.
-    id_tables, present = {}, {}
+    id_tables = {}
     for block_id, block in enumerate(blocks):
-        inner = seg[to_roi(block.inner_block)]
-        present[block_id] = np.unique(inner)
         outer_shape = [int(e) - int(b) for b, e in zip(block.outer_block.begin, block.outer_block.end)]
         tile = np.asarray(store[(block_id,) + tuple(slice(0, s) for s in outer_shape)])
         tile_ids = tile[to_roi(block.inner_block_local)].ravel()
         foreground = tile_ids != 0
         if foreground.any():
-            pairs = np.unique(np.stack([tile_ids[foreground], inner.ravel()[foreground]], axis=1), axis=0)
-            id_tables[block_id] = (pairs[:, 0], pairs[:, 1])
+            # The multicut assigns whole segments, so the first pixel of a tile id gives its stitched id.
+            keys, first = np.unique(tile_ids[foreground], return_index=True)
+            id_tables[block_id] = (keys, seg[to_roi(block.inner_block)].ravel()[foreground][first])
 
     for target_id, target in enumerate(blocks):
         inner_begin = np.asarray(target.inner_block.begin, dtype="int64")
@@ -377,6 +390,10 @@ def _complete_from_halo(seg: np.ndarray, store: Source, blocking, tile_overlap: 
         search_begin = np.maximum(inner_begin - np.asarray(halo), 0)
         search_end = np.minimum(inner_end + np.asarray(halo), np.asarray(seg.shape))
         sources = blocking.get_block_ids_overlapping_bounding_box(search_begin.tolist(), search_end.tolist())
+
+        # Collect the candidate pixels of all sources before the first fill. Thus, the check for the
+        # objects of the target reads the target before the completion.
+        candidates = []
         for source_id in sorted(sources):
             if source_id == target_id or source_id not in id_tables:
                 continue
@@ -386,11 +403,25 @@ def _complete_from_halo(seg: np.ndarray, store: Source, blocking, tile_overlap: 
             end = np.minimum(np.asarray(outer.end, dtype="int64"), inner_end)
             if np.any(begin >= end):
                 continue
+            region = tuple(slice(int(b), int(e)) for b, e in zip(begin, end))
             local = tuple(slice(int(b - o), int(e - o)) for b, e, o in zip(begin, end, outer_begin))
-            region = _map_ids(np.asarray(store[(source_id,) + local]), *id_tables[source_id])
-            target_region = seg[tuple(slice(int(b), int(e)) for b, e in zip(begin, end))]
-            fill = (region != 0) & (target_region == 0) & ~np.isin(region, present[target_id])
-            target_region[fill] = region[fill]
+            source_ids = np.asarray(store[(source_id,) + local])
+            mask = (source_ids != 0) & (seg[region] == 0)
+            if mask.any():
+                candidates.append((region, mask, _map_ids(source_ids[mask], *id_tables[source_id])))
+        if not candidates:
+            continue
+
+        candidate_ids = np.unique(np.concatenate([ids for _, _, ids in candidates]))
+        allowed = [object_id for object_id in candidate_ids.tolist() if object_id != 0 and
+                   not _has_object_in_block(seg, bounding_boxes, object_id, inner_begin, inner_end)]
+        if not allowed:
+            continue
+        for region, mask, ids in candidates:
+            target_region = seg[region]
+            current = target_region[mask]
+            fill_ids = np.where(np.isin(ids, allowed), ids, 0)
+            target_region[mask] = np.where(current == 0, fill_ids, current)
 
 
 # ---------------------------------------------------------------------------------------------
