@@ -129,6 +129,63 @@ def test_stitch_segmentation_channels():
     _check_result(stitched, expected)
 
 
+# --- stitch_segmentation: complete_from_halo ---
+
+def _segment_skip_tile_1(tile, tile_id=None):
+    """Label a tile. Return only background for tile 1, to simulate a tile that misses its objects."""
+    seg = _segment(tile)
+    return np.zeros_like(seg) if tile_id == 1 else seg
+
+
+def _segment_erode_tile_1(tile, tile_id=None):
+    """Label a tile. Erode the objects of tile 1, to simulate a tile that segments them smaller."""
+    from scipy.ndimage import binary_erosion
+
+    return _segment(binary_erosion(tile > 0, iterations=2) if tile_id == 1 else tile)
+
+
+def _ball_across_tile_border(ndim):
+    """Return a ball in tiles 0 and 1 for a tile shape of 64. It crosses the border at 64 on the last axis."""
+    shape, center = ((128, 128), (30, 62)) if ndim == 2 else ((64, 128, 128), (30, 30, 62))
+    grid = np.indices(shape)
+    return sum((g - c) ** 2 for g, c in zip(grid, center)) <= 8 ** 2
+
+
+@pytest.mark.parametrize("ndim", [2, 3])
+@pytest.mark.parametrize("complete", [False, True])
+def test_stitch_segmentation_complete_from_halo(ndim, complete):
+    data = _ball_across_tile_border(ndim)
+    stitched = np.asarray(bp.segmentation.stitch_segmentation(
+        data, _segment_skip_tile_1, (64,) * ndim, (16,) * ndim, complete_from_halo=complete,
+    ))
+    assert set(np.unique(stitched).tolist()) == {0, 1}
+    if complete:
+        assert np.array_equal(stitched > 0, data)
+    else:  # Tile 0 writes only its inner block, so the ball is cut at the border.
+        assert np.array_equal(stitched > 0, data & (np.arange(data.shape[-1]) < 64))
+
+
+def test_stitch_segmentation_complete_from_halo_keeps_the_tile_decision():
+    # Tile 1 segments the ball smaller. Tile 1 has its own part of the ball, so the halo of tile 0
+    # does not change the ball in the inner block of tile 1.
+    from scipy.ndimage import binary_erosion
+
+    data = _ball_across_tile_border(2)
+    stitched = np.asarray(bp.segmentation.stitch_segmentation(
+        data, _segment_erode_tile_1, (64, 64), (16, 16), complete_from_halo=True,
+    ))
+    assert set(np.unique(stitched).tolist()) == {0, 1}
+    assert np.array_equal(stitched[:64, 64:] > 0, binary_erosion(data, iterations=2)[:64, 64:])
+
+
+def test_stitch_segmentation_complete_from_halo_keeps_agreeing_tiles():
+    data = _get_data()
+    plain = bp.segmentation.stitch_segmentation(data, _segment, (128, 128), (32, 32))
+    completed = bp.segmentation.stitch_segmentation(data, _segment, (128, 128), (32, 32),
+                                                    complete_from_halo=True)
+    assert np.array_equal(np.asarray(plain), np.asarray(completed))
+
+
 # --- stitch_tiled_segmentation ---
 
 @pytest.mark.parametrize("tile_shape", [(224, 224), (256, 256), (512, 512)])
@@ -150,6 +207,21 @@ def test_stitch_segmentation_parity(job_type, num_workers, zarr_factory):
     zout = zarr_factory(shape=data.shape, chunks=(128, 128), dtype="uint64", fill=0)
     bp.segmentation.stitch_segmentation(
         zin, _segment, (128, 128), (32, 32), output=zout, job_type=job_type, num_workers=num_workers,
+    )
+    assert np.array_equal(np.asarray(local), zout[:])
+
+
+@pytest.mark.parametrize("job_type,num_workers", [("local", 4), ("subprocess", 3)])
+def test_stitch_segmentation_complete_from_halo_parity(job_type, num_workers, zarr_factory):
+    data = _ball_across_tile_border(2)
+    local = bp.segmentation.stitch_segmentation(data, _segment_skip_tile_1, (64, 64), (16, 16),
+                                                complete_from_halo=True)
+
+    zin = zarr_factory(data.astype("uint8"), chunks=(64, 64))
+    zout = zarr_factory(shape=data.shape, chunks=(64, 64), dtype="uint64", fill=0)
+    bp.segmentation.stitch_segmentation(
+        zin, _segment_skip_tile_1, (64, 64), (16, 16), output=zout, job_type=job_type,
+        num_workers=num_workers, complete_from_halo=True,
     )
     assert np.array_equal(np.asarray(local), zout[:])
 

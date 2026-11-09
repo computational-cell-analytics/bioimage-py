@@ -7,8 +7,10 @@ tiled labeling, turning each overlap into an attractive edge cost, and solving a
 :mod:`bioimage_py.segmentation.multicut`) to decide which cross-tile objects are one and the same.
 
 - `stitch_segmentation` runs a user segmentation function tile-wise (each tile read with a halo) and
-  stitches the results. The halo region — segmented by a tile but not written into the result — is
-  where the overlap with the neighbouring tile's segmentation of the *same* pixels is measured.
+  stitches the results. The halo region — segmented by a tile but by default not written into the
+  result — is where the overlap with the neighbouring tile's segmentation of the *same* pixels is
+  measured. With ``complete_from_halo``, the halo also completes objects that a neighbouring tile
+  does not segment.
 - `stitch_tiled_segmentation` stitches an already-tiled segmentation (unique ids per tile, tiles
   non-overlapping) by measuring the overlap of objects *touching* across tile interfaces.
 
@@ -332,6 +334,65 @@ def _stitch_via_multicut(seg: np.ndarray, uv: np.ndarray, frac: np.ndarray, with
     return _project_node_labels_to_pixels(rag, seg, np.asarray(node_labels), n_threads=n_threads)
 
 
+def _map_ids(ids: np.ndarray, keys: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Map ``ids`` through the ``keys`` -> ``values`` table. ``keys`` must be sorted. Other ids map to 0."""
+    if len(keys) == 0:
+        return np.zeros_like(ids, dtype=values.dtype)
+    index = np.clip(np.searchsorted(keys, ids), 0, len(keys) - 1)
+    return np.where(keys[index] == ids, values[index], 0).astype(values.dtype, copy=False)
+
+
+def _complete_from_halo(seg: np.ndarray, store: Source, blocking, tile_overlap: Tuple[int, ...]) -> None:
+    """Fill background in each tile's inner block from the halo predictions of the neighbouring tiles.
+
+    Each tile writes only its inner block. Thus, an object that a neighbouring tile does not segment
+    is cut at the tile border. The halo prediction of a tile fills a pixel of a neighbouring inner
+    block only if:
+
+    - the pixel is background, and
+    - the neighbouring tile has no part of the same object.
+
+    Thus, a tile that segments an object still decides that object in its own inner block. This
+    function changes ``seg`` in place.
+    """
+    halo = list(tile_overlap)
+    blocks = [blocking.get_block_with_halo(i, halo) for i in range(int(blocking.number_of_blocks))]
+
+    # Map the ids of each tile to the stitched ids through its inner block, which the tile wrote.
+    id_tables, present = {}, {}
+    for block_id, block in enumerate(blocks):
+        inner = seg[to_roi(block.inner_block)]
+        present[block_id] = np.unique(inner)
+        outer_shape = [int(e) - int(b) for b, e in zip(block.outer_block.begin, block.outer_block.end)]
+        tile = np.asarray(store[(block_id,) + tuple(slice(0, s) for s in outer_shape)])
+        tile_ids = tile[to_roi(block.inner_block_local)].ravel()
+        foreground = tile_ids != 0
+        if foreground.any():
+            pairs = np.unique(np.stack([tile_ids[foreground], inner.ravel()[foreground]], axis=1), axis=0)
+            id_tables[block_id] = (pairs[:, 0], pairs[:, 1])
+
+    for target_id, target in enumerate(blocks):
+        inner_begin = np.asarray(target.inner_block.begin, dtype="int64")
+        inner_end = np.asarray(target.inner_block.end, dtype="int64")
+        search_begin = np.maximum(inner_begin - np.asarray(halo), 0)
+        search_end = np.minimum(inner_end + np.asarray(halo), np.asarray(seg.shape))
+        sources = blocking.get_block_ids_overlapping_bounding_box(search_begin.tolist(), search_end.tolist())
+        for source_id in sorted(sources):
+            if source_id == target_id or source_id not in id_tables:
+                continue
+            outer = blocks[source_id].outer_block
+            outer_begin = np.asarray(outer.begin, dtype="int64")
+            begin = np.maximum(outer_begin, inner_begin)
+            end = np.minimum(np.asarray(outer.end, dtype="int64"), inner_end)
+            if np.any(begin >= end):
+                continue
+            local = tuple(slice(int(b - o), int(e - o)) for b, e, o in zip(begin, end, outer_begin))
+            region = _map_ids(np.asarray(store[(source_id,) + local]), *id_tables[source_id])
+            target_region = seg[tuple(slice(int(b), int(e)) for b, e in zip(begin, end))]
+            fill = (region != 0) & (target_region == 0) & ~np.isin(region, present[target_id])
+            target_region[fill] = region[fill]
+
+
 # ---------------------------------------------------------------------------------------------
 # Public functions.
 # ---------------------------------------------------------------------------------------------
@@ -409,6 +470,7 @@ def stitch_segmentation(
     job_type: str = "local",
     job_config: Optional[RunnerConfig] = None,
     return_before_stitching: bool = False,
+    complete_from_halo: bool = False,
 ) -> Union[SourceLike, Tuple[SourceLike, np.ndarray]]:
     """Run a segmentation function tile-wise and stitch the results based on overlap.
 
@@ -442,6 +504,10 @@ def stitch_segmentation(
         job_config: Backend configuration (a `RunnerConfig` / `SlurmConfig`). For distributed
             backends a temporary per-tile store is created under ``job_config.tmp_root``.
         return_before_stitching: Also return the (relabeled) pre-stitch segmentation, for debugging.
+        complete_from_halo: Whether to complete objects that a neighbouring tile does not segment.
+            Each tile writes only its inner block, so otherwise such an object is cut at the tile
+            border. If set, the halo prediction of a tile fills background in the neighbouring tile
+            where that tile has no part of the same object. Has no effect without ``with_background``.
 
     Returns:
         The output array with the stitched segmentation, or ``(output, pre_stitch)`` if
@@ -497,21 +563,25 @@ def stitch_segmentation(
         overlap_fn = _make_seg_overlap(shape, tile_shape, tile_overlap, store_handle, ndim)
         ov_results = runner.run(overlap_fn, [out_array], block_shape=tile_shape,
                                 num_workers=num_workers, has_return_val=True, name="stitch-overlaps")
+
+        uv, frac = _collect_edges(ov_results)
+        uv, frac = _map_edges(uv, frac, mapping)  # overlap ids are offset ids -> map to dense.
+
+        seg = out[full_roi(ndim)]
+        stitched = _stitch_via_multicut(seg, uv, frac, with_background, beta, n_threads=None)
+
+        # Relabel to consecutive ids (elf semantics): keep 0 as background, or renumber 0 too when
+        # there is no background.
+        if with_background:
+            stitched, _, _ = bic.segmentation.relabel_sequential(stitched.astype("uint64"), offset=1)
+        else:
+            stitched, _, _ = bic.segmentation.relabel_sequential(stitched.astype("uint64") + 1, offset=1)
+
+        # This step reads the tile store, so it must run before the store cleanup.
+        if complete_from_halo and with_background:
+            _complete_from_halo(stitched, store, blocking, tile_overlap)
     finally:
         store_cleanup()
-
-    uv, frac = _collect_edges(ov_results)
-    uv, frac = _map_edges(uv, frac, mapping)  # overlap ids are offset ids -> map to dense.
-
-    seg = out[full_roi(ndim)]
-    stitched = _stitch_via_multicut(seg, uv, frac, with_background, beta, n_threads=None)
-
-    # Relabel to consecutive ids (elf semantics): keep 0 as background, or renumber 0 too when there
-    # is no background.
-    if with_background:
-        stitched, _, _ = bic.segmentation.relabel_sequential(stitched.astype("uint64"), offset=1)
-    else:
-        stitched, _, _ = bic.segmentation.relabel_sequential(stitched.astype("uint64") + 1, offset=1)
 
     pre_stitch = seg.copy() if return_before_stitching else None
     out[full_roi(ndim)] = stitched.astype(out.dtype, copy=False)
